@@ -139,7 +139,7 @@ int ctrl_chrdev_create(struct ctrl* ctrl, dev_t first,
                        const struct file_operations* fops)
 {
     int err;
-    struct device* chrdev;
+    struct device* chrdev = NULL;
 
     if (ctrl->chrdev != NULL)
     {

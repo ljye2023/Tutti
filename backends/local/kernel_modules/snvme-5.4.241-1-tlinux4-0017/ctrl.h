@@ -58,7 +58,7 @@ struct ctrl
     int                 number;     /* Controller number */
     dev_t               rdev;       /* Character device register */
     struct class*       cls;        /* Character device class */
-    struct cdev         cdev;       /* Character device (separately allocated) */
+    struct cdev         cdev;       /* Character device */
     struct device*      chrdev;     /* Character device handle */
     struct nvme_dev *dev;
     /*****info about user defined nvme io qp **** */
@@ -135,7 +135,7 @@ struct ctrl* ctrl_find_by_inode(const struct list* list, const struct inode* ino
 /*
  * Create character device and set up file operations.
  */
-int ctrl_chrdev_create(struct ctrl* ctrl, 
+int ctrl_chrdev_create(struct ctrl* ctrl,
                        dev_t first,
                        const struct file_operations* fops);
 
