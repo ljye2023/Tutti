@@ -3,6 +3,10 @@ build/
 build/*
 build_tutti/
 build_tutti/*
+build_layer2/
+build_layer2/*
+# In-tree CMake build dir under the Layer 2 tests (configured artifacts only).
+tutti/device_manager/tests/build/
 
 # Third-party packages directory
 third_pkgs/
@@ -47,6 +51,12 @@ backends/local/kernel_modules/test/snvme_smoke_addq
 backends/local/kernel_modules/test/snvme_smoke_qgroup
 backends/local/kernel_modules/test/snvme_smoke_recycle
 backends/local/kernel_modules/test/snvme_smoke_io
+tutti/device_manager/nvme/kernel_modules/test/snvme_smoke
+tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_gpu
+tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_addq
+tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_qgroup
+tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_recycle
+tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_io
 
 # Nsight Systems profile output -- per-run, not source.
 *.nsys-rep

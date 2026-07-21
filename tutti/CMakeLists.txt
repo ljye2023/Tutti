@@ -45,6 +45,20 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
+# yaml-cpp: used by Layer 2 (device_manager/nvme/nvmeservice) config parser.
+# Normalize the target name across packagings:
+#   vcpkg / new upstream : yaml-cpp::yaml-cpp
+#   old system pkg (0.5.x): bare "yaml-cpp" target, or only ${YAML_CPP_LIBRARIES}
+find_package(yaml-cpp REQUIRED)
+if(TARGET yaml-cpp::yaml-cpp)
+    set(TUTTI_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+elseif(TARGET yaml-cpp)
+    set(TUTTI_YAML_CPP_TARGET yaml-cpp)
+else()
+    set(TUTTI_YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
+endif()
+message(STATUS "Tutti: yaml-cpp target: ${TUTTI_YAML_CPP_TARGET}")
+
 message(STATUS "Tutti: Using CUDA ${CUDAToolkit_VERSION}")
 message(STATUS "Tutti: Target architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
@@ -102,7 +116,7 @@ add_subdirectory(accel)
 # Future layers (commented out, not built yet)
 # ---------------------------------------------------------------------------
 
-# add_subdirectory(device_manager)   # Layer 2
+add_subdirectory(device_manager)   # Layer 2 ✅ ENABLED
 # add_subdirectory(backends)         # Layer 3
 # add_subdirectory(io_engine)        # Layer 4
 # add_subdirectory(block_storage)    # Layer 5
