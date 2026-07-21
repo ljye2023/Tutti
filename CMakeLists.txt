@@ -319,6 +319,7 @@ install (TARGETS libnvm DESTINATION "lib")
 #
 # Layered subdirectories (all under tutti:: namespace):
 #
+#   tutti/           -- New refactored layered architecture
 #   memory/          -- HostDeviceMemorySubsystem (libnvm DMA mapping +
 #                       cudaMalloc / malloc + register_external)
 #   device_manager/  -- LocalNvmeDirectRegistry (IN_PROCESS) +
@@ -328,6 +329,13 @@ install (TARGETS libnvm DESTINATION "lib")
 #   memory          -> libnvm + CUDA::cudart
 #   device_manager  -> libnvm + nvmeservice (gRPC client)
 # ---------------------------------------------------------------------------
+
+# Add tutti subdirectory if it exists
+if(EXISTS "${PROJECT_SOURCE_DIR}/tutti/CMakeLists.txt")
+    add_subdirectory(tutti)
+    message(STATUS "Added tutti subdirectory")
+endif()
+
 add_subdirectory(memory)
 
 # The legacy monolithic GPU-file tree has been moved out of
@@ -445,6 +453,13 @@ add_subdirectory(adapters/kv_cache)
 # whole stack through the Coordinator.  Added last so every layer +
 # the coordinator target is already declared.
 add_subdirectory(examples)
+
+# tests/ holds layer-specific smoke tests. Added after all layers
+# and core libraries are declared.
+if(EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
+    add_subdirectory(tests)
+    message(STATUS "Added tests subdirectory")
+endif()
 
 
 # Macro for creating sample target

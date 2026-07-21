@@ -1,6 +1,8 @@
 # Build directory
 build/
 build/*
+build_tutti/
+build_tutti/*
 
 # Third-party packages directory
 third_pkgs/
