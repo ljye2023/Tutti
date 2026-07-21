@@ -30,7 +30,14 @@ add_subdirectory(nvme/libnvm)
 # =============================================================================
 
 # NVMeService provides cross-process arbitration (Level-1 allocator)
-add_subdirectory(nvme/nvmeservice)
+# NVMeService requires gRPC - make it optional
+find_package(gRPC CONFIG QUIET)
+if(gRPC_FOUND)
+    add_subdirectory(nvme/nvmeservice)
+    message(STATUS "NVMeService enabled (gRPC found)")
+else()
+    message(STATUS "NVMeService disabled (gRPC not found)")
+endif()
 
 # =============================================================================
 # Source Collection

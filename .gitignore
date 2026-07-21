@@ -67,3 +67,4 @@ sweep_logs/
 
 # Exported chat history (not source)
 history_*.md
+tutti_build/

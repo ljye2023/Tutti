@@ -117,7 +117,7 @@ add_subdirectory(accel)
 # ---------------------------------------------------------------------------
 
 add_subdirectory(device_manager)   # Layer 2 ✅ ENABLED
-# add_subdirectory(backends)         # Layer 3
+add_subdirectory(backends)         # Layer 3 ✅ ENABLED
 # add_subdirectory(io_engine)        # Layer 4
 # add_subdirectory(block_storage)    # Layer 5
 # add_subdirectory(raw_device)       # Layer 5
