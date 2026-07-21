@@ -5,29 +5,63 @@
 
 #pragma once
 
-#include "tutti/types/io_types.h"
-#include "tutti/accel/include/accel_types.h"
+#include "io_engine/include/io_types.h"
+#include "accel/include/common/accel_types.h"
 #include <vector>
+#include <cstdint>
 
 namespace tutti {
+
+struct MemoryRegion;  // accel/include/common/memory_region.h
+class IBackendProvider;
+class IAccelerator;
 
 class IIoEngine {
 public:
     virtual ~IIoEngine() = default;
 
-    // Submit a batch of IO requests
-    // Returns true on success
-    virtual bool submit_batch(const std::vector<IoRequest>& requests,
-                              bool is_read,
-                              AccelStream stream) = 0;
+    //==========================================================================
+    // Batch Submit (Blocking)
+    //
+    // Submit one uniform-direction batch and block until complete.
+    // Internally:
+    //   1. Fan out: IoRequest → SubSliceInfo[] (using max_io_size from backend)
+    //   2. Backend: prepare_descriptors(ioaddrs, slices) → BufferDescriptor[]
+    //   3. HAL: memcpy_async(descs CPU→GPU, stream)
+    //   4. Backend: launch_batch_gpu_stream(stream, target_handle, descs, n, is_read)
+    //   5. HAL: synchronize_stream(stream)
+    //==========================================================================
 
-    // Get maximum IO size supported by backend
-    virtual size_t max_io_size() const = 0;
+    virtual bool submit_batch(
+        const std::vector<IoRequest>& requests,  // Backend-neutral
+        bool is_read,
+        AccelStream stream) = 0;
 
-    // Slice a large IO into sub-slices (fan-out logic moved from memory/)
-    virtual size_t slice_fanout(const IoRequest& request,
-                                SubSliceInfo* slices_out,
-                                size_t max_slices) const = 0;
+    //==========================================================================
+    // Batch Submit (Async)
+    //
+    // Returns after kernel launch is queued on stream.
+    // Caller responsible for stream-sync or event observation.
+    // Kernel-side failures surface on caller's eventual stream-sync.
+    //==========================================================================
+
+    virtual bool submit_batch_async(
+        const std::vector<IoRequest>& requests,
+        bool is_read,
+        AccelStream stream) = 0;
+
+    //==========================================================================
+    // Capacity / Planning
+    //==========================================================================
+
+    // Maximum entries one batch may flatten to after fan-out.
+    // Callers must pack under this limit.
+    virtual uint32_t max_entries_per_batch() const = 0;
+
+    // How many sub-IOs a given MemoryRegion flattens to after fan-out.
+    // Adapters use this to pack batches without exceeding max_entries_per_batch.
+    // NEW METHOD (was buried in IMemorySubsystem::lookup_io_slice).
+    virtual uint32_t slice_fanout(const MemoryRegion* region) const = 0;
 };
 
 }  // namespace tutti

@@ -5,8 +5,8 @@
 
 #pragma once
 
-#include "tutti/io_engine/include/io_engine.h"
-#include "tutti/backends/include/backend_provider.h"
+#include "io_engine/include/io_engine.h"
+#include "backends/include/backend_provider.h"
 #include <memory>
 
 namespace tutti {
@@ -23,20 +23,26 @@ struct LocalNvmeIoEngineConfig {
 class LocalNvmeIoEngine : public IIoEngine {
 public:
     LocalNvmeIoEngine(
-        IBackendProvider* backend,
+        backends::IBackendProvider* backend,
+        IAccelerator* accel,
         const LocalNvmeIoEngineConfig& config);
 
     virtual ~LocalNvmeIoEngine();
 
     // IIoEngine interface
-    int submit_batch(
-        const IoRequest* requests,
-        size_t num_requests,
+    bool submit_batch(
+        const std::vector<IoRequest>& requests,
+        bool is_read,
         AccelStream stream) override;
 
-    int poll_completions(
-        uint32_t* num_completed,
+    bool submit_batch_async(
+        const std::vector<IoRequest>& requests,
+        bool is_read,
         AccelStream stream) override;
+
+    uint32_t max_entries_per_batch() const override;
+
+    uint32_t slice_fanout(const MemoryRegion* region) const override;
 
 private:
     struct Impl;

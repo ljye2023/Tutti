@@ -22,11 +22,12 @@ set(DEPENDS_ON "tutti_accel;tutti_backend_interface")
 
 set(LAYER_SOURCES
     src/io_engine_impl.cpp
-    src/batch_submit.cu
+    src/local_nvme_io_engine.cpp
 )
 
 set(LAYER_HEADERS
     include/io_engine.h
+    include/io_types.h
     include/local_nvme/launch_batch.h
     include/local_nvme/local_nvme_io_engine.h
 )
@@ -108,3 +109,11 @@ install(DIRECTORY include/
         PATTERN "*.h"
         PATTERN "*.cuh"
 )
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

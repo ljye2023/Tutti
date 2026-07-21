@@ -5,8 +5,8 @@
 
 #pragma once
 
-#include "tutti/accel/include/accel_types.h"
-#include "tutti/types/io_types.h"
+#include "accel/include/common/accel_types.h"
+#include "io_engine/include/io_types.h"
 #include <cstddef>
 
 namespace tutti {
