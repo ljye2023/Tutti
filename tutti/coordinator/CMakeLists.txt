@@ -1,12 +1,14 @@
 # tutti/coordinator/CMakeLists.txt
-# Layer 6: Coordinator
+# Layer 6: Coordinator - Top-level orchestrator bridging applications to storage layers
 #
 # Provides:
-#   - Coordinator class (top-level orchestrator)
-#   - Bootstrap + device initialization
-#   - High-level API for all storage interfaces
+#   - ICoordinator interface for application entry point
+#   - IRawDevice interface for fileless namespace + LBA-range access
+#   - Buffer registration orchestration via HAL
+#   - Batch submission workflows to IO Engine
+#   - Dual data paths: Block Storage (GpuFile) and Raw Device (namespace/LBA)
 #
-# Dependencies: All lower layers (1-5)
+# Dependencies: Layer 1 (accel), Layer 3 (backends), Layer 4 (io_engine), Layer 5 (block_storage)
 
 # =============================================================================
 # Layer Configuration
@@ -14,19 +16,23 @@
 
 set(LAYER_NAME "tutti_coordinator")
 set(LAYER_NUMBER 6)
-set(DEPENDS_ON "tutti_accel;tutti_device_manager;tutti_backend_interface;tutti_io_engine;tutti_block_storage;tutti_raw_device")
+set(DEPENDS_ON "tutti_accel;tutti_backends;tutti_io_engine;tutti_block_storage")
 
 # =============================================================================
 # Source Collection
 # =============================================================================
 
 set(LAYER_SOURCES
-    src/coordinator.cpp
+    src/coordinator_impl.cpp
+    src/raw_device_impl.cpp
+    src/buffer_registry.cpp
 )
 
 set(LAYER_HEADERS
     include/coordinator.h
-    include/device.h
+    include/coordinator_types.h
+    include/raw_device.h
+    include/gpu_file.h
 )
 
 # =============================================================================
@@ -65,14 +71,11 @@ target_link_libraries(${LAYER_NAME}
     PUBLIC
         tutti_types
         tutti_accel
-        tutti_device_manager
-        tutti_backend_interface
+        tutti_backends
         tutti_io_engine
         tutti_block_storage
-        tutti_raw_device
     PRIVATE
-        tutti_backend_local_nvme
-        CUDA::cudart
+        Threads::Threads
 )
 
 # =============================================================================
@@ -99,3 +102,11 @@ install(DIRECTORY include/
     DESTINATION include/tutti/coordinator
     FILES_MATCHING PATTERN "*.h"
 )
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

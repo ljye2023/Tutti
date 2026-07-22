@@ -1,51 +1,70 @@
-// tutti/coordinator/include/coordinator.h
-// Layer 6: Coordinator - Top-level Orchestrator
-//
-// Main entry point for the Tutti storage runtime
-
 #pragma once
 
-#include "tutti/accel/include/accel_types.h"
-#include "tutti/accel/include/iaccel.h"
-#include "tutti/device_manager/include/vdevice.h"
-#include "tutti/block_storage/include/block_storage.h"
-#include "tutti/raw_device/include/raw_device.h"
-#include <memory>
-#include <string>
+#include "coordinator_types.h"
+#include "raw_device.h"
+#include "accel/include/common/accel_types.h"
+#include "io_engine/include/io_types.h"
+#include <cstdint>
 
 namespace tutti {
 
-// Coordinator configuration
-struct CoordinatorConfig {
-    std::string device_path;
-    uint32_t num_queues;
-    uint32_t queue_depth;
-    bool enable_p2p;
-};
+namespace block_storage {
+class IBlockStorage;
+}
 
-// Top-level coordinator class
-class Coordinator {
+namespace coordinator {
+
+class ICoordinator {
 public:
-    Coordinator();
-    ~Coordinator();
+    virtual ~ICoordinator() = default;
 
-    // Initialization
-    int initialize(const CoordinatorConfig& config);
-    void shutdown();
+    virtual bool initialize(const CoordinatorConfig& config) = 0;
 
-    // Accelerator access
-    IAccelerator* get_accelerator();
+    virtual bool cleanup() = 0;
 
-    // Storage interfaces
-    IBlockStorage* get_block_storage();
-    IRawDevice* get_raw_device();
+    virtual MemoryRegion* register_buffer(
+        void* ptr,
+        size_t size,
+        MemoryKind kind) = 0;
 
-    // Device access
-    VDevice get_vdevice() const;
+    virtual bool unregister_buffer(MemoryRegion* region) = 0;
 
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    virtual BatchSubmitResult submit_read_batch(
+        IoRequest* requests,
+        uint32_t count,
+        AccelStream stream = AccelStream()) = 0;
+
+    virtual BatchSubmitResult submit_write_batch(
+        IoRequest* requests,
+        uint32_t count,
+        AccelStream stream = AccelStream()) = 0;
+
+    virtual bool submit_read_batch_async(
+        IoRequest* requests,
+        uint32_t count,
+        AccelStream stream,
+        BatchCompletionCallback callback,
+        void* user_data) = 0;
+
+    virtual bool submit_write_batch_async(
+        IoRequest* requests,
+        uint32_t count,
+        AccelStream stream,
+        BatchCompletionCallback callback,
+        void* user_data) = 0;
+
+    virtual block_storage::IBlockStorage* get_block_storage() = 0;
+
+    virtual IRawDevice* get_raw_device() = 0;
+
+    virtual uint32_t max_batch_size() const = 0;
+
+    virtual uint32_t slice_fanout(MemoryRegion* region) const = 0;
 };
 
+ICoordinator* create_coordinator();
+
+void destroy_coordinator(ICoordinator* coordinator);
+
+} // namespace coordinator
 } // namespace tutti
