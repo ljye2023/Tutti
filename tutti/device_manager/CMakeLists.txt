@@ -221,4 +221,4 @@ install(DIRECTORY nvme/include/
 # Tests
 # =============================================================================
 
-add_subdirectory(tests)
+# Layer-specific tests are excluded; all tests live under tutti/tests/

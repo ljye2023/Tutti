@@ -107,6 +107,4 @@ install(DIRECTORY include/
 # Tests
 # =============================================================================
 
-if(BUILD_TESTING)
-    add_subdirectory(tests)
-endif()
+# Layer-specific tests are excluded; all tests live under tutti/tests/

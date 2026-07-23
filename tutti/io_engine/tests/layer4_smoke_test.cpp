@@ -16,53 +16,64 @@ using namespace tutti;
 //==============================================================================
 class MockBackendProvider : public backends::IBackendProvider {
 public:
+    // --- Lifecycle ---
+    bool initialize(VDevice*) override { return true; }
+    void cleanup() override {}
+
+    // --- Metadata ---
+    backends::BackendType backend_type() const override { return backends::BackendType::LOCAL_NVME; }
+    const char* backend_name() const override { return "MockNVMe"; }
+    size_t max_io_size() const override { return 4096; }
     backends::BackendMetadata metadata() const override {
-        backends::BackendMetadata meta;
+        backends::BackendMetadata meta{};
         meta.max_batch_size = 16;
         meta.max_io_size = 4096;
         return meta;
     }
 
-    size_t max_io_size() const override {
-        return 4096;
-    }
-
+    // --- Descriptor preparation ---
     bool prepare_descriptors(
         const uint64_t* ioaddrs,
         const backends::SubSliceInfo* slices,
         uint32_t n_slices,
         backends::BufferDescriptor* out_descs) override {
-        // Mock descriptor preparation
         for (uint32_t i = 0; i < n_slices; ++i) {
-            out_descs[i].device_addr = ioaddrs[0] + slices[i].offset_bytes;
-            out_descs[i].byte_length = slices[i].length_bytes;
+            out_descs[i].prp1        = ioaddrs[0] + slices[i].offset_bytes;
+            out_descs[i].data_length = slices[i].length_bytes;
         }
         return true;
     }
 
-    void release_descriptors(
-        const backends::BufferDescriptor* descs,
-        uint32_t n_descs) override {
-        // Mock release - no-op
-    }
+    void release_descriptors(backends::BufferDescriptor*, uint32_t) override {}
 
-    void launch_batch_gpu_stream(
-        void* stream,
-        void* target_handle,
-        const backends::BufferDescriptor* descs,
-        uint32_t n_descs,
-        bool is_read) override {
-        // Mock kernel launch - no-op
-        std::cout << "  [Mock] Launched batch with " << n_descs << " descriptors, is_read="
-                  << is_read << std::endl;
+    // --- Target handle management ---
+    void* acquire_target_handle(const backends::StorageTarget&) override {
+        return reinterpret_cast<void*>(0x1000);
     }
-
-    // Other required methods (not used in smoke test)
-    bool submit_batch_cpu_sync(void*, const backends::BufferDescriptor*, uint32_t, bool) override { return true; }
-    bool submit_batch_cpu_async(void*, const backends::BufferDescriptor*, uint32_t, bool) override { return true; }
-    bool setup_coop_channel(void*, void*, uint32_t) override { return true; }
-    void* acquire_target_handle() override { return reinterpret_cast<void*>(0x1000); }
     void release_target_handle(void*) override {}
+
+    // --- Submission ---
+    void launch_batch_gpu_stream(
+        void*, void*,
+        const backends::BufferDescriptor*, uint32_t, bool) override {
+        std::cout << "  [Mock] GPU stream batch launched" << std::endl;
+    }
+
+    backends::SubmissionResult submit_batch_cpu_sync(
+        void*, const backends::BufferDescriptor*, uint32_t, bool) override {
+        backends::SubmissionResult r{};
+        r.success = true;
+        return r;
+    }
+
+    bool submit_batch_cpu_async(
+        backends::IOFuture*, void*,
+        const backends::BufferDescriptor*, uint32_t, bool) override { return true; }
+
+    bool setup_coop_channel(const backends::CoopChannelConfig&, void*) override { return true; }
+
+    bool poll_future(const backends::IOFuture&, backends::SubmissionResult*) override { return true; }
+    bool wait_future(const backends::IOFuture&, uint32_t, backends::SubmissionResult*) override { return true; }
 };
 
 //==============================================================================
@@ -237,7 +248,7 @@ bool test_submit_batch_blocking() {
 
     char buffer[8192];
     MemoryRegion* region = accel.register_host(buffer, 8192);
-    void* target = backend.acquire_target_handle();
+    void* target = backend.acquire_target_handle(backends::StorageTarget{});
     AccelStream stream = accel.create_stream();
 
     IoRequest req;
@@ -272,7 +283,7 @@ bool test_submit_batch_async() {
 
     char buffer[8192];
     MemoryRegion* region = accel.register_host(buffer, 8192);
-    void* target = backend.acquire_target_handle();
+    void* target = backend.acquire_target_handle(backends::StorageTarget{});
     AccelStream stream = accel.create_stream();
 
     IoRequest req;
@@ -312,7 +323,7 @@ bool test_multi_region_batch() {
     char buffer2[4096];
     MemoryRegion* region1 = accel.register_host(buffer1, 4096);
     MemoryRegion* region2 = accel.register_host(buffer2, 4096);
-    void* target = backend.acquire_target_handle();
+    void* target = backend.acquire_target_handle(backends::StorageTarget{});
     AccelStream stream = accel.create_stream();
 
     IoRequest req1;

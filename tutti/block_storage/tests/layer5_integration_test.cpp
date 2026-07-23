@@ -19,85 +19,86 @@ using namespace tutti;
 // Mock Backend Provider for testing
 class MockBackendProvider : public backends::IBackendProvider {
 public:
-    MockBackendProvider() : device_count_(4), next_lba_(1000) {}
+    MockBackendProvider() {}
 
-    bool initialize(VDevice* vdev) override { return true; }
+    bool initialize(VDevice*) override { return true; }
     void cleanup() override {}
 
-    bool prepare_descriptors(const uint64_t* ioaddrs, const backends::SubSliceInfo* slices,
-                            uint32_t n_slices, backends::BufferDescriptor* out_descs) override {
-        return true;
+    backends::BackendType backend_type() const override { return backends::BackendType::LOCAL_NVME; }
+    const char* backend_name() const override { return "MockBackend"; }
+    size_t max_io_size() const override { return 1024 * 1024; }
+    backends::BackendMetadata metadata() const override {
+        backends::BackendMetadata m{};
+        m.max_io_size = 1024 * 1024;
+        return m;
     }
 
-    void release_descriptors(backends::BufferDescriptor* descs, uint32_t n_descs) override {}
+    bool prepare_descriptors(const uint64_t*, const backends::SubSliceInfo*,
+                             uint32_t, backends::BufferDescriptor*) override { return true; }
+    void release_descriptors(backends::BufferDescriptor*, uint32_t) override {}
 
-    void* acquire_target_handle(const backends::StorageTarget& target) override {
+    void* acquire_target_handle(const backends::StorageTarget& t) override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return reinterpret_cast<void*>(0x1000 + target.namespace_id);
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(0x1000 + t.namespace_id));
     }
+    void release_target_handle(void*) override {}
 
-    void release_target_handle(void* handle) override {}
+    void launch_batch_gpu_stream(void*, void*, const backends::BufferDescriptor*, uint32_t, bool) override {}
 
-    void launch_batch_gpu_stream(void* stream, void* target_handle,
-                                 backends::BufferDescriptor* descs, uint32_t n_descs,
-                                 bool is_read) override {}
-
-    bool submit_batch_cpu_sync(void* target_handle, backends::BufferDescriptor* descs,
-                               uint32_t n_descs, bool is_read) override {
-        return true;
+    backends::SubmissionResult submit_batch_cpu_sync(
+        void*, const backends::BufferDescriptor*, uint32_t, bool) override {
+        backends::SubmissionResult r{}; r.success = true; return r;
     }
-
-    backends::BackendType get_backend_type() const override {
-        return backends::BackendType::LOCAL_NVME;
-    }
-
-    const char* get_backend_name() const override { return "MockBackend"; }
-    backends::BackendCapabilities get_capabilities() const override {
-        return backends::BackendCapabilities{};
-    }
-    uint64_t get_max_io_size() const override { return 1024 * 1024; }
+    bool submit_batch_cpu_async(backends::IOFuture*, void*, const backends::BufferDescriptor*, uint32_t, bool) override { return true; }
+    bool setup_coop_channel(const backends::CoopChannelConfig&, void*) override { return true; }
+    bool poll_future(const backends::IOFuture&, backends::SubmissionResult*) override { return true; }
+    bool wait_future(const backends::IOFuture&, uint32_t, backends::SubmissionResult*) override { return true; }
 
 private:
-    size_t device_count_;
     uint64_t next_lba_;
     mutable std::mutex mutex_;
 };
 
 // Mock Accelerator for testing
-class MockAccelerator : public accel::IAccelerator {
+class MockAccelerator : public IAccelerator {
 public:
-    accel::AccelKind get_kind() const override { return accel::AccelKind::CUDA; }
-    const char* get_name() const override { return "MockAccel"; }
+    const char* vendor_name() const override { return "MockGPU"; }
+    int device_count() const override { return 1; }
+    bool set_device(int) override { return true; }
+    int get_device() const override { return 0; }
 
-    bool allocate(size_t size, accel::MemoryKind kind, void** ptr) override {
-        *ptr = malloc(size);
-        return *ptr != nullptr;
+    void* allocate_host(size_t size, MemoryKind) override { return malloc(size); }
+    void* allocate_device(size_t size, MemoryKind, int) override { return malloc(size); }
+    void free(void* ptr, MemoryKind) override { ::free(ptr); }
+
+    MemoryRegion* register_host(void* host_ptr, size_t size) override {
+        auto* r = new MemoryRegion{}; r->host_ptr = host_ptr; r->size = size; return r;
     }
-
-    bool deallocate(void* ptr, accel::MemoryKind kind) override {
-        free(ptr);
-        return true;
+    MemoryRegion* register_device(void* dev_ptr, size_t size, int) override {
+        auto* r = new MemoryRegion{}; r->device_ptr = dev_ptr; r->size = size; return r;
     }
+    MemoryRegion* register_external(void*, void*, size_t, const ExternalMemorySpec&) override { return nullptr; }
+    void unregister(MemoryRegion* r) override { delete r; }
+    MemoryRegion* lookup(const void*) const override { return nullptr; }
+    MemoryRegion* lookup_by_id(uint64_t) const override { return nullptr; }
+    void* device_pointer_for(const void*) override { return nullptr; }
 
-    bool copy(void* dst, const void* src, size_t size, accel::MemoryKind dst_kind,
-             accel::MemoryKind src_kind, void* stream) override {
-        memcpy(dst, src, size);
-        return true;
+    AccelStream create_stream() override { return AccelStream(reinterpret_cast<void*>(0x2000)); }
+    void destroy_stream(AccelStream) override {}
+    void synchronize_stream(AccelStream) override {}
+
+    AccelEvent create_event() override { return AccelEvent(reinterpret_cast<void*>(0x3000)); }
+    void destroy_event(AccelEvent) override {}
+    void record_event(AccelEvent, AccelStream) override {}
+    void wait_event(AccelStream, AccelEvent) override {}
+    bool query_event(AccelEvent) override { return true; }
+
+    bool memcpy_async(void* dst, const void* src, size_t size, AccelStream) override {
+        memcpy(dst, src, size); return true;
     }
-
-    bool memset(void* ptr, int value, size_t size, accel::MemoryKind kind,
-               void* stream) override {
-        ::memset(ptr, value, size);
-        return true;
-    }
-
-    void* create_stream() override { return reinterpret_cast<void*>(0x2000); }
-    void destroy_stream(void* stream) override {}
-    bool stream_sync(void* stream) override { return true; }
-
-    bool get_device_properties(accel::DeviceProperties* props) override {
-        return true;
-    }
+    void launch(void*, const Dim3&, const Dim3&, size_t, AccelStream, void**) override {}
+    bool ipc_export(MemoryRegion*, IpcHandle*) override { return false; }
+    MemoryRegion* ipc_import(const IpcHandle&, int) override { return nullptr; }
 };
 
 void test_large_file_striping() {
@@ -331,8 +332,8 @@ void test_sync_durability() {
     handle->dirty = true;
 
     // Sync file
-    void* stream = accelerator.create_stream();
-    result = storage->sync_file(handle, stream);
+    AccelStream stream = accelerator.create_stream();
+    result = storage->sync_file(handle, stream.handle);
     assert(result);
     assert(!handle->dirty);
 

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <sys/types.h>  // off_t (used in ExternalMemorySpec::host_fd)
 #include "memory_kind.h"
 
 namespace tutti {

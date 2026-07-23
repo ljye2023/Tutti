@@ -124,18 +124,22 @@ add_subdirectory(coordinator)      # Layer 6 ✅ ENABLED
 # add_subdirectory(raw_device)       # Layer 5 (legacy)
 
 # ---------------------------------------------------------------------------
-# Tests (Layer 1 smoke tests)
+# Tests
+#
+# Set -DBUILD_TESTING=ON to include the test suite in the build.
+# Default is OFF so a plain `cmake -S tutti -B tutti/build` stays lean.
 # ---------------------------------------------------------------------------
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/CMakeLists.txt")
-    add_subdirectory(../tests ${CMAKE_CURRENT_BINARY_DIR}/tests)
-    message(STATUS "Added tests subdirectory for Layer 1 smoke tests")
-endif()
+option(BUILD_TESTING "Build Tutti tests" OFF)
 
-# Layer 1 IAccelerator smoke tests (tutti/tests/accel)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/accel/CMakeLists.txt")
-    add_subdirectory(tests/accel ${CMAKE_CURRENT_BINARY_DIR}/tests_accel)
-    message(STATUS "Added tests/accel subdirectory for Layer 1 IAccelerator smoke tests")
+if(BUILD_TESTING)
+    include(CTest)
+
+    # Layer 1 IAccelerator smoke tests (tutti/tests/accel)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/accel/CMakeLists.txt")
+        add_subdirectory(tests/accel ${CMAKE_CURRENT_BINARY_DIR}/tests_accel)
+        message(STATUS "Tutti: added tests/accel (Layer 1 smoke tests)")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

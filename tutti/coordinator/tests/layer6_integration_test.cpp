@@ -12,117 +12,143 @@
 using namespace tutti;
 using namespace tutti::coordinator;
 
-// Mock implementations (same as smoke test)
+// Mock implementations (aligned to current interfaces)
 class MockBackendProvider : public backends::IBackendProvider {
 public:
-    void* acquire_target_handle(backends::StorageTarget* target) override {
-        return reinterpret_cast<void*>(0x1000 + (counter_++));
+    bool initialize(VDevice*) override { return true; }
+    void cleanup() override {}
+
+    backends::BackendType backend_type() const override { return backends::BackendType::LOCAL_NVME; }
+    const char* backend_name() const override { return "MockNVMe"; }
+    size_t max_io_size() const override { return 131072; }
+    backends::BackendMetadata metadata() const override {
+        backends::BackendMetadata m{}; m.max_io_size = 131072; return m;
     }
 
-    bool release_target_handle(void* handle) override {
-        return true;
-    }
+    bool prepare_descriptors(const uint64_t*, const backends::SubSliceInfo*, uint32_t, backends::BufferDescriptor*) override { return true; }
+    void release_descriptors(backends::BufferDescriptor*, uint32_t) override {}
 
-    uint32_t max_io_size() const override {
-        return 131072;
+    void* acquire_target_handle(const backends::StorageTarget&) override {
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(0x1000 + counter_++));
     }
+    void release_target_handle(void*) override {}
+
+    void launch_batch_gpu_stream(void*, void*, const backends::BufferDescriptor*, uint32_t, bool) override {}
+    backends::SubmissionResult submit_batch_cpu_sync(void*, const backends::BufferDescriptor*, uint32_t, bool) override {
+        backends::SubmissionResult r{}; r.success = true; return r;
+    }
+    bool submit_batch_cpu_async(backends::IOFuture*, void*, const backends::BufferDescriptor*, uint32_t, bool) override { return true; }
+    bool setup_coop_channel(const backends::CoopChannelConfig&, void*) override { return true; }
+    bool poll_future(const backends::IOFuture&, backends::SubmissionResult*) override { return true; }
+    bool wait_future(const backends::IOFuture&, uint32_t, backends::SubmissionResult*) override { return true; }
 
 private:
-    int counter_ = 0;
+    mutable int counter_ = 0;
 };
 
 class MockAccelerator : public IAccelerator {
 public:
-    MemoryRegion* register_host_memory(void* ptr, size_t size) override {
-        auto* region = new MemoryRegion();
-        region->ptr = ptr;
-        region->size = size;
-        region->region_id = next_id_++;
-        region->kind = MemoryKind::HOST;
-        return region;
-    }
+    const char* vendor_name() const override { return "MockGPU"; }
+    int device_count() const override { return 1; }
+    bool set_device(int) override { return true; }
+    int get_device() const override { return 0; }
 
-    MemoryRegion* register_device_memory(void* ptr, size_t size) override {
-        auto* region = new MemoryRegion();
-        region->ptr = ptr;
-        region->size = size;
-        region->region_id = next_id_++;
-        region->kind = MemoryKind::DEVICE;
-        return region;
-    }
+    void* allocate_host(size_t size, MemoryKind) override { return malloc(size); }
+    void* allocate_device(size_t size, MemoryKind, int) override { return malloc(size); }
+    void free(void* ptr, MemoryKind) override { ::free(ptr); }
 
-    MemoryRegion* register_external_memory(void* ptr, size_t size) override {
-        auto* region = new MemoryRegion();
-        region->ptr = ptr;
-        region->size = size;
-        region->region_id = next_id_++;
-        region->kind = MemoryKind::EXTERNAL;
-        return region;
+    MemoryRegion* register_host(void* host_ptr, size_t size) override {
+        auto* r = new MemoryRegion{};
+        r->host_ptr  = host_ptr;
+        r->size      = size;
+        r->region_id = next_id_++;
+        r->kind      = MemoryKind::HOST;
+        return r;
     }
+    MemoryRegion* register_device(void* dev_ptr, size_t size, int) override {
+        auto* r = new MemoryRegion{};
+        r->device_ptr = dev_ptr;
+        r->size       = size;
+        r->region_id  = next_id_++;
+        r->kind       = MemoryKind::DEVICE;
+        return r;
+    }
+    MemoryRegion* register_external(void*, void*, size_t, const ExternalMemorySpec&) override { return nullptr; }
+    void unregister(MemoryRegion* r) override { delete r; }
+    MemoryRegion* lookup(const void*) const override { return nullptr; }
+    MemoryRegion* lookup_by_id(uint64_t) const override { return nullptr; }
+    void* device_pointer_for(const void*) override { return nullptr; }
 
-    bool unregister_memory(MemoryRegion* region) override {
-        delete region;
-        return true;
-    }
+    AccelStream create_stream() override { return AccelStream(reinterpret_cast<void*>(static_cast<uintptr_t>(0x2000 + stream_counter_++))); }
+    void destroy_stream(AccelStream) override {}
+    void synchronize_stream(AccelStream) override {}
 
-    HalStream* create_stream() override {
-        return reinterpret_cast<HalStream*>(0x2000 + (stream_counter_++));
-    }
+    AccelEvent create_event() override { return AccelEvent(reinterpret_cast<void*>(0x3000)); }
+    void destroy_event(AccelEvent) override {}
+    void record_event(AccelEvent, AccelStream) override {}
+    void wait_event(AccelStream, AccelEvent) override {}
+    bool query_event(AccelEvent) override { return true; }
 
-    bool destroy_stream(HalStream* stream) override {
-        return true;
+    bool memcpy_async(void* dst, const void* src, size_t size, AccelStream) override {
+        memcpy(dst, src, size); return true;
     }
+    void launch(void*, const Dim3&, const Dim3&, size_t, AccelStream, void**) override {}
+    bool ipc_export(MemoryRegion*, IpcHandle*) override { return false; }
+    MemoryRegion* ipc_import(const IpcHandle&, int) override { return nullptr; }
 
 private:
-    uint64_t next_id_ = 1;
-    int stream_counter_ = 0;
+    uint64_t next_id_       = 1;
+    int      stream_counter_ = 0;
 };
 
 class MockBlockStorage : public block_storage::IBlockStorage {
 public:
-    bool initialize(const block_storage::BlockStorageConfig&) override {
-        return true;
-    }
-
-    bool shutdown() override {
-        return true;
-    }
+    bool initialize(const block_storage::BlockStorageConfig&,
+                    backends::IBackendProvider*, IAccelerator*) override { return true; }
+    void cleanup() override {}
 
     block_storage::GpuFileHandle* open_gpu_file(
-        const std::string&, block_storage::FileOpenMode) override {
+        const std::string&, block_storage::FileOpenMode,
+        uint64_t = 0, uint64_t = 0) override {
         return reinterpret_cast<block_storage::GpuFileHandle*>(0x3000);
     }
+    bool close_gpu_file(block_storage::GpuFileHandle*) override { return true; }
+    bool delete_gpu_file(const std::string&) override { return true; }
 
-    bool close_gpu_file(block_storage::GpuFileHandle*) override {
-        return true;
+    std::vector<block_storage::GpuFileHandle*> open_gpu_files_batch(
+        const std::vector<std::string>&,
+        const std::vector<block_storage::FileOpenMode>&,
+        size_t /*count*/) override { return {}; }
+
+    std::vector<block_storage::FileInfo> list_gpu_file_names() override { return {}; }
+
+    backends::StorageTarget acquire_device_handle(block_storage::GpuFileHandle*, size_t) override {
+        return backends::StorageTarget{};
     }
+    bool release_device_handle(block_storage::GpuFileHandle*, size_t) override { return true; }
+    bool sync_file(block_storage::GpuFileHandle*, void*) override { return true; }
+    bool flush_metadata() override { return true; }
 };
 
 class MockIoEngine : public IIoEngine {
 public:
     bool submit_batch(
-        const std::vector<IoRequest>& requests, bool is_read, AccelStream stream) override {
+        const std::vector<tutti::IoRequest>& requests, bool, AccelStream) override {
         submitted_count_ += requests.size();
         return true;
     }
 
     bool submit_batch_async(
-        const std::vector<IoRequest>& requests, bool is_read, AccelStream stream) override {
+        const std::vector<tutti::IoRequest>& requests, bool, AccelStream) override {
         submitted_count_ += requests.size();
         return true;
     }
 
-    uint32_t max_entries_per_batch() const override {
-        return 128;
-    }
+    uint32_t max_entries_per_batch() const override { return 128; }
 
-    uint32_t slice_fanout(const MemoryRegion*) const override {
-        return 1;
-    }
+    uint32_t slice_fanout(const MemoryRegion*) const override { return 1; }
 
-    uint32_t get_submitted_count() const {
-        return submitted_count_;
-    }
+    uint32_t get_submitted_count() const { return submitted_count_; }
 
 private:
     uint32_t submitted_count_ = 0;
@@ -279,7 +305,7 @@ bool test_batch_submit_validation() {
     req.byte_offset = 0;
     req.byte_length = 4096;
 
-    BatchSubmitResult result = coordinator->submit_read_batch(&req, 1, nullptr);
+    BatchSubmitResult result = coordinator->submit_read_batch(&req, 1, AccelStream{});
 
     if (!result.success) {
         std::cout << "FAILED (submit failed)" << std::endl;
