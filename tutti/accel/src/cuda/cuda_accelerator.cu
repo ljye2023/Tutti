@@ -188,7 +188,7 @@ MemoryRegion* CudaAccelerator::register_host(void* host_ptr, size_t size) {
     RegionEntry entry;
     entry.region.region_id = region_id;
     entry.region.kind = MemoryKind::HOST;
-    entry.region.cuda_device = -1;
+    entry.region.device_id = -1;
     entry.region.host_ptr = host_ptr;
     entry.region.device_ptr = nullptr;
     entry.region.size = size;
@@ -212,7 +212,7 @@ MemoryRegion* CudaAccelerator::register_device(void* device_ptr, size_t size, in
     RegionEntry entry;
     entry.region.region_id = region_id;
     entry.region.kind = MemoryKind::DEVICE;
-    entry.region.cuda_device = device_id;
+    entry.region.device_id = device_id;
     entry.region.host_ptr = nullptr;
     entry.region.device_ptr = device_ptr;
     entry.region.size = size;
@@ -241,7 +241,7 @@ MemoryRegion* CudaAccelerator::register_external(
     RegionEntry entry;
     entry.region.region_id = region_id;
     entry.region.kind = MemoryKind::EXTERNAL;
-    entry.region.cuda_device = (device_ptr != nullptr) ? get_device() : -1;
+    entry.region.device_id = (device_ptr != nullptr) ? get_device() : -1;
     entry.region.host_ptr = host_ptr;
     entry.region.device_ptr = device_ptr;
     entry.region.size = size;
@@ -486,8 +486,8 @@ MemoryRegion* CudaAccelerator::ipc_import(const IpcHandle& handle, int device_id
 
     // Register as external memory with CUDA IPC source
     ExternalMemorySpec spec;
-    spec.source = ExternalMemorySpec::Source::CUDA_IPC;
-    memcpy(spec.cuda_ipc.handle, handle.data, sizeof(spec.cuda_ipc.handle));
+    spec.source = ExternalMemorySpec::Source::DEVICE_IPC;
+    memcpy(spec.device_ipc.handle, handle.data, sizeof(spec.device_ipc.handle));
 
     // Note: We don't know the size from the handle alone
     // This is a limitation - caller should provide size

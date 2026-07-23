@@ -118,10 +118,10 @@ add_subdirectory(accel)
 
 add_subdirectory(device_manager)   # Layer 2 ✅ ENABLED
 add_subdirectory(backends)         # Layer 3 ✅ ENABLED
-# add_subdirectory(io_engine)        # Layer 4
-# add_subdirectory(block_storage)    # Layer 5
-# add_subdirectory(raw_device)       # Layer 5
-# add_subdirectory(coordinator)      # Layer 6
+add_subdirectory(io_engine)        # Layer 4 ✅ ENABLED
+add_subdirectory(block_storage)    # Layer 5 ✅ ENABLED
+add_subdirectory(coordinator)      # Layer 6 ✅ ENABLED
+# add_subdirectory(raw_device)       # Layer 5 (legacy)
 
 # ---------------------------------------------------------------------------
 # Tests (Layer 1 smoke tests)
@@ -130,6 +130,12 @@ add_subdirectory(backends)         # Layer 3 ✅ ENABLED
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/CMakeLists.txt")
     add_subdirectory(../tests ${CMAKE_CURRENT_BINARY_DIR}/tests)
     message(STATUS "Added tests subdirectory for Layer 1 smoke tests")
+endif()
+
+# Layer 1 IAccelerator smoke tests (tutti/tests/accel)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/accel/CMakeLists.txt")
+    add_subdirectory(tests/accel ${CMAKE_CURRENT_BINARY_DIR}/tests_accel)
+    message(STATUS "Added tests/accel subdirectory for Layer 1 IAccelerator smoke tests")
 endif()
 
 # ---------------------------------------------------------------------------

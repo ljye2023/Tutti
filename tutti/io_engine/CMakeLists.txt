@@ -14,7 +14,7 @@
 
 set(LAYER_NAME "tutti_io_engine")
 set(LAYER_NUMBER 4)
-set(DEPENDS_ON "tutti_accel;tutti_backend_interface")
+set(DEPENDS_ON "tutti_accel;tutti_backends")
 
 # =============================================================================
 # Source Collection
@@ -78,7 +78,7 @@ target_link_libraries(${LAYER_NAME}
     PUBLIC
         tutti_types
         tutti_accel
-        tutti_backend_interface
+        tutti_backends
     PRIVATE
         CUDA::cudart
 )

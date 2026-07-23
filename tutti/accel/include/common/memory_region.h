@@ -14,7 +14,7 @@ struct MemoryRegion {
     // Identity
     uint64_t    region_id;      // Unique across the runtime
     MemoryKind  kind;
-    int         cuda_device;    // Which GPU owns this (or -1 for host-only)
+    int         device_id;      // Which accelerator device owns this (or -1 for host-only)
 
     // Address views
     void*       host_ptr;       // nullptr if device-only
@@ -34,14 +34,14 @@ struct MemoryRegion {
 struct ExternalMemorySpec {
     enum class Source {
         APP_MANAGED,  // Caller allocated, HAL just tracks it
-        CUDA_IPC,     // cudaIpcOpenMemHandle
+        DEVICE_IPC,   // Device-runtime IPC handle (e.g. cudaIpcOpenMemHandle)
         HOST_SHM,     // shm_open + mmap
         HOST_FD_MAP,  // fd + mmap
     } source;
 
     union {
         struct { /* empty */ } app_managed;
-        struct { uint8_t handle[64]; } cuda_ipc;  // cudaIpcMemHandle_t
+        struct { uint8_t handle[64]; } device_ipc;  // Opaque device IPC handle
         struct { int shm_fd; } host_shm;
         struct { int fd; off_t offset; } host_fd;
     };
