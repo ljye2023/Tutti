@@ -45,6 +45,15 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
+# gRPC: optional; when found, nvmeservice (daemon NVMe multi-process path) is
+# enabled and TUTTI_NVMESERVICE_ENABLED is defined on all targets that need it.
+find_package(gRPC CONFIG QUIET)
+if(gRPC_FOUND)
+    message(STATUS "Tutti: gRPC found -- nvmeservice (daemon NVMe) enabled")
+else()
+    message(STATUS "Tutti: gRPC NOT found -- daemon NVMe path disabled")
+endif()
+
 # yaml-cpp: used by Layer 2 (device_manager/nvme/nvmeservice) config parser.
 # Normalize the target name across packagings:
 #   vcpkg / new upstream : yaml-cpp::yaml-cpp

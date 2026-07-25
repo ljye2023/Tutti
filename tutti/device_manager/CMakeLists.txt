@@ -70,10 +70,18 @@ set(COMMON_SOURCES
     src/common/device_manager_impl.cpp
 )
 
-# New NVMe driver sources (DirectNvmeDeviceDriver, DaemonNvmeDeviceDriver)
+# New NVMe driver sources (DirectNvmeDeviceDriver, DaemonNvmeDeviceDriver).
+# daemon_nvme_queue_alloc.cu is the CUDA helper for daemon-mode queue allocation;
+# it lives in the same driver source set so it is part of tutti_device_manager.
 set(NVME_DRIVER_SOURCES
     nvme/src/direct_nvme_device_driver.cpp
     nvme/src/daemon_nvme_device_driver.cpp
+)
+
+# CUDA sources for daemon queue allocation helper.
+# Kept separate so CMake applies CUDA-specific flags only to these files.
+set(NVME_CUDA_DRIVER_SOURCES
+    nvme/src/daemon_nvme_queue_alloc.cu
 )
 
 # Mock backend sources (in-memory IDeviceDriver, peer to nvme)
@@ -96,6 +104,7 @@ set(LAYER_SOURCES
     ${COMMON_SOURCES}
     ${NVME_SOURCES}
     ${NVME_DRIVER_SOURCES}
+    ${NVME_CUDA_DRIVER_SOURCES}
     ${MOCK_SOURCES}
 )
 
@@ -114,6 +123,10 @@ add_library(${LAYER_NAME} ${LAYER_SOURCES})
 set_target_properties(${LAYER_NAME} PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME "tutti_device_manager"
     BUILD_RPATH "$ORIGIN"
@@ -137,6 +150,20 @@ target_include_directories(${LAYER_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/nvme/libnvm/include
 )
 
+# When nvmeservice is available (gRPC found), add its include paths so that
+# daemon_nvme_device_driver.cpp and daemon_nvme_queue_alloc.cu can reach
+# nvmeservice_client.h, queue.h, buffer.h, and the generated proto headers.
+if(gRPC_FOUND)
+    target_include_directories(${LAYER_NAME}
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/nvme/nvmeservice/src
+    )
+    # Signal to the driver sources that nvmeservice gRPC support is compiled in.
+    target_compile_definitions(${LAYER_NAME}
+        PRIVATE TUTTI_NVMESERVICE_ENABLED=1
+    )
+endif()
+
 # =============================================================================
 # Dependencies
 # =============================================================================
@@ -146,7 +173,19 @@ target_link_libraries(${LAYER_NAME}
         tutti_accel
     PRIVATE
         libnvm
+        CUDA::cudart
 )
+
+# When nvmeservice is available (gRPC found), link the gRPC client library so
+# DaemonNvmeDeviceDriver can open sessions with the daemon.
+if(gRPC_FOUND)
+    target_link_libraries(${LAYER_NAME}
+        PRIVATE
+            nvmeservice
+            gRPC::grpc++
+            protobuf::libprotobuf
+    )
+endif()
 
 # =============================================================================
 # Layer Metadata (for validation)

@@ -1,14 +1,16 @@
-# tutti/tests/device_manager/nvme/CMakeLists.txt -- Layer 2 NVMe real-hardware test
+# tutti/tests/device_manager/nvme/CMakeLists.txt -- Layer 2 NVMe tests
 #
-# nvme_real_hw_test is a GoogleTest that shells out to the prebuilt
-# nvmeservice_client example binary to exercise the real NVMe path
-# (daemon B3 owner + gRPC Connect + libnvm attach/create + GPU IO) against a
-# physical controller (default 0000:b1:00.0).
+# Two test executables:
 #
-# The test itself links only GoogleTest -- no libnvm / CUDA / gRPC -- because
-# it drives everything through the client binary.  All cases GTEST_SKIP()
-# unless TUTTI_NVME_REAL_HW=1 (and the destructive tier needs
-# TUTTI_NVME_ALLOW_DESTRUCTIVE=1), so this is safe on hardware-less nodes.
+#   nvme_real_hw_test     -- Integration test that shells out to the prebuilt
+#                            nvmeservice_client binary (no libnvm/CUDA link).
+#                            Gated behind TUTTI_NVME_REAL_HW=1.
+#
+#   daemon_driver_test    -- Unit + integration tests for DaemonNvmeDeviceDriver.
+#                            Unit cases (DaemonDriverUnit.*) work with no hardware
+#                            by using the mock-grant fallback built into the driver.
+#                            Real-HW cases (DaemonDriverRealHw.*) gate on
+#                            TUTTI_NVME_REAL_HW=1 + a live daemon.
 
 cmake_minimum_required(VERSION 3.18)
 
@@ -28,8 +30,10 @@ if(NOT GTest_FOUND)
     FetchContent_MakeAvailable(googletest)
 endif()
 
+set(DM_LAYER_DIR "${PROJECT_SOURCE_DIR}/device_manager")
+
 # ---------------------------------------------------------------------------
-# Test executable
+# nvme_real_hw_test -- shells out to nvmeservice_client, no driver link
 # ---------------------------------------------------------------------------
 add_executable(nvme_real_hw_test
     nvme_real_hw_test.cpp
@@ -41,11 +45,6 @@ set_target_properties(nvme_real_hw_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Bake in the default client-binary path so the test finds it without env
-# overrides.  Prefer the exact built location of the client example target
-# (a generator expression, resolved at build time) when that target exists in
-# this configure; otherwise fall back to the conventional bin/ path (env
-# TUTTI_NVME_CLIENT_BIN always overrides at run time regardless).
 if(TARGET nvmeservice_client_example)
     target_compile_definitions(nvme_real_hw_test PRIVATE
         TUTTI_NVME_CLIENT_BIN="$<TARGET_FILE:nvmeservice_client_example>")
@@ -59,14 +58,59 @@ target_link_libraries(nvme_real_hw_test PRIVATE
     GTest::gtest_main
 )
 
-# Stage the b1-targeted config next to the binaries for the driver script.
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/sys_config.b1.yaml
                ${CMAKE_BINARY_DIR}/bin/sys_config.b1.yaml COPYONLY)
 
+# ---------------------------------------------------------------------------
+# daemon_driver_test -- DaemonNvmeDeviceDriver unit + integration
+# ---------------------------------------------------------------------------
+add_executable(daemon_driver_test
+    daemon_driver_test.cpp
+)
+
+set_target_properties(daemon_driver_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Include paths:
+#   - nvme/include    : daemon_nvme_device_driver.h, nvme_virtual_device.h, etc.
+#   - device_manager/include : common/*.h (IDeviceDriver, ILeaseManager, …)
+#   - mock/include    : MockLeaseManager
+#   - libnvm/include  : nvm_types.h (needed by nvme_virtual_device.h)
+target_include_directories(daemon_driver_test PRIVATE
+    ${DM_LAYER_DIR}/nvme/include
+    ${DM_LAYER_DIR}/include
+    ${DM_LAYER_DIR}/mock/include
+    ${DM_LAYER_DIR}/nvme/libnvm/include
+    ${PROJECT_SOURCE_DIR}
+)
+
+# When nvmeservice is available the test is compiled with the same flag so the
+# real-HW fixture can #ifdef-check for it.
+if(gRPC_FOUND)
+    target_compile_definitions(daemon_driver_test PRIVATE
+        TUTTI_NVMESERVICE_ENABLED=1)
+endif()
+
+target_link_libraries(daemon_driver_test PRIVATE
+    tutti_device_manager   # provides DaemonNvmeDeviceDriver (mock-grant or gRPC path)
+    GTest::gtest
+    GTest::gtest_main
+)
+
+# ---------------------------------------------------------------------------
+# CTest registration
+# ---------------------------------------------------------------------------
 include(GoogleTest)
-# Label so CI can exclude real-hardware / destructive cases by default:
-#   ctest -L real_hw      (opt-in)     ctest -LE real_hw   (exclude)
+
 gtest_discover_tests(nvme_real_hw_test
     PROPERTIES LABELS "real_hw;nvme;destructive")
 
-message(STATUS "Configured nvme_real_hw_test (Layer 2 real-HW, shells out to nvmeservice_client)")
+# Unit cases always run; real-HW cases carry the real_hw label so they can be
+# excluded on hardware-less nodes with: ctest -LE real_hw
+gtest_discover_tests(daemon_driver_test
+    PROPERTIES LABELS "nvme")
+
+message(STATUS "Configured nvme_real_hw_test and daemon_driver_test (Layer 2 NVMe)")
