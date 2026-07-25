@@ -62,6 +62,30 @@ set(NVME_HEADERS
 
 set(NVME_SOURCES
     nvme/src/local_nvme_virtual.cpp
+    nvme/src/nvme_physical_device.cpp
+)
+
+# New Layer 2 common sources (DeviceManagerImpl, etc.)
+set(COMMON_SOURCES
+    src/common/device_manager_impl.cpp
+)
+
+# New NVMe driver sources (DirectNvmeDeviceDriver, DaemonNvmeDeviceDriver)
+set(NVME_DRIVER_SOURCES
+    nvme/src/direct_nvme_device_driver.cpp
+    nvme/src/daemon_nvme_device_driver.cpp
+)
+
+# Mock backend sources (in-memory IDeviceDriver, peer to nvme)
+set(MOCK_HEADERS
+    mock/include/mock_physical_device.h
+    mock/include/mock_virtual_device.h
+    mock/include/mock_lease_manager.h
+    mock/include/mock_device_driver.h
+)
+
+set(MOCK_SOURCES
+    mock/src/mock_device_driver.cpp
 )
 
 set(NVME_CUDA_HEADERS
@@ -69,7 +93,10 @@ set(NVME_CUDA_HEADERS
 )
 
 set(LAYER_SOURCES
+    ${COMMON_SOURCES}
     ${NVME_SOURCES}
+    ${NVME_DRIVER_SOURCES}
+    ${MOCK_SOURCES}
 )
 
 set(LAYER_HEADERS
@@ -101,9 +128,11 @@ target_include_directories(${LAYER_NAME}
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/nvme/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/mock/include>
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
         $<INSTALL_INTERFACE:include>
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/nvme/src
         ${CMAKE_CURRENT_SOURCE_DIR}/nvme/libnvm/include
 )
@@ -151,6 +180,11 @@ install(DIRECTORY nvme/include/
     FILES_MATCHING
         PATTERN "*.h"
         PATTERN "*.cuh"
+)
+
+install(DIRECTORY mock/include/
+    DESTINATION include/tutti/device_manager/mock
+    FILES_MATCHING PATTERN "*.h"
 )
 
 # =============================================================================

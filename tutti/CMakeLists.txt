@@ -140,6 +140,12 @@ if(BUILD_TESTING)
         add_subdirectory(tests/accel ${CMAKE_CURRENT_BINARY_DIR}/tests_accel)
         message(STATUS "Tutti: added tests/accel (Layer 1 smoke tests)")
     endif()
+
+    # Layer 2 vendor-neutral Device Manager tests (tutti/tests/device_manager)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/device_manager/CMakeLists.txt")
+        add_subdirectory(tests/device_manager ${CMAKE_CURRENT_BINARY_DIR}/tests_device_manager)
+        message(STATUS "Tutti: added tests/device_manager (Layer 2 vendor-neutral tests)")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
