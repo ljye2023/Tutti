@@ -7,6 +7,7 @@ build_layer2/
 build_layer2/*
 # In-tree CMake build dir under the Layer 2 tests (configured artifacts only).
 tutti/device_manager/tests/build/
+build_snvme_module/
 
 # Third-party packages directory
 third_pkgs/

@@ -1,0 +1,33 @@
+# sys_config.b1.yaml -- NVMeService daemon config for the Layer 2 real-hardware
+# test.  Targets the scratch NVMe at 0000:b1:00.0 and CUDA device 0 (L40S).
+#
+# This file is consumed by nvme_real_hw_test's driver script
+# (run_real_hw_test.sh), which starts the daemon as the exclusive B3 owner of
+# 0000:b1:00.0 before the GoogleTest client connects.
+#
+# WARNING: the daemon takes exclusive ownership of 0000:b1:00.0 (unbinds it
+# from the in-tree nvme driver).  The Tier-2 IO case writes to the namespace.
+# Only point this at a scratch device that is safe to wipe.
+
+grpc:
+  endpoint: "127.0.0.1:50051"
+
+gpus:
+  - id: 0
+    mount_path: "/mnt/gpu0"
+
+nvmes:
+  - pci_addr: "0000:b1:00.0"      # device_id=0 -- the scratch Intel DC SSD
+    mount_path: "/mnt/nvme0"
+    namespace_id: 1
+    kernel_ioq_cap: 16            # controller MSI-X budget < vCPU count;
+                                  # matches the proven SNVME_TEST_KERNEL_IOQ_CAP=16
+    allowed_gpus: [0]
+
+queue_pool:
+  default_per_client: 16
+  max_per_client: 32
+
+lease:
+  heartbeat_interval_sec: 10
+  timeout_sec: 30
