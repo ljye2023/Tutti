@@ -132,7 +132,19 @@ static void nvme_set_queue_dying(struct nvme_ns *ns)
 	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
 		return;
 
+	/*
+	 * blk_set_queue_dying(request_queue) was removed upstream in v5.17 and
+	 * replaced by blk_mark_disk_dead(gendisk); the change was backported into
+	 * some 5.15 point-releases (e.g. Ubuntu HWE 5.15.0-185).  Select on whether
+	 * the target kernel exports blk_mark_disk_dead (probed in the Kbuild
+	 * Makefile), not on LINUX_VERSION_CODE -- the Ubuntu ABI number is not the
+	 * upstream stable SUBLEVEL, so a version gate would misfire.
+	 */
+#ifdef HAVE_BLK_MARK_DISK_DEAD
+	blk_mark_disk_dead(ns->disk);
+#else
 	blk_set_queue_dying(ns->queue);
+#endif
 	blk_mq_unquiesce_queue(ns->queue);
 
 	set_capacity_and_notify(ns->disk, 0);

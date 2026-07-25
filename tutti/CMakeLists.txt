@@ -146,6 +146,15 @@ if(BUILD_TESTING)
         add_subdirectory(tests/device_manager ${CMAKE_CURRENT_BINARY_DIR}/tests_device_manager)
         message(STATUS "Tutti: added tests/device_manager (Layer 2 vendor-neutral tests)")
     endif()
+
+    # Layer 2 NVMe real-hardware tests (tutti/tests/device_manager/nvme).
+    # Shells out to the nvmeservice_client example; all cases skip unless
+    # TUTTI_NVME_REAL_HW=1, so it is safe to configure everywhere.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/device_manager/nvme/CMakeLists.txt")
+        add_subdirectory(tests/device_manager/nvme
+                         ${CMAKE_CURRENT_BINARY_DIR}/tests_device_manager_nvme)
+        message(STATUS "Tutti: added tests/device_manager/nvme (Layer 2 real-HW NVMe tests)")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

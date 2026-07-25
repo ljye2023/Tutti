@@ -793,7 +793,13 @@ void nvme_mpath_remove_disk(struct nvme_ns_head *head)
 {
 	if (!head->disk)
 		return;
+	/* See core.c nvme_set_queue_dying(): newer 5.15 point-releases removed
+	 * blk_set_queue_dying() in favour of blk_mark_disk_dead(). */
+#ifdef HAVE_BLK_MARK_DISK_DEAD
+	blk_mark_disk_dead(head->disk);
+#else
 	blk_set_queue_dying(head->disk->queue);
+#endif
 	/* make sure all pending bios are cleaned up */
 	kblockd_schedule_work(&head->requeue_work);
 	flush_work(&head->requeue_work);

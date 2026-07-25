@@ -14,6 +14,16 @@ snvme-objs := nvfs-pci.o nvfs-p2p.o list.o ctrl.o map.o pci.o
 
 KERNEL_SRC := /lib/modules/$(shell uname -r)/build
 
+# blk_set_queue_dying() was removed upstream in v5.17 and replaced by
+# blk_mark_disk_dead(gendisk); the change was backported into some 5.15
+# point-releases (e.g. Ubuntu HWE 5.15.0-185).  Decide by whether the target
+# kernel actually EXPORTS blk_mark_disk_dead -- do not gate on the version
+# number, because the Ubuntu ABI number is not the upstream stable SUBLEVEL.
+have_bmdd := $(shell grep -qsw blk_mark_disk_dead $(KERNEL_SRC)/Module.symvers && echo 1)
+ifeq ($(have_bmdd),1)
+ccflags-y += -DHAVE_BLK_MARK_DISK_DEAD
+endif
+
 all:
 	$(MAKE) -C $(KERNEL_SRC) M=@module_output@ modules
 insmod:
