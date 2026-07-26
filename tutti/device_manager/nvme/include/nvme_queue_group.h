@@ -4,7 +4,7 @@
  * nvme_queue_group.h -- GPU-resident NVMe queue pool
  *
  * NvmeQueueGroup manages a set of NVMe user queue pairs on GPU.
- * Created by device_manager, consumed by backends via VDevice.
+ * Created by device_manager, consumed by backends via NvmeVirtualDevice.
  */
 
 #include <cstdint>

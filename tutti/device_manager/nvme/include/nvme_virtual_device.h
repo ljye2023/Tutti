@@ -37,13 +37,13 @@ struct NvmeVirtualDevice : IVirtualDevice {
     nvm_queue_t* d_qps       = nullptr;
     uint32_t     queue_quota = 0;       // number of QPs in this slice
 
-    // Namespace view (from LocalNvmeDevice)
+    // Namespace view (copied from the owning NvmePhysicalDevice)
     uint32_t namespace_id  = 0;
     uint32_t blk_size      = 0;
     uint32_t blk_size_log  = 0;
     size_t   max_data_size = 0;         // MDTS in bytes
 
-    // ── Constructor (used by LocalNvmeDeviceDriver) ───────────────────────
+    // ── Constructor (used by Direct/Daemon NvmeDeviceDriver) ──────────────
     NvmeVirtualDevice(int32_t phys_id, uint32_t vdev_id, uint32_t caps)
         : phys_device_id_(phys_id), vdev_id_(vdev_id), caps_(caps) {}
 

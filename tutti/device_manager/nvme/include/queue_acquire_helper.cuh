@@ -6,7 +6,7 @@
  * Layer: device_manager (NVMe-specific)
  *
  * Device-side helpers for queue acquisition and NVMe command submission.
- * These operate on nvm_queue_t* (libnvm struct) exposed via VDevice::d_qps.
+ * These operate on nvm_queue_t* (libnvm struct) exposed via NvmeVirtualDevice::d_qps.
  *
  * Concurrency model:
  *   - acquire_queue(): Hash-based queue selection (round-robin)

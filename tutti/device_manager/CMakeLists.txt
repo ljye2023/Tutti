@@ -2,8 +2,8 @@
 # Layer 2: Device Manager - Complete NVMe Virtualization Stack
 #
 # Provides:
-#   - Common: IVirtualNvme, IDeviceRegistry, ILeaseManager, VDevice
-#   - NVMe: LocalNvmeVirtualRegistry, queue helpers, registries
+#   - Common: IDeviceManager, IPhysicalDevice, IVirtualDevice, IDeviceDriver, ILeaseManager
+#   - NVMe: Nvme{Physical,Virtual}Device, Direct/Daemon NVMe drivers, queue helpers
 #   - libnvm: User-space NVMe queue library
 #   - NVMeService: Cross-process arbitration daemon
 #   - snvme: Kernel module for NVMe user queues
@@ -43,25 +43,30 @@ endif()
 # Source Collection
 # =============================================================================
 
-# Common sources (transport-agnostic interfaces)
+# Common headers (transport-agnostic interfaces)
 set(COMMON_HEADERS
-    include/common/device.h
-    include/common/vdevice.h
-    include/common/virtual_nvme.h
-    include/common/device_registry.h
-    include/common/lease_manager.h
+    include/common/device_type.h
+    include/common/idevice_manager.h
+    include/common/iphysical_device.h
+    include/common/ivirtual_device.h
+    include/common/idevice_driver.h
+    include/common/ilease_manager.h
+    include/common/null_lease_manager.h
+    include/common/device_manager_impl.h
 )
 
-# NVMe-specific sources
+# NVMe-specific headers
 set(NVME_HEADERS
-    nvme/include/local_nvme_device.h
+    nvme/include/nvme_physical_device.h
+    nvme/include/nvme_virtual_device.h
     nvme/include/nvme_queue_group.h
-    nvme/include/local_nvme_virtual.h
+    nvme/include/direct_nvme_device_driver.h
+    nvme/include/daemon_nvme_device_driver.h
+    nvme/include/daemon_nvme_queue_alloc.h
     nvme/include/queue_acquire_helper.cuh
 )
 
 set(NVME_SOURCES
-    nvme/src/local_nvme_virtual.cpp
     nvme/src/nvme_physical_device.cpp
 )
 
@@ -253,8 +258,8 @@ install(DIRECTORY mock/include/
 #    - Dead-process queue reclamation
 #
 # 3. In-Process Virtualization (Level-2)
-#    - IVirtualNvme interface (include/common/)
-#    - LocalNvmeVirtualRegistry (nvme/src/)
+#    - IVirtualDevice interface (include/common/)
+#    - Per-backend IDeviceDriver::alloc_vdevice (nvme/src/)
 #    - Per-backend vDevice allocation
 #
 # 4. Device-Side Queue Mechanics
@@ -264,20 +269,26 @@ install(DIRECTORY mock/include/
 # Directory Structure:
 #
 # include/common/           - Transport-agnostic interfaces
-#   device.h               - Device struct + BackendType enum
-#   vdevice.h              - VDevice struct
-#   virtual_nvme.h         - IVirtualNvme interface
-#   device_registry.h      - IDeviceRegistry interface
-#   lease_manager.h        - ILeaseManager interface
+#   device_type.h          - DeviceType enum
+#   idevice_manager.h      - IDeviceManager interface (entry point)
+#   iphysical_device.h     - IPhysicalDevice interface
+#   ivirtual_device.h      - IVirtualDevice interface
+#   idevice_driver.h       - IDeviceDriver plugin interface
+#   ilease_manager.h       - ILeaseManager interface
+#   null_lease_manager.h   - NullLeaseManager (direct-mode no-op)
+#   device_manager_impl.h  - DeviceManagerImpl / create_device_manager
 #
 # nvme/                     - All NVMe-specific code
 #   include/               - NVMe-specific types
-#     local_nvme_device.h  - LocalNvmeDevice struct
+#     nvme_physical_device.h - NvmePhysicalDevice (IPhysicalDevice)
+#     nvme_virtual_device.h  - NvmeVirtualDevice (IVirtualDevice)
 #     nvme_queue_group.h   - NvmeQueueGroup class
-#     local_nvme_virtual.h - LocalNvmeVirtualRegistry class
+#     direct_nvme_device_driver.h  - DirectNvmeDeviceDriver
+#     daemon_nvme_device_driver.h  - DaemonNvmeDeviceDriver
 #     queue_acquire_helper.cuh - Device-side queue helpers
 #   src/                   - NVMe implementations
-#     local_nvme_virtual.cpp - LocalNvmeVirtualRegistry implementation
+#     nvme_physical_device.cpp - NvmePhysicalDevice implementation
+#     direct_nvme_device_driver.cpp / daemon_nvme_device_driver.cpp
 #     queue_acquire_helper_impl.cuh - Device-side helper implementations
 #   libnvm/                - User-space NVMe library
 #     include/             - libnvm public headers

@@ -15,6 +15,27 @@ daemon (B3 owner: chrdev_create + kernel_ioq_cap + SNVM_DEVICE_BIND + probe)
 `nvmeservice_client` example binary (the only in-tree driver of the full
 libnvm + GPU IO path). The test links only GoogleTest — no libnvm/CUDA/gRPC.
 
+`daemon_driver_test` drives the low-level `DaemonNvmeDeviceDriver` directly
+(unit tier in mock-grant mode; `DaemonDriverRealHw.*` against a live daemon).
+
+`device_manager_real_hw_test` exercises the **upper-layer** path a real
+consumer (e.g. `tutti/backends/nvme`) uses, through the `IDeviceManager`
+facade rather than the driver:
+
+```
+create_device_manager({DaemonNvmeDeviceDriver}) -> IDeviceManager
+  dm->Open()
+  IVirtualDevice* v = dm->open_vdevice(phys_id, quota, &err)
+  assert v->type() == LOCAL_NVME; auto* nvme = static_cast<NvmeVirtualDevice*>(v)
+  read nvme->{d_qps, queue_quota, namespace_id, blk_size, blk_size_log, max_data_size}
+  dm->close_vdevice(v)  ->  dm->Close()
+```
+
+`DeviceManagerFacadeUnit.*` runs anywhere (mock-grant mode, no daemon);
+`DeviceManagerFacadeRealHw.*` gates on `TUTTI_NVME_REAL_HW=1` + a live daemon
+and asserts a downcast `NvmeVirtualDevice` carries live GPU queues (`d_qps`
+non-null) and populated namespace metadata.
+
 The old monolithic driver script has been split into single-responsibility
 scripts (build, module reload, daemon start, gtest run, daemon stop). See
 "Scripts" and "Typical flow" below for how they chain together.

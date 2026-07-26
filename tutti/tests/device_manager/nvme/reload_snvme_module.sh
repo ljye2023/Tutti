@@ -126,7 +126,9 @@ reload_module() {
     SUDO insmod "$SNVME_CORE_KO"                          || { echo "  insmod snvme_core failed" >&2; return 1; }
     SUDO insmod "$SNVME_KO" io_queue_depth="$IO_QUEUE_DEPTH" || { echo "  insmod snvme failed" >&2; return 1; }
     [[ -e /dev/snvm_control ]] || { echo "  /dev/snvm_control absent after reload" >&2; return 1; }
-    echo "  module reloaded ($SNVME_KO); /dev/snvm_control present."
+    echo "  module reloaded ($SNVME_CORE_KO) ;"
+    echo "  module reloaded ($SNVME_KO) with io_queue_depth=$IO_QUEUE_DEPTH ;"
+    echo "  /dev/snvm_control present."
 }
 
 reload_module

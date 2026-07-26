@@ -1,8 +1,8 @@
 # Layer 2: Device Manager
 
-**Version:** 2.0  
-**Date:** 2026-07-24  
-**Status:** Redesigned — interfaces updated, NVMe implementation retained  
+**Version:** 2.1  
+**Date:** 2026-07-26  
+**Status:** Redesigned — vendor-neutral interfaces live; NVMe daemon path real, direct path stubbed; mock backend complete  
 **Library:** `libtutti_device_manager`  
 **Location:** `tutti/device_manager/`
 
@@ -95,9 +95,9 @@ if (vdev->type() == DeviceType::LOCAL_NVME) {
 
 ---
 
-## 3. Generic Interfaces
+## 3. Device-Agnostic Interfaces
 
-All files live under `tutti/device_manager/include/common/`.
+This section is the complete vendor-neutral surface: the interfaces, the key structures/ownership, and how they call each other. All files live under `tutti/device_manager/include/common/`. Nothing here depends on NVMe, libnvm, or CUDA.
 
 ### `DeviceType` — Transport Family Enum
 **File:** `include/common/device_type.h`
@@ -175,9 +175,10 @@ Each backend family registers one `IDeviceDriver` with `IDeviceManager` at start
 | `enumerate(out_devices)` | `int` | Discover physical devices; append to `out_devices`; return count appended |
 | `alloc_vdevice(dev, quota, error)` | `IVirtualDevice*` | Allocate a virtual device with `quota` resource units from `dev`; return `nullptr` on failure |
 | `free_vdevice(vdev)` | `void` | Return the virtual device to the pool; no-op on `nullptr` |
+| `shutdown()` | `void` | Stop the heartbeat thread, release the lease, and free all enumerated `IPhysicalDevice` instances. The driver is unusable afterward. |
 
 **Ownership rules:**
-- `IPhysicalDevice*` instances returned by `enumerate()` are owned by the driver; lifetime until driver destruction
+- `IPhysicalDevice*` instances returned by `enumerate()` are owned by the driver; lifetime until `shutdown()` / driver destruction
 - `IVirtualDevice*` instances returned by `alloc_vdevice()` are owned by the driver; lifetime until `free_vdevice()`
 
 ---
@@ -226,6 +227,62 @@ mgr->close_vdevice(vdev);
 mgr->Close();
 ```
 
+#### Construction
+
+`DeviceManagerImpl` is the only concrete `IDeviceManager`. It is never constructed directly; callers assemble a driver set and hand it to the factory, which takes ownership of the drivers:
+
+```cpp
+// src/common/device_manager_impl.cpp
+std::unique_ptr<IDeviceManager> create_device_manager(
+    std::vector<std::unique_ptr<IDeviceDriver>> drivers);
+```
+
+`Open()` iterates the drivers and calls `enumerate()` on each. A driver returning `n < 0` aborts `Open()` (returns `false`, clears the registry); `n == 0` is a success that simply contributes no devices. Note the rollback only clears the manager's registry — it does **not** call `shutdown()` on drivers that already enumerated, so partial-failure cleanup is the caller's responsibility.
+
+---
+
+### Key Structures & Ownership
+
+The generic layer defines no concrete data structures beyond the interfaces above; the only concrete class is `DeviceManagerImpl`, whose internal state captures the whole model:
+
+| Member | Type | Meaning |
+|--------|------|---------|
+| `drivers_` | `vector<unique_ptr<IDeviceDriver>>` | **Owned.** One driver per backend family. |
+| `devices_` | `vector<IPhysicalDevice*>` | Flat registry, raw pointers **owned by the drivers**. Built during `Open()`. |
+| `live_vdevices_` | `vector<pair<IVirtualDevice*, IDeviceDriver*>>` | Maps each open vDevice to the driver that made it, so `close_vdevice()` can route teardown correctly. |
+| `mutex_` | `std::mutex` | Guards `open_vdevice` / `close_vdevice`. |
+
+### Call Relationships
+
+```
+create_device_manager(drivers)          // factory takes ownership of drivers
+        │
+        ▼
+DeviceManagerImpl::Open()
+        └── for each driver: driver->enumerate(devices_)   // drivers create & own IPhysicalDevice
+                                     │
+                                     └─ [daemon] gRPC connect + attach + create_group
+                                        [direct] open device via libnvm   (stubbed today)
+                                        [mock]   fabricate N devices in memory
+
+DeviceManagerImpl::open_vdevice(phys_id, quota)
+        ├── find_by_id(phys_id) → IPhysicalDevice*
+        ├── pick driver whose type() == dev->type()
+        ├── driver->alloc_vdevice(dev, quota)  → IVirtualDevice*   // driver owns it
+        └── record {vdev, driver} in live_vdevices_
+
+caller: static_cast<NvmeVirtualDevice*>(vdev)   // gated by type(); reads d_qps etc.
+
+DeviceManagerImpl::close_vdevice(vdev)
+        └── look up driver in live_vdevices_ → driver->free_vdevice(vdev)
+
+DeviceManagerImpl::Close()
+        ├── free every live vdevice via its driver
+        └── driver->shutdown() for each driver   // frees IPhysicalDevice, stops heartbeat
+```
+
+The manager never touches `ILeaseManager`; leases are entirely a driver concern (injected at driver construction). This is why the cross-process/in-process boundary sits inside `enumerate()`, not in the manager (see §5).
+
 ---
 
 ### `ILeaseManager` — Cross-Process Arbitration
@@ -239,9 +296,11 @@ Manages the per-process resource grant issued by the **DeviceService** daemon. M
 | `release_lease(lease_id)` | `bool` | Explicitly release grant before exit; `false` if not held |
 | `has_lease(lease_id)` | `bool` | Query whether grant is currently active |
 
-**Single-process / direct mode:** `ILeaseManager` is a no-op (`heartbeat` always returns `true`, `has_lease` always returns `true`).
+**Implementations shipping today** (see §6 for status):
+- `NullLeaseManager` (`include/common/null_lease_manager.h`) — no-op for direct / single-process mode; all three methods return `true`.
+- `MockLeaseManager` (`mock/include/mock_lease_manager.h`) — counts heartbeats/releases for tests; all methods succeed.
 
-**DeviceService** (renamed from NVMeService) is the canonical daemon implementation. It manages grants for all device types.
+> **Note:** There is **no** dedicated daemon-mode `ILeaseManager` implementation in the tree yet. In daemon mode the cross-process lease is kept alive by the `NvmeServiceClient`'s own gRPC bidi-stream heartbeat inside `DaemonNvmeDeviceDriver`; the injected `ILeaseManager*` is a higher-level tracker and is currently a `MockLeaseManager` even in the real-hardware tests. A real `DeviceServiceLeaseManager` is a future item.
 
 ---
 
@@ -343,7 +402,7 @@ There are **three** scopes, not two:
 | `IDeviceManager` | Process | In-proc (Coordinator) | One per process. Manages this process's slice. |
 | `IDeviceDriver` instances | Process | In-proc (IDeviceManager) | One per device type per process. In daemon mode, it talks to DeviceService; in direct mode, it opens the device itself. |
 | `IPhysicalDevice*` | Process | In-proc (IDeviceDriver) | **Per-process view only.** `process_grant()` = this process's grant, not hardware total. `available_grant()` = grant minus already-allocated vDevices. |
-| `ILeaseManager` | Process | In-proc (IDeviceDriver) | Either `NullLeaseManager` (direct mode) or `DeviceServiceLeaseManager` (daemon mode). |
+| `ILeaseManager` | Process | In-proc (IDeviceDriver) | `NullLeaseManager` (direct mode) or `MockLeaseManager` (daemon mode today; a real daemon-mode implementation is a future item — see §3). |
 | Heartbeat thread | Process | In-proc (IDeviceDriver) | Calls `ILeaseManager::heartbeat()` periodically. The driver owns this thread — not the manager, not the coordinator. |
 | `IVirtualDevice*` | Backend | In-proc (IDeviceDriver) | One per backend. Lifetime: `open_vdevice()` → `close_vdevice()`. |
 
@@ -403,20 +462,22 @@ The four decisions below follow directly from this structure.
 **`IDeviceDriver` owns the heartbeat thread**, not `IDeviceManager` or the Coordinator.
 
 - In direct mode (`NullLeaseManager`): no heartbeat thread needed.
-- In daemon mode (`DeviceServiceLeaseManager`): the driver starts a heartbeat thread in `enumerate()`, stops it in `shutdown()`.
-- The thread calls `lease_mgr_->heartbeat(lease_id)` every 5 seconds.
+- In daemon mode: `DaemonNvmeDeviceDriver` starts `heartbeat_loop()` on a background thread and stops it in `shutdown()`.
+- The thread calls `lease_mgr_->heartbeat(lease_id)` every **5 seconds** (sliced into 100 ms polls for responsive shutdown).
 - The Coordinator never sees the lease protocol.
+
+> The injected `lease_mgr_` is currently a `MockLeaseManager` (no real daemon-mode `ILeaseManager` exists yet — see §3). The authoritative cross-process keep-alive today is the `NvmeServiceClient`'s own gRPC bidi-stream heartbeat, separate from this thread.
 
 ### Decision 3: Direct vs. Daemon — Two IDeviceDriver Implementations
 
 NVMe support is provided by **two separate `IDeviceDriver` implementations**:
 
-| Driver | Mode | Physical Device Ownership | ILeaseManager |
-|--------|------|---------------------------|---------------|
-| `DirectNvmeDeviceDriver` | Single-process | Opens `/dev/libnvm*` directly via libnvm | `NullLeaseManager` (no-op) |
-| `DaemonNvmeDeviceDriver` | Multi-process | Connects to DeviceService daemon via gRPC | `DeviceServiceLeaseManager` |
+| Driver | Mode | Physical Device Ownership | ILeaseManager | Status |
+|--------|------|---------------------------|---------------|--------|
+| `DirectNvmeDeviceDriver` | Single-process | Opens the device directly via libnvm | `NullLeaseManager` (no-op) | `enumerate()` is a mock stub; `d_qps` left null |
+| `DaemonNvmeDeviceDriver` | Multi-process | Connects to the daemon via gRPC | injected `ILeaseManager*` (Mock today) | Real gRPC path when `TUTTI_NVMESERVICE_ENABLED` + `mock_mode=false`; fills `d_qps` |
 
-Both return the same `NvmeVirtualDevice*` upward. The mode difference is encapsulated in the driver, not exposed to `IDeviceManager`.
+Both return the same `NvmeVirtualDevice*` upward. The mode difference is encapsulated in the driver, not exposed to `IDeviceManager`. `DaemonNvmeDeviceDriver` also accepts a `mock_mode` flag that bypasses gRPC even when compiled in, for hardware-free unit tests.
 
 ### Decision 4: ILeaseManager Injection Per-Driver
 
@@ -424,16 +485,19 @@ Each `IDeviceDriver` receives its own `ILeaseManager*` at construction:
 
 ```cpp
 DirectNvmeDeviceDriver(IAccelerator* accel, ILeaseManager* lease_mgr);
-DaemonNvmeDeviceDriver(IAccelerator* accel, ILeaseManager* lease_mgr, std::string daemon_addr);
+DaemonNvmeDeviceDriver(IAccelerator* accel, ILeaseManager* lease_mgr,
+                       std::string daemon_addr, bool mock_mode = false);
 ```
 
 The `ILeaseManager` lifetime is managed by the caller (typically the Coordinator). The driver does not own it.
 
 ---
 
-## 5. Device Implementations
+## 5. NVMe Concrete Types
 
-### NVMe Implementation
+This section documents the NVMe-specific types reached by downcasting; §6 records what is actually wired up today.
+
+### `NvmeVirtualDevice` — the downcast target
 
 **Concrete type:** `NvmeVirtualDevice : IVirtualDevice`  
 **File:** `nvme/include/nvme_virtual_device.h`
@@ -463,16 +527,30 @@ struct NvmeVirtualDevice : IVirtualDevice {
 | `issue_nvme_cmd(qp, prp1, prp2, n_blocks, lba, opcode, out_cid)` | Compose SQE + ring doorbell |
 | `poll(qp, cid)` | Busy-poll CQ for completion of command `cid` |
 
-**NVMe-internal components** (not part of the vendor-neutral API):
-- `nvme/include/local_nvme_device.h` — `LocalNvmeDevice` (ctrl handle, queue group, ns metadata)
-- `nvme/include/nvme_queue_group.h` — `NvmeQueueGroup` (GPU-resident queue array)
-- `nvme/include/local_nvme_virtual.h` — `LocalNvmeVirtualRegistry` (concrete Level-② allocator)
-- `nvme/libnvm/` — libnvm integration
-- `nvme/nvmeservice/` — DeviceService daemon + client library
+**Concrete NVMe files** (under `nvme/`, not part of the vendor-neutral API):
 
-### Mock Implementation
+| File | Provides |
+|------|----------|
+| `nvme/include/nvme_physical_device.h` | `NvmePhysicalDevice : IPhysicalDevice` (ctrl handle, queue group, ns metadata) |
+| `nvme/include/nvme_virtual_device.h` | `NvmeVirtualDevice : IVirtualDevice` (the downcast target above) |
+| `nvme/include/nvme_queue_group.h` | `NvmeQueueGroup` (GPU-resident queue array) |
+| `nvme/include/direct_nvme_device_driver.h` | `DirectNvmeDeviceDriver : IDeviceDriver` |
+| `nvme/include/daemon_nvme_device_driver.h` | `DaemonNvmeDeviceDriver : IDeviceDriver` |
+| `nvme/include/queue_acquire_helper.cuh` | device-side queue mechanics (above) |
+| `nvme/libnvm/` | libnvm integration |
+| `nvme/nvmeservice/` | daemon + gRPC client library |
 
-A first-class in-memory backend that lives alongside NVMe at `device_manager/mock/`. It implements the same generic interfaces with no hardware, libnvm, or CUDA dependency:
+> The old `local_nvme_device.h` / `local_nvme_virtual.h` (the `LocalNvmeVirtualRegistry` allocator) were **removed** — the concrete `IPhysicalDevice` / driver split replaced them.
+
+---
+
+## 6. Current Implementation Status
+
+This section records what is actually built today (v2.1), so consumers know which paths are load-bearing and which are stubs.
+
+### Mock backend — complete
+
+A first-class in-memory backend at `device_manager/mock/`, implementing every generic interface with no hardware, libnvm, or CUDA dependency:
 
 | Type | Interface | File |
 |------|-----------|------|
@@ -481,15 +559,32 @@ A first-class in-memory backend that lives alongside NVMe at `device_manager/moc
 | `MockDeviceDriver` | `IDeviceDriver` | `mock/include/mock_device_driver.h` |
 | `MockLeaseManager` | `ILeaseManager` | `mock/include/mock_lease_manager.h` |
 
-It fabricates physical devices with a configurable resource grant and serves vDevice allocations entirely in memory. Because it depends only on the `common/` headers, it doubles as the proof that the vendor-neutral layer has no vendor coupling: a target that links `DeviceManagerImpl` + the mock backend pulls in zero NVMe/CUDA symbols. It is the backend used by the Layer 2 vendor-neutral test suite (`tutti/tests/device_manager/`) and is suitable for CI and bring-up on machines without NVMe hardware.
+- `MockDeviceDriver::enumerate()` fabricates a configurable count of devices (ctor params: `type, base_id, device_count, grant_each, caps, lease_mgr`), each with the given grant and caps, and drives the lease at bring-up if a `lease_mgr` was supplied.
+- `alloc_vdevice()` performs **real accounting**: checks `available_grant()`, calls `reserve()`, and constructs a `MockVirtualDevice` recording the quota as `resource_count`. `free_vdevice()` releases the grant back.
+- `MockVirtualDevice` is **metadata-only** by design — it has no `d_qps`-style resource pointer, matching the fact that mock has no transport.
 
-### RDMA Implementation
+Because it depends only on `common/` headers, it is the proof that the vendor-neutral layer has no vendor coupling: a target linking `DeviceManagerImpl` + mock pulls in zero NVMe/CUDA symbols. It backs the Layer 2 vendor-neutral test suite (`tutti/tests/device_manager/`) and is suitable for CI on NVMe-less machines.
 
-Placeholder: `RdmaVirtualDevice : IVirtualDevice` to be implemented. Will expose RDMA queue-pair handles and memory-region slots in place of `d_qps`.
+### NVMe backend — daemon path real, direct path stubbed
+
+| Path | `enumerate()` | `alloc_vdevice()` → `d_qps` | Notes |
+|------|---------------|------------------------------|-------|
+| `DaemonNvmeDeviceDriver`, real (`TUTTI_NVMESERVICE_ENABLED` + `mock_mode=false`) | **Real** — gRPC `list_devices` + `connect` + `nvm_ctrl_attach_client` + `nvm_create_group` | **Real** — `daemon_nvme_alloc_queues()` fills `d_qps` when `ctx.ctrl != nullptr` | Verified on hardware; see the facade test below |
+| `DaemonNvmeDeviceDriver`, `mock_mode=true` | Fabricates one 16-QP device, `ctrl` null | null | For hardware-free unit tests |
+| `DaemonNvmeDeviceDriver`, built w/o gRPC | Fabricates one "MockGrant" device | null | `#else` fallback |
+| `DirectNvmeDeviceDriver` | **Stub** — fabricates one 16-QP device (`// TODO: replace with real libnvm device discovery`) | **null** (`// left null in mock`) | Not yet wired to real libnvm |
+
+Regardless of path, `namespace_id` / `blk_size` / `blk_size_log` / `max_data_size` on the returned `NvmeVirtualDevice` are copied from the owning `NvmePhysicalDevice`; only `d_qps` depends on a live `ctrl`.
+
+**Tests:** `tutti/tests/device_manager/nvme/` — `daemon_driver_test.cpp` (driver unit + real-HW tiers) and `device_manager_real_hw_test.cpp` (the `IDeviceManager` facade path: `open_vdevice` → downcast → resource-field access, both mock and real-HW tiers).
+
+### RDMA / GDS — not implemented
+
+`RdmaVirtualDevice` / `GdsVirtualDevice` are reserved `DeviceType` values only. When added, each implements the same `IDeviceDriver` + `I{Physical,Virtual}Device` triad and exposes its own resource handles (RDMA queue-pair / memory-region slots) in place of `d_qps`.
 
 ---
 
-## 6. Migration from v1 API
+## 7. Migration from v1 API
 
 The v1 API (`IDeviceRegistry` + `IVirtualNvme` + `VDevice`) is superseded by this design. Key mapping:
 
@@ -501,24 +596,27 @@ The v1 API (`IDeviceRegistry` + `IVirtualNvme` + `VDevice`) is superseded by thi
 | `VDevice` struct (NVMe-coupled) | `IVirtualDevice*` base + `NvmeVirtualDevice*` subtype |
 | `open_vdevice(phys_id, quota)` | `IDeviceManager::open_vdevice(phys_id, resource_quota)` |
 | `available_queues(phys_id)` | `IDeviceManager::available_resources(phys_id)` |
-| `NVMeService` | `DeviceService` (manages all device types) |
 
-The old headers (`device.h`, `device_registry.h`, `vdevice.h`, `virtual_nvme.h`, `lease_manager.h`) are retained for backward compatibility but should be migrated away from.
+The old headers (`device.h`, `device_registry.h`, `vdevice.h`, `virtual_nvme.h`, `lease_manager.h`, `local_nvme_device.h`, `local_nvme_virtual.h`) have been **deleted** from `tutti/device_manager/`. Any code still including them (e.g. parts of `tutti/backends/nvme/` that took a flat `VDevice*`) must migrate to `IVirtualDevice*` + a `static_cast<NvmeVirtualDevice*>` after checking `type()`.
+
+> The daemon is still named **nvmeservice** in the tree (`nvme/nvmeservice/`). An earlier draft of this doc called it "DeviceService"; that rename has not happened in code.
 
 ---
 
-## 7. Vendor-Neutral Boundary
+## 8. Vendor-Neutral Boundary
 
 This document covers the `common/` API. The vendor-neutral surface:
 
 | File | Provides |
 |------|----------|
-| `include/common/backend_type.h` | `DeviceType` enum |
+| `include/common/device_type.h` | `DeviceType` enum |
 | `include/common/iphysical_device.h` | `IPhysicalDevice` interface |
 | `include/common/ivirtual_device.h` | `IVirtualDevice` interface |
 | `include/common/idevice_driver.h` | `IDeviceDriver` plugin interface |
 | `include/common/idevice_manager.h` | `IDeviceManager` facade |
 | `include/common/ilease_manager.h` | `ILeaseManager` interface |
+| `include/common/null_lease_manager.h` | `NullLeaseManager` (direct-mode no-op) |
+| `include/common/device_manager_impl.h` | `DeviceManagerImpl` + `create_device_manager()` factory |
 
 Nothing above Layer 2 includes libnvm. The `nvm_types.h` include in `NvmeVirtualDevice` is the only cross-boundary type, and it is confined to NVMe backends that explicitly downcast.
 

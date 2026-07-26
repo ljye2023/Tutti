@@ -101,6 +101,41 @@ target_link_libraries(daemon_driver_test PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# device_manager_real_hw_test -- IDeviceManager facade (upper-layer) tests
+# ---------------------------------------------------------------------------
+# Exercises create_device_manager -> open_vdevice -> NvmeVirtualDevice downcast
+# -> resource-field access, i.e. the path tutti/backends/nvme uses. Unit cases
+# run anywhere (mock-grant mode); real-HW cases gate on TUTTI_NVME_REAL_HW=1.
+add_executable(device_manager_real_hw_test
+    device_manager_real_hw_test.cpp
+)
+
+set_target_properties(device_manager_real_hw_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+target_include_directories(device_manager_real_hw_test PRIVATE
+    ${DM_LAYER_DIR}/nvme/include
+    ${DM_LAYER_DIR}/include
+    ${DM_LAYER_DIR}/mock/include
+    ${DM_LAYER_DIR}/nvme/libnvm/include
+    ${PROJECT_SOURCE_DIR}
+)
+
+if(gRPC_FOUND)
+    target_compile_definitions(device_manager_real_hw_test PRIVATE
+        TUTTI_NVMESERVICE_ENABLED=1)
+endif()
+
+target_link_libraries(device_manager_real_hw_test PRIVATE
+    tutti_device_manager
+    GTest::gtest
+    GTest::gtest_main
+)
+
+# ---------------------------------------------------------------------------
 # CTest registration
 # ---------------------------------------------------------------------------
 include(GoogleTest)
@@ -113,4 +148,9 @@ gtest_discover_tests(nvme_real_hw_test
 gtest_discover_tests(daemon_driver_test
     PROPERTIES LABELS "nvme")
 
-message(STATUS "Configured nvme_real_hw_test and daemon_driver_test (Layer 2 NVMe)")
+# Facade unit cases always run; real-HW cases carry the real_hw label.
+gtest_discover_tests(device_manager_real_hw_test
+    PROPERTIES LABELS "nvme")
+
+message(STATUS "Configured nvme_real_hw_test, daemon_driver_test and "
+               "device_manager_real_hw_test (Layer 2 NVMe)")
