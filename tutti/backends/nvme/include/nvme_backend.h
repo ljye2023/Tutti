@@ -1,188 +1,156 @@
 #ifndef TUTTI_BACKENDS_NVME_BACKEND_H_
 #define TUTTI_BACKENDS_NVME_BACKEND_H_
 
-#include "backends/include/backend_provider.h"
-#include "nvme_command_builder.h"
-#include "prp_page_cache.h"
+#include "backends/include/backend.h"
+#include "backends/include/backend_types.h"
+#include "backends/include/storage_target.h"
+#include "nvme_io_types.h"
+#include <cstdint>
 #include <memory>
-#include <unordered_map>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace tutti {
+
+struct NvmeVirtualDevice;  // device_manager/nvme/include/nvme_virtual_device.h
+
+} // namespace tutti
 
 namespace tutti {
 namespace backends {
 namespace nvme {
 
-// Concrete IBackendProvider implementation for NVMe transport.
+class NvmeCommandBuilder;
+class PrpPageCache;
+
+// Concrete IBackend implementation for local NVMe transport.
 //
-// Responsibilities:
-//   - Consume VDevice from Device Manager at initialize()
-//   - Build PRP/SGL descriptors from ioaddrs via NvmeCommandBuilder
-//   - Manage GPU-resident target handles (NvmeFileDeviceHandle)
-//   - Launch GPU batch submission kernel on AccelStream
-//   - Provide CPU synchronous submission path for bootstrap/testing
+// Inherits the device-agnostic IBackend contract: lifecycle (initialize /
+// shutdown), vdevice roster, and metadata. NVMe-specific operations —
+// descriptor preparation, target handle management, and submission — are
+// exposed as non-virtual host methods (register-equivalent) or device-side
+// helpers (submit_one, see nvme_device_helpers.cuh).
 //
-// Dependencies (consuming downward):
-//   - Device Manager: VDevice (queues + namespace view + caps) at initialize()
-//   - Accelerator HAL: AccelStream, dma_map, cudaMalloc/cudaMemcpy wrappers
-//   - Abstraction: TUTTI_DEVICE, TUTTI_GLOBAL, TUTTI_LAUNCH_KERNEL macros
+// ── Roster ───────────────────────────────────────────────────────────────────
 //
-// Consumed by (upward):
-//   - IO Engine: calls prepare_descriptors, launch_batch_gpu_stream, submit_batch_cpu_sync
-//   - Block Storage: calls acquire_target_handle, release_target_handle
+//   initialize() opens cfg.vdevice_count vdevices from cfg.phys_id via the
+//   Device Manager, downcasting each IVirtualDevice* to NvmeVirtualDevice*.
+//   On any failure the partial roster is rolled back and initialize returns
+//   false. A shared PRP cache is sized for the aggregate queue quota.
 //
-// Key design notes:
-//   - Receives VDevice once at initialize(); steady-state IO never calls DM
-//   - Owns PRP-list page cache internally (two-tier: GPU L1 + host-pinned L2)
-//   - Launches backend-specific submit_batch_kernel on GPU stream
-//   - Target handle is NvmeFileDeviceHandle: extents + reference to vdev->d_qps
-//   - Steady-state IO uses DM's device-side queue mechanics (no hot-path DM calls)
-class NvmeBackend : public IBackendProvider {
+// ── NVMe-specific methods (non-virtual, call after initialize()) ──────────────
+//
+//   acquire_target_handle(target, hdl)
+//       Build a GPU-resident NvmeFileDeviceHandle bound to the vdevice
+//       selected by hdl (VDeviceHandle). Returns a device pointer (opaque
+//       void*), or nullptr on failure.
+//
+//   release_target_handle(handle)
+//       Free the GPU-resident handle and associated overflow extents.
+//
+//   prepare_descriptors(ioaddrs, slices, n, out_descs)
+//       Build PRP descriptors from DMA addresses. Shared across all vdevices.
+//
+//   release_descriptors(descs, n)
+//       Return PRP-list pages to cache.
+//
+//   launch_batch_gpu_stream(stream, target_handle, descs, n, is_read)
+//       Launch the GPU batch submission kernel on the given CUDA stream.
+//
+//   submit_batch_cpu_sync(target_handle, descs, n, is_read)
+//       CPU synchronous submission (bootstrap / testing).
+class NvmeBackend : public IBackend {
 public:
     NvmeBackend();
     ~NvmeBackend() override;
 
-    // Disable copy/move - backend manages GPU resources
     NvmeBackend(const NvmeBackend&) = delete;
     NvmeBackend& operator=(const NvmeBackend&) = delete;
 
-    // ========== LIFECYCLE ==========
+    // ── IBackend: lifecycle ──────────────────────────────────────────────────
 
-    // Initialize backend with Device Manager VDevice.
-    //
-    // Stores vdev pointer, initializes PRP cache with queue_quota sizing:
-    //   L1 pool: queue_quota * 2 pages (GPU-resident)
-    //   L2 pool: queue_quota * 8 pages (host-pinned)
-    //
-    // vdev: VDevice pointer from Device Manager (non-null for NVMe backends)
-    //
-    // Returns true on success, false on failure (backend unusable if false).
-    bool initialize(VDevice* vdev) override;
+    // Open cfg.vdevice_count NvmeVirtualDevice slices from cfg.phys_id.
+    // Initialises PRP cache sized for total queue quota. Rolls back on partial
+    // allocation failure.
+    bool initialize(IDeviceManager* dm, const BackendConfig& cfg) override;
 
-    // Clean up backend resources.
-    //
-    // Releases all target handles, frees PRP cache, clears vdev reference.
-    // Does NOT call Device Manager directly - caller returns vdev to DM.
-    void cleanup() override;
+    // Return every vdevice to the Device Manager and free backend resources.
+    // Idempotent: safe to call more than once.
+    void shutdown() override;
 
-    // ========== DESCRIPTOR PREPARATION ==========
+    // ── IBackend: vdevice roster ─────────────────────────────────────────────
 
-    // Prepare PRP descriptors from raw DMA addresses.
-    //
-    // Calls descriptor_builder_->build_prp_descriptors() for PRP construction.
-    // Falls back to SGL if controller supports and transfer exceeds PRP limits (future).
-    //
-    // Returns true on success, false on failure (out of PRP pages, MDTS exceeded).
+    uint32_t        vdevice_count()            const override;
+    IVirtualDevice* vdevice_at(uint32_t i)     const override;
+    VDeviceHandle   vdevice_handle_at(uint32_t i) const override;
+
+    // ── IBackend: metadata ───────────────────────────────────────────────────
+
+    BackendType     backend_type() const override { return BackendType::LOCAL_NVME; }
+    const char*     backend_name() const override { return "local_nvme"; }
+    BackendMetadata metadata()     const override;
+
+    // ── NVMe-specific: descriptor preparation ───────────────────────────────
+
+    // Build PRP descriptors from raw DMA addresses (one per sub-slice).
+    // Returns true on success; false if MDTS exceeded or PRP cache exhausted.
     bool prepare_descriptors(
-        const uint64_t* ioaddrs,
+        const uint64_t*    ioaddrs,
         const SubSliceInfo* slices,
-        uint32_t n_slices,
-        BufferDescriptor* out_descs) override;
+        uint32_t            n_slices,
+        BufferDescriptor*   out_descs);
 
-    // Release descriptors and return PRP-list pages to cache.
-    void release_descriptors(BufferDescriptor* descs, uint32_t n_descs) override;
+    // Return PRP-list pages used by the descriptors back to the cache.
+    void release_descriptors(BufferDescriptor* descs, uint32_t n_descs);
 
-    // ========== TARGET HANDLE MANAGEMENT ==========
+    // ── NVMe-specific: target handle management ──────────────────────────────
 
-    // Acquire GPU-resident target handle from StorageTarget.
-    //
-    // Algorithm:
-    //   1. Validate target kind (NVME_FILE or NVME_RAW only)
-    //   2. Allocate host-side NvmeFileDeviceHandle on stack
-    //   3. Populate fields: file_id, logical_size_bytes, nvme_block_size from target + vdev
-    //   4. Copy extents: if num_extents <= 8, inline; else inline + overflow cudaMalloc
-    //   5. Set vdev pointer to backend's vdev_ member (reference, not ownership)
-    //   6. cudaMalloc device handle, cudaMemcpy host template to device
-    //   7. Track in target_handles_ map for cleanup
-    //
-    // Returns device pointer (opaque void*), or nullptr on failure.
-    void* acquire_target_handle(const StorageTarget& target) override;
+    // Build a GPU-resident NvmeFileDeviceHandle bound to the vdevice at hdl.
+    // Returns a device pointer (opaque void*), or nullptr on failure.
+    void* acquire_target_handle(const StorageTarget& target, VDeviceHandle hdl);
 
-    // Release GPU-resident target handle and free resources.
-    //
-    // cudaFree GPU handle, free overflow extents if present, remove from tracking map.
-    void release_target_handle(void* handle) override;
+    // Free the GPU-resident handle and its associated overflow extents.
+    void release_target_handle(void* handle);
 
-    // ========== SUBMISSION MODES ==========
+    // ── NVMe-specific: submission ────────────────────────────────────────────
 
-    // REQUIRED: Launch GPU batch submission kernel on AccelStream.
-    //
-    // Casts target_handle to NvmeFileDeviceHandle*, computes grid/block dimensions,
-    // launches submit_batch_kernel<<<>>> on stream.
-    //
-    // Grid/block sizing: block_size = 256, grid_size = (n_descs + 255) / 256.
-    // Kernel uses DM's device-side queue mechanics (acquire_queue, issue_nvme_cmd, poll).
+    // Launch the GPU batch submission kernel on stream.
     void launch_batch_gpu_stream(
-        void* stream,
-        void* target_handle,
-        const BufferDescriptor* descs,
-        uint32_t n_descs,
-        bool is_read) override;
+        void*                    stream,
+        void*                    target_handle,
+        const BufferDescriptor*  descs,
+        uint32_t                 n_descs,
+        bool                     is_read);
 
-    // REQUIRED: CPU synchronous submission.
-    //
-    // CPU-side: resolve LBAs, build NVMe commands, call libnvm nvm_cmd_read/write,
-    // poll completion queue, return success/failure.
-    //
-    // Used for bootstrap, metadata operations, and testing.
+    // CPU synchronous submission (bootstrap / testing path).
     SubmissionResult submit_batch_cpu_sync(
-        void* target_handle,
+        void*                   target_handle,
         const BufferDescriptor* descs,
-        uint32_t n_descs,
-        bool is_read) override;
-
-    // OPTIONAL: Asynchronous CPU submission - unsupported in v0.2.
-    bool submit_batch_cpu_async(
-        IOFuture* future,
-        void* target_handle,
-        const BufferDescriptor* descs,
-        uint32_t n_descs,
-        bool is_read) override;
-
-    // OPTIONAL: Setup COOP channel - unsupported in v0.2.
-    bool setup_coop_channel(
-        const CoopChannelConfig& config,
-        void* target_handle) override;
-
-    // OPTIONAL: Poll IOFuture - unsupported in v0.2.
-    bool poll_future(const IOFuture& future, SubmissionResult* out_result) override;
-
-    // OPTIONAL: Wait for IOFuture - unsupported in v0.2.
-    bool wait_future(
-        const IOFuture& future,
-        uint32_t timeout_ms,
-        SubmissionResult* out_result) override;
-
-    // ========== METADATA ==========
-
-    BackendType backend_type() const override { return BackendType::LOCAL_NVME; }
-    const char* backend_name() const override { return "local_nvme"; }
-    size_t max_io_size() const override;
-    BackendMetadata metadata() const override;
+        uint32_t                n_descs,
+        bool                    is_read);
 
 private:
-    // Device Manager reference
-    VDevice* vdev_;
+    IDeviceManager*                   dm_       = nullptr;  // not owned
+    std::vector<NvmeVirtualDevice*>   nvme_vdevices_;       // not owned (owned by DM)
 
-    // PRP-list page cache (two-tier: GPU L1 + host-pinned L2)
-    std::unique_ptr<PrpPageCache> prp_cache_;
-
-    // Descriptor builder (PRP/SGL construction logic)
+    // Shared across all vdevices (sized for aggregate queue quota)
+    std::unique_ptr<PrpPageCache>       prp_cache_;
     std::unique_ptr<NvmeCommandBuilder> descriptor_builder_;
 
-    // Target handle tracking (for cleanup validation)
-    struct TargetHandleMetadata {
-        void* device_ptr;            // GPU pointer to NvmeFileDeviceHandle
-        void* overflow_extents;      // GPU pointer to overflow extents (nullptr if none)
-        uint32_t num_extents;        // Total extent count
-        uint64_t target_id;          // Source target identifier
+    // Tracking acquired target handles for cleanup in shutdown()
+    struct TargetHandleEntry {
+        void*    device_ptr;        // GPU pointer to NvmeFileDeviceHandle
+        void*    overflow_extents;  // GPU pointer to overflow extents (null if none)
+        void*    inline_extents;    // GPU pointer to inline extent array
+        uint64_t target_id;         // Source target identifier (debug)
     };
-    std::unordered_map<void*, TargetHandleMetadata> target_handles_;
-    std::mutex target_handles_mutex_;
+    std::unordered_map<void*, TargetHandleEntry> target_handles_;
+    mutable std::mutex                           target_handles_mutex_;
 
     // Internal helpers
-    bool validate_vdev() const;
-    size_t compute_l1_cache_size() const;
-    size_t compute_l2_cache_size() const;
+    NvmeVirtualDevice* nvme_vdev_at(uint32_t i) const;
+    uint32_t           total_queue_quota() const;
 };
 
 } // namespace nvme

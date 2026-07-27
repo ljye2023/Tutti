@@ -2,8 +2,8 @@
 #define TUTTI_BACKENDS_NVME_TARGET_HANDLE_H_
 
 #include <cstdint>
-#include "device_manager/include/common/vdevice.h"
 #include "backends/include/storage_target.h"
+#include <nvm_types.h>   // nvm_queue_t (needed for d_qps field type)
 
 namespace tutti {
 namespace backends {
@@ -11,14 +11,15 @@ namespace nvme {
 
 // GPU-resident file handle consumed by device kernels.
 //
-// Design: inline-small (8 extents) + overflow pattern. 99% of files fit in inline storage.
-// Overflow extents allocated separately on GPU for large fragmented files.
+// Layout: inline-small (8 extents) + overflow pattern. 99 % of files fit in
+// the inline storage; the overflow pointer is null in that case.
 //
-// Lifetime: allocated by acquire_target_handle via cudaMalloc, held for file lifetime,
-// freed by release_target_handle via cudaFree.
+// Lifetime: allocated by NvmeBackend::acquire_target_handle() via cudaMalloc,
+// held for the duration of IO, freed by release_target_handle() via cudaFree.
 //
-// Memory layout: POD struct, ~200 bytes typical (8 inline extents). Scales to 124 extents
-// max via overflow pointer.
+// All pointer fields must point to CUDA-accessible memory (managed, device,
+// or pinned). In particular, NvmeVirtualDevice (host heap) must NOT be stored
+// here — its runtime-relevant fields are copied inline at acquisition time.
 struct NvmeFileDeviceHandle {
     // File identity and size
     uint64_t file_id;                // Source file identifier for debugging
@@ -30,25 +31,17 @@ struct NvmeFileDeviceHandle {
     uint32_t namespace_id;           // NVMe namespace id for SQE construction
 
     // Extent mapping
-    uint32_t num_extents;            // Total extent count
-    LbaExtent* extents;              // Inline extents (8 elements)
-    LbaExtent* extents_overflow;     // GPU pointer to overflow extents (nullptr if num_extents <= 8)
+    uint32_t   num_extents;          // Total extent count
+    LbaExtent* extents;              // GPU pointer to inline extents array
+    LbaExtent* extents_overflow;     // GPU pointer to overflow extents (nullptr if <= 8)
 
-    // Device Manager reference
-    VDevice* vdev;                   // Reference to DM-provided vDevice (contains d_qps, queue_quota)
+    // Queue slice — copied from NvmeVirtualDevice at acquisition time so the
+    // GPU kernel never needs to dereference a host-heap pointer.
+    nvm_queue_t* d_qps;              // GPU-resident QueuePair[] (managed memory)
+    uint32_t     queue_quota;        // Number of queue pairs in d_qps
 
-    // Inline extent storage (8 extents covers 99% of files)
+    // Inline extent capacity
     static constexpr uint32_t MAX_INLINE_EXTENTS = 8;
-};
-
-// Raw LBA range handle for direct block device access (future)
-struct NvmeRawDeviceHandle {
-    uint64_t start_lba;              // Starting LBA of range
-    uint64_t length_blocks;          // Length of range in blocks
-    uint32_t namespace_id;           // NVMe namespace id
-    uint32_t nvme_block_size;        // Namespace block size
-    uint32_t nvme_block_size_log;    // log2(block_size)
-    VDevice* vdev;                   // Reference to DM-provided vDevice
 };
 
 } // namespace nvme

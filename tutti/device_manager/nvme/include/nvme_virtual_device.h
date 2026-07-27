@@ -33,9 +33,15 @@ struct NvmeVirtualDevice : IVirtualDevice {
     // ── NVMe-specific fields (read by NVMe backends only) ─────────────────
 
     // GPU-resident queue slice: d_qps[0..queue_quota-1] belong to this vdev.
-    // Points into NvmeQueueGroup::d_qps_[slice_start].
+    // Actually points to QueuePair[] on CUDA managed memory; typed nvm_queue_t*
+    // for interface uniformity. Cast to QueuePair* to access .sq/.cq fields.
     nvm_queue_t* d_qps       = nullptr;
     uint32_t     queue_quota = 0;       // number of QPs in this slice
+
+    // libnvm controller handle. Non-null only when allocated via the real
+    // gRPC path (mock_mode=false). Needed by backends to call
+    // nvm_dma_map_data_device() for IO buffer DMA registration.
+    nvm_ctrl_t*  ctrl        = nullptr;
 
     // Namespace view (copied from the owning NvmePhysicalDevice)
     uint32_t namespace_id  = 0;

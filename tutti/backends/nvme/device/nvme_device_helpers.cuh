@@ -1,161 +1,153 @@
-#include "backends/include/storage_target.h"
 #ifndef TUTTI_BACKENDS_NVME_DEVICE_HELPERS_CUH_
 #define TUTTI_BACKENDS_NVME_DEVICE_HELPERS_CUH_
 
-#include "nvme_target_handle.h"
-#include "backends/include/backend_types.h"
-#include "device_manager/include/common/vdevice.h"
-// TODO: Add proper storage types
-#include <cstdint>
-#include <cstdint>
+// Device-side NVMe IO helpers -- private to the NVMe backend.
+//
+// Include order note:
+//   <ctrl.h> must come before <queue.h>.  ctrl.h transitively #includes
+//   queue.h (which defines QueuePair); if queue.h is included first its
+//   include guard fires when ctrl.h tries to pull it in, leaving QueuePair
+//   undefined at the point ctrl.h uses it at line ~308.  Including ctrl.h
+//   first lets the ctrl.h -> queue.h -> QueuePair chain resolve before
+//   ctrl.h needs QueuePair.
+#include <ctrl.h>                     // libnvm/src: outer include → pulls queue.h
+#include <queue.h>                    // libnvm/src: QueuePair { .sq, .cq, .nvmNamespace }
+#include <nvm_parallel_queue.h>       // get_cid, sq_enqueue, cq_poll, cq_dequeue, put_cid
+#include <nvm_cmd.h>                  // nvm_cmd_header/data_ptr/rw_blks; NVM_IO_READ/WRITE
 
-// Device-side addressing helpers - private to backend, not exposed through SPI.
-//
-// These functions consume Device Manager's device-side queue mechanics:
-//   - acquire_queue(vdev->d_qps, vdev->queue_quota, preferred_index)
-//   - issue_nvme_cmd(qp, sqe)
-//   - poll(qp, cid)
-//
-// Key design: Backend does NOT own queue mechanics - it consumes DM's device API.
+#include "nvme_target_handle.h"       // NvmeFileDeviceHandle, LbaExtent
+#include "nvme_io_types.h"            // BufferDescriptor, SubSliceInfo
+#include "backends/include/storage_target.h" // LbaExtent
+
+#include <cstdint>
 
 namespace tutti {
 namespace backends {
 namespace nvme {
 namespace device {
 
-// Resolve logical file offset to NVMe LBA and block count.
+// ── LBA resolution ──────────────────────────────────────────────────────────
+
+// Resolve logical file offset (bytes) to NVMe LBA + remaining block count.
 //
-// Walks inline extents[], falls back to extents_overflow if needed.
-// Translates logical offset to (LBA, block_count) pair for NVMe command.
-//
-// handle: GPU-resident file handle
-// logical_offset: Byte offset within file
-// out_lba: Output LBA (returned)
-// out_block_count: Output block count (returned)
-//
-// Returns true on success, false if offset is out of bounds or invalid.
+// Walks inline extents[], falls back to extents_overflow for large files.
+// Returns true on success; false if offset is out of range.
 __device__ inline bool resolve_lba(
     NvmeFileDeviceHandle* handle,
-    uint64_t logical_offset,
-    uint64_t& out_lba,
-    uint32_t& out_block_count)
+    uint64_t              logical_offset,
+    uint64_t&             out_lba,
+    uint32_t&             out_block_count)
 {
     if (handle == nullptr || handle->extents == nullptr) {
         return false;
     }
 
-    // Convert byte offset to block offset
     uint64_t logical_block = logical_offset >> handle->nvme_block_size_log;
 
-    // Walk extents to find containing extent
-    uint64_t current_logical_block = 0;
-
+    uint64_t cur_logical = 0;
     for (uint32_t i = 0; i < handle->num_extents; ++i) {
-        const LbaExtent* extent;
+        const LbaExtent* ext =
+            (i < NvmeFileDeviceHandle::MAX_INLINE_EXTENTS)
+                ? &handle->extents[i]
+                : (handle->extents_overflow
+                       ? &handle->extents_overflow[
+                             i - NvmeFileDeviceHandle::MAX_INLINE_EXTENTS]
+                       : nullptr);
 
-        // Load extent from inline or overflow array
-        if (i < NvmeFileDeviceHandle::MAX_INLINE_EXTENTS) {
-            extent = &handle->extents[i];
-        } else {
-            if (handle->extents_overflow == nullptr) {
-                return false;
-            }
-            extent = &handle->extents_overflow[i - NvmeFileDeviceHandle::MAX_INLINE_EXTENTS];
-        }
+        if (ext == nullptr) return false;
 
-        // Check if logical_block falls within this extent
-        uint64_t extent_end = current_logical_block + extent->length_blocks;
-        if (logical_block >= current_logical_block && logical_block < extent_end) {
-            // Found containing extent
-            uint64_t offset_within_extent = logical_block - current_logical_block;
-            out_lba = extent->start_lba + offset_within_extent;
-
-            // Calculate remaining blocks in extent
-            uint64_t remaining_blocks = extent->length_blocks - offset_within_extent;
-            out_block_count = static_cast<uint32_t>(remaining_blocks);
-
+        uint64_t ext_end = cur_logical + ext->length_blocks;
+        if (logical_block >= cur_logical && logical_block < ext_end) {
+            uint64_t off = logical_block - cur_logical;
+            out_lba         = ext->start_lba + off;
+            out_block_count = static_cast<uint32_t>(ext->length_blocks - off);
             return true;
         }
-
-        current_logical_block = extent_end;
+        cur_logical = ext_end;
     }
-
-    // Offset out of bounds
-    return false;
+    return false;  // out of bounds
 }
 
-// Submit a single NVMe READ command.
-//
-// Resolves LBA, acquires queue from DM, builds READ SQE, submits via DM's issue_nvme_cmd().
-//
-// handle: GPU-resident file handle
-// logical_offset: Byte offset within file
-// prp1: First PRP entry (DMA address)
-// prp2: Second PRP entry or PRP-list pointer
-// nbytes: Transfer length in bytes
-//
-// Returns command ID (CID) on success, negative value on failure.
+// ── Internal: one NVMe command, blocking until CQE arrives ───────────────────
+
+// Hash-based queue selection: spreads global threads across queue_quota rings.
+__device__ inline uint32_t select_queue(uint32_t queue_quota) {
+    uint32_t gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    return gtid % queue_quota;
+}
+
+// Build and submit one NVMe READ or WRITE command; spin-poll for completion.
+// Returns CID (>= 0) on success; negative error code on failure.
+__device__ inline int submit_one_impl(
+    NvmeFileDeviceHandle* handle,
+    uint64_t              logical_offset,
+    uint64_t              prp1,
+    uint64_t              prp2,
+    uint32_t              nbytes,
+    uint8_t               opcode)
+{
+    // 1. Resolve LBA
+    uint64_t lba;
+    uint32_t block_count;
+    if (!resolve_lba(handle, logical_offset, lba, block_count)) return -1;
+
+    uint32_t transfer_blocks =
+        (nbytes + handle->nvme_block_size - 1) >> handle->nvme_block_size_log;
+    if (transfer_blocks > block_count) return -2;  // crosses extent boundary
+
+    // 2. Select queue pair.
+    //    d_qps is typed nvm_queue_t* but points to QueuePair[] in managed memory.
+    QueuePair* qps = reinterpret_cast<QueuePair*>(handle->d_qps);
+    uint32_t   qi  = select_queue(handle->queue_quota);
+    QueuePair* qp  = &qps[qi];
+
+    // 3. Acquire CID + build NVMe SQE
+    nvm_cmd_t cmd;
+    uint16_t  cid = get_cid(&qp->sq);
+    nvm_cmd_header(&cmd, cid, opcode, qp->nvmNamespace);
+    nvm_cmd_data_ptr(&cmd, prp1, prp2);
+    nvm_cmd_rw_blks(&cmd, lba, static_cast<uint16_t>(transfer_blocks));
+
+    // 4. Enqueue SQE (rings SQ doorbell internally via ticket protocol)
+    sq_enqueue(&qp->sq, &cmd);
+
+    // 5. Spin-poll CQ; retire CQE and release CID
+    uint32_t cq_pos = cq_poll(&qp->cq, cid);
+    cq_dequeue(&qp->cq, static_cast<uint16_t>(cq_pos), &qp->sq);
+    put_cid(&qp->sq, cid);
+
+    return static_cast<int>(cid);
+}
+
+// ── Public entry points ──────────────────────────────────────────────────────
+
+// Submit one NVMe READ command; spin until the CQE arrives.
+// handle:         GPU-resident file handle (from NvmeBackend::acquire_target_handle)
+// logical_offset: byte offset within the file / raw range
+// prp1, prp2:     PRP entries from NvmeBackend::prepare_descriptors
+// nbytes:         transfer length in bytes
+// Returns CID >= 0 on success; negative on failure.
 __device__ inline int submit_read_one(
     NvmeFileDeviceHandle* handle,
-    uint64_t logical_offset,
-    uint64_t prp1,
-    uint64_t prp2,
-    uint32_t nbytes)
+    uint64_t              logical_offset,
+    uint64_t              prp1,
+    uint64_t              prp2,
+    uint32_t              nbytes)
 {
-    // Resolve LBA from logical offset
-    uint64_t lba;
-    uint32_t block_count;
-    if (!resolve_lba(handle, logical_offset, lba, block_count)) {
-        return -1;
-    }
-
-    // Calculate number of blocks for transfer
-    uint32_t transfer_blocks = (nbytes + handle->nvme_block_size - 1) >> handle->nvme_block_size_log;
-    if (transfer_blocks > block_count) {
-        // Transfer spans multiple extents - not supported in single command
-        return -2;
-    }
-
-    // TODO: Integrate with Device Manager's device-side queue mechanics
-    // This requires:
-    //   1. acquire_queue(handle->vdev->d_qps, handle->vdev->queue_quota, preferred_index)
-    //   2. Build NVMe READ SQE with: namespace_id, lba, transfer_blocks, prp1, prp2
-    //   3. issue_nvme_cmd(qp, &sqe)
-    //   4. Return CID for polling
-
-    // Placeholder: return success
-    return 0;
+    return submit_one_impl(handle, logical_offset, prp1, prp2,
+                           nbytes, NVM_IO_READ);
 }
 
-// Submit a single NVMe WRITE command.
-//
-// Same as submit_read_one but WRITE opcode.
+// Submit one NVMe WRITE command; spin until the CQE arrives.
 __device__ inline int submit_write_one(
     NvmeFileDeviceHandle* handle,
-    uint64_t logical_offset,
-    uint64_t prp1,
-    uint64_t prp2,
-    uint32_t nbytes)
+    uint64_t              logical_offset,
+    uint64_t              prp1,
+    uint64_t              prp2,
+    uint32_t              nbytes)
 {
-    // Resolve LBA from logical offset
-    uint64_t lba;
-    uint32_t block_count;
-    if (!resolve_lba(handle, logical_offset, lba, block_count)) {
-        return -1;
-    }
-
-    // Calculate number of blocks for transfer
-    uint32_t transfer_blocks = (nbytes + handle->nvme_block_size - 1) >> handle->nvme_block_size_log;
-    if (transfer_blocks > block_count) {
-        // Transfer spans multiple extents - not supported in single command
-        return -2;
-    }
-
-    // TODO: Integrate with Device Manager's device-side queue mechanics
-    // Same as submit_read_one but with WRITE opcode
-
-    // Placeholder: return success
-    return 0;
+    return submit_one_impl(handle, logical_offset, prp1, prp2,
+                           nbytes, NVM_IO_WRITE);
 }
 
 } // namespace device

@@ -27,7 +27,7 @@ void BackendFactory::register_backend(
     registry.constructors[type] = constructor;
 }
 
-std::unique_ptr<IBackendProvider> BackendFactory::create_backend(BackendType type) {
+std::unique_ptr<IBackend> BackendFactory::create_backend(BackendType type) {
     auto& registry = BackendRegistry::instance();
     std::lock_guard<std::mutex> lock(registry.mutex);
 
@@ -37,8 +37,8 @@ std::unique_ptr<IBackendProvider> BackendFactory::create_backend(BackendType typ
     }
 
     // Call constructor and wrap in unique_ptr
-    IBackendProvider* backend = it->second();
-    return std::unique_ptr<IBackendProvider>(backend);
+    IBackend* backend = it->second();
+    return std::unique_ptr<IBackend>(backend);
 }
 
 std::vector<BackendType> BackendFactory::available_backends() {

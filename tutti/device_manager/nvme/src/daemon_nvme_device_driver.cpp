@@ -335,6 +335,7 @@ IVirtualDevice* DaemonNvmeDeviceDriver::alloc_vdevice(
         }
 
         vdev->d_qps = qs.d_qps;
+        vdev->ctrl  = ctx.ctrl;          // expose ctrl for backend DMA mapping
         vdev_queue_sets_[vdev.get()] = qs;
     }
     // If ctx.ctrl is null (mock/fallback mode), d_qps stays null --

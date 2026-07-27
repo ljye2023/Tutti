@@ -75,7 +75,8 @@ target_include_directories(tutti_backends_nvme
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/device
-        ${PROJECT_SOURCE_DIR}/device_manager/nvme/libnvm/include
+        ${PROJECT_SOURCE_DIR}/device_manager/nvme/include        # NvmeVirtualDevice, NvmeQueueGroup
+        ${PROJECT_SOURCE_DIR}/device_manager/nvme/libnvm/include # nvm_types.h (needed by nvme_virtual_device.h)
         ${PROJECT_SOURCE_DIR}/device_manager/nvme/libnvm/src
 )
 

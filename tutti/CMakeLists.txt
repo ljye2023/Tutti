@@ -14,7 +14,9 @@
 #
 # Target: Linux 5.15 kernel + CUDA 12.6+ for v0.1
 #
-# NOTE: This CMakeLists.txt currently only builds Layer 0 and Layer 1
+# NOTE: This CMakeLists.txt builds Layers 0-3 (abstraction/types, accel,
+#       device_manager, backends incl. the full NVMe transport). Layers 4-6
+#       are not yet wired in.
 
 cmake_minimum_required(VERSION 3.18)
 
@@ -126,7 +128,7 @@ add_subdirectory(accel)
 # ---------------------------------------------------------------------------
 
 add_subdirectory(device_manager)   # Layer 2 ✅ ENABLED
-# add_subdirectory(backends)         # Layer 3 ✅ ENABLED
+add_subdirectory(backends)         # Layer 3 ✅ ENABLED (device-agnostic core + mock + full NVMe backend)
 # add_subdirectory(io_engine)        # Layer 4 ✅ ENABLED
 # add_subdirectory(block_storage)    # Layer 5 ✅ ENABLED
 # add_subdirectory(coordinator)      # Layer 6 ✅ ENABLED
@@ -163,6 +165,20 @@ if(BUILD_TESTING)
         add_subdirectory(tests/device_manager/nvme
                          ${CMAKE_CURRENT_BINARY_DIR}/tests_device_manager_nvme)
         message(STATUS "Tutti: added tests/device_manager/nvme (Layer 2 real-HW NVMe tests)")
+    endif()
+
+    # Layer 3 device-agnostic backend tests (tutti/tests/backends).
+    # Exercises the IBackend contract through the mock backend; no transport.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/backends/CMakeLists.txt")
+        add_subdirectory(tests/backends ${CMAKE_CURRENT_BINARY_DIR}/tests_backends)
+        message(STATUS "Tutti: added tests/backends (Layer 3 device-agnostic tests)")
+    endif()
+
+    # Layer 3 NVMe backend tests (tutti/tests/backends/nvme).
+    # Unit tier runs without hardware (mock DM); real-HW tier needs TUTTI_NVME_REAL_HW=1.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/backends/nvme/CMakeLists.txt")
+        add_subdirectory(tests/backends/nvme ${CMAKE_CURRENT_BINARY_DIR}/tests_backends_nvme)
+        message(STATUS "Tutti: added tests/backends/nvme (Layer 3 NVMe backend tests)")
     endif()
 endif()
 

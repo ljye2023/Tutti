@@ -21,7 +21,7 @@ set(DEPENDS_ON "tutti_abstraction;tutti_types;tutti_accel;tutti_device_manager")
 
 # Common sources (transport-agnostic interfaces and factory)
 set(COMMON_HEADERS
-    include/backend_provider.h
+    include/backend.h
     include/backend_factory.h
     include/backend_types.h
 )
@@ -30,8 +30,14 @@ set(COMMON_SOURCES
     src/backend_factory.cpp
 )
 
+# Mock backend: device-agnostic IBackend impl for testing (no NVMe/CUDA).
+set(MOCK_SOURCES
+    mock/src/mock_backend.cpp
+)
+
 set(LAYER_SOURCES
     ${COMMON_SOURCES}
+    ${MOCK_SOURCES}
 )
 
 set(LAYER_HEADERS
@@ -64,6 +70,7 @@ target_include_directories(${LAYER_NAME}
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/mock/include
 )
 
 # =============================================================================
@@ -81,7 +88,7 @@ target_link_libraries(${LAYER_NAME}
 # Backend Implementations
 # =============================================================================
 
-# NVMe backend
+# NVMe backend -- migrated to IBackend + NvmeVirtualDevice.
 add_subdirectory(nvme)
 
 # Future backends:

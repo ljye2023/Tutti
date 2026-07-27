@@ -1,9 +1,9 @@
 #ifndef TUTTI_BACKENDS_NVME_COMMAND_BUILDER_H_
 #define TUTTI_BACKENDS_NVME_COMMAND_BUILDER_H_
 
-#include "backends/include/backend_types.h"
-#include <cstdint>
+#include "nvme_io_types.h"
 #include <cstddef>
+#include <cstdint>
 
 namespace tutti {
 namespace backends {
@@ -33,7 +33,7 @@ class PrpPageCache;
 class NvmeCommandBuilder {
 public:
     // page_size: typically 4096 bytes (NVMe standard)
-    // mdts: max data transfer size from VDevice (controller MDTS)
+    // mdts: max data transfer size from NvmeVirtualDevice (controller MDTS, bytes)
     // prp_cache: reference to backend's PRP-list page cache
     NvmeCommandBuilder(size_t page_size, size_t mdts, PrpPageCache* prp_cache);
 
@@ -50,28 +50,26 @@ public:
     // n_slices: Number of sub-slices to process
     // out_descs: Output array of BufferDescriptors (caller-allocated, size >= n_slices)
     //
-    // Returns true on success, false on failure (e.g., out of PRP pages, MDTS exceeded).
+    // Returns true on success, false on failure (out of PRP pages, MDTS exceeded).
     bool build_prp_descriptors(
-        const uint64_t* ioaddrs,
+        const uint64_t*    ioaddrs,
         const SubSliceInfo* slices,
-        uint32_t n_slices,
-        BufferDescriptor* out_descs);
+        uint32_t            n_slices,
+        BufferDescriptor*   out_descs);
 
     // Build SGL descriptors (NVMe 1.2+ scatter-gather lists).
-    // Future enhancement - currently returns false (unsupported).
+    // Not yet implemented — always returns false.
     bool build_sgl_descriptors(
-        const uint64_t* ioaddrs,
+        const uint64_t*    ioaddrs,
         const SubSliceInfo* slices,
-        uint32_t n_slices,
-        BufferDescriptor* out_descs);
+        uint32_t            n_slices,
+        BufferDescriptor*   out_descs);
 
     // Release descriptors and return PRP-list pages to cache.
     //
-    // Must be called when descriptors are no longer needed (tensor deregistration,
-    // error cleanup). Returns PRP-list pages to cache for reuse.
-    //
-    // descs: Array of descriptors to release (from prior build_prp_descriptors call)
-    // n_descs: Number of descriptors in array
+    // Must be called when descriptors are no longer needed (tensor
+    // deregistration, error cleanup). Returns PRP-list pages to the cache for
+    // reuse.
     void release_descriptors(BufferDescriptor* descs, uint32_t n_descs);
 
 private:
@@ -82,15 +80,15 @@ private:
     // PRP descriptor kind flags (stored in BufferDescriptor::descriptor_flags)
     enum PrpKind : uint32_t {
         PRP_SINGLE = 0,  // Single page, prp2 = 0
-        PRP_DUAL = 1,    // Two pages, prp2 = second page
-        PRP_LIST = 2     // Multiple pages, prp2 = PRP-list page
+        PRP_DUAL   = 1,  // Two pages, prp2 = second page
+        PRP_LIST   = 2   // Multiple pages, prp2 = PRP-list page
     };
 
-    // Build PRP-list page for LIST transfers
-    // Returns device pointer to PRP-list page, or nullptr on failure
+    // Build PRP-list page for LIST transfers.
+    // Returns device pointer to PRP-list page, or nullptr on failure.
     void* build_prp_list_page(const uint64_t* ioaddrs, uint32_t num_pages);
 
-    // Calculate number of pages needed for transfer
+    // Calculate number of pages needed for a transfer.
     uint32_t calculate_num_pages(uint64_t start_addr, uint32_t length) const;
 };
 

@@ -1,7 +1,7 @@
 #ifndef TUTTI_BACKENDS_BACKEND_FACTORY_H_
 #define TUTTI_BACKENDS_BACKEND_FACTORY_H_
 
-#include "backend_provider.h"
+#include "backend.h"
 #include "backend_types.h"
 #include <functional>
 #include <memory>
@@ -26,13 +26,13 @@ namespace backends {
 //
 //   // In IO Engine:
 //   auto backend = BackendFactory::create_backend(BackendType::LOCAL_NVME);
-//   if (backend && backend->initialize(vdev)) {
+//   if (backend && backend->initialize(device_manager, cfg)) {
 //       // Use backend...
 //   }
 class BackendFactory {
 public:
     // Backend constructor function type
-    using BackendConstructor = std::function<IBackendProvider*()>;
+    using BackendConstructor = std::function<IBackend*()>;
 
     // Register backend constructor for a given type.
     //
@@ -53,7 +53,7 @@ public:
     // type: Backend type to instantiate
     //
     // Returns unique_ptr to backend, or nullptr if type not registered.
-    static std::unique_ptr<IBackendProvider> create_backend(BackendType type);
+    static std::unique_ptr<IBackend> create_backend(BackendType type);
 
     // List all registered backend types.
     //

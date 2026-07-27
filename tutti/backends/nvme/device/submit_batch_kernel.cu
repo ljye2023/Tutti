@@ -1,6 +1,6 @@
 #include "nvme_device_helpers.cuh"
 #include "nvme_target_handle.h"
-#include "backends/include/backend_types.h"
+#include "nvme_io_types.h"
 #include <cuda_runtime.h>
 
 namespace tutti {

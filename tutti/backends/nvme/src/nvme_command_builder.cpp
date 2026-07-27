@@ -1,6 +1,8 @@
-#include "backends/include/storage_target.h"
+// nvme_command_builder.cpp -- PRP/SGL descriptor construction from ioaddrs
+
 #include "nvme_command_builder.h"
 #include "prp_page_cache.h"
+
 #include <cuda_runtime.h>
 #include <cstring>
 
@@ -87,7 +89,8 @@ bool NvmeCommandBuilder::build_sgl_descriptors(
     uint32_t n_slices,
     BufferDescriptor* out_descs)
 {
-    // SGL support is future enhancement (NVMe 1.2+)
+    // SGL support is a future enhancement (NVMe 1.2+)
+    (void)ioaddrs; (void)slices; (void)n_slices; (void)out_descs;
     return false;
 }
 

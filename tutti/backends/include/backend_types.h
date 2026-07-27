@@ -7,15 +7,18 @@
 namespace tutti {
 namespace backends {
 
-// Backend type identifier - moved from device_manager for Layer 3 independence
+// Backend type identifier - one per transport family.
+// Mirrors DeviceType (Layer 2) but stays independent so Layer 3 does not
+// depend on the device_manager enum for its public identity.
 enum class BackendType {
-    LOCAL_NVME = 0,  // Local NVMe via Device Manager VDevice
+    LOCAL_NVME = 0,  // Local NVMe via Device Manager vdevices
     RDMA = 1,        // RDMA-capable remote storage
     GDS = 2,         // NVIDIA GPUDirect Storage
+    MOCK = 3,        // In-memory test backend (device-agnostic; no transport)
     UNKNOWN = 255
 };
 
-// Backend capability flags
+// Backend capability flags.
 enum BackendCapability : uint32_t {
     SUPPORTS_GPUDIRECT = 1 << 0,  // Can bypass CPU for data movement
     SUPPORTS_COOP = 1 << 1,       // Supports cooperative kernel mode
@@ -24,7 +27,7 @@ enum BackendCapability : uint32_t {
     SUPPORTS_METADATA = 1 << 4    // Supports metadata pass-through
 };
 
-// Backend metadata - returned by IBackendProvider methods
+// Backend metadata - returned by IBackend::metadata().
 struct BackendMetadata {
     const char* name;           // Human-readable backend name
     BackendType type;           // Backend type enum
@@ -34,39 +37,49 @@ struct BackendMetadata {
     size_t alignment_bytes;     // Required buffer alignment
 };
 
-// Sub-slice layout information for descriptor construction
-struct SubSliceInfo {
-    uint64_t offset_bytes;      // Offset within the larger buffer
-    uint32_t length_bytes;      // Length of this sub-slice
-    uint32_t slice_index;       // Index for tracking/debugging
+// Handle identifying one vdevice within a backend's roster.
+//
+// A backend acquires N vdevices from IDeviceManager at initialize() and keeps
+// them in a dense array. VDeviceHandle is the caller-facing token that selects
+// which vdevice an operation (register / submit_one) targets. It carries only
+// the dense index; the backend maps it back to the concrete IVirtualDevice*
+// (and any transport-specific, device-side resources) internally.
+//
+// This keeps the selection token transport-neutral: NVMe's submit_one is a
+// device-side (__device__) function, so the host interface only needs an index,
+// not a pointer to device resources.
+struct VDeviceHandle {
+    static constexpr uint32_t INVALID = 0xFFFFFFFFu;
+
+    uint32_t index;  // Dense index into the backend's vdevice roster
+
+    VDeviceHandle() : index(INVALID) {}
+    explicit VDeviceHandle(uint32_t i) : index(i) {}
+
+    bool is_valid() const { return index != INVALID; }
 };
 
-// Buffer descriptor - transport-agnostic IO descriptor
-// Backends populate this during prepare_descriptors()
-struct BufferDescriptor {
-    uint64_t prp1;              // First PRP entry (or SGL descriptor address)
-    uint64_t prp2;              // Second PRP entry or PRP-list pointer
-    uint64_t storage_offset;    // Logical offset within the target (file/LBA space)
-    uint32_t data_length;       // Transfer length in bytes
-    uint32_t descriptor_flags;  // Backend-specific flags (PRP kind, SGL type, etc.)
-    void* backend_private;      // Backend-private metadata pointer (e.g., cached pages)
+// Configuration for backend bring-up.
+//
+// Passed to IBackend::initialize(). Tells the backend which physical device to
+// slice and how to carve its vdevice roster from the Device Manager grant.
+//
+// The backend calls IDeviceManager::open_vdevice(phys_id, quota_per_vdevice)
+// vdevice_count times, populating its roster. Transport-specific tuning that is
+// not device-agnostic belongs in the concrete backend, not here.
+struct BackendConfig {
+    int32_t  phys_id;             // Physical device id (from IDeviceManager registry)
+    uint32_t vdevice_count;       // How many vdevices to open on this backend
+    uint32_t quota_per_vdevice;   // Resource units per vdevice (e.g. NVMe queue pairs)
+
+    BackendConfig()
+        : phys_id(-1), vdevice_count(1), quota_per_vdevice(1) {}
 };
 
-// Target handle wrapper - opaque pointer with type discriminator
-struct TargetHandle {
-    void* handle;               // Opaque backend-private handle pointer
-    BackendType backend_type;   // Type discriminator for safe casting
-    uint64_t target_id;         // Source target identifier for debugging
-
-    TargetHandle() : handle(nullptr), backend_type(BackendType::UNKNOWN), target_id(0) {}
-
-    TargetHandle(void* h, BackendType type, uint64_t id = 0)
-        : handle(h), backend_type(type), target_id(id) {}
-
-    bool is_valid() const { return handle != nullptr; }
-};
-
-// Submission result for synchronous operations
+// Result of a synchronous submission (host-side paths, e.g. bootstrap/tests).
+//
+// Device-side submit_one paths report completion through their own transport
+// mechanics; this struct is for host-side callers only.
 struct SubmissionResult {
     bool success;               // Overall success flag
     uint32_t completed_count;   // Number of IOs completed
@@ -75,23 +88,6 @@ struct SubmissionResult {
 
     SubmissionResult()
         : success(false), completed_count(0), failed_count(0), error_code(0) {}
-};
-
-// IO future handle for asynchronous operations (OPTIONAL path)
-struct IOFuture {
-    void* backend_private;      // Backend-specific future handle
-    BackendType backend_type;   // Type discriminator
-
-    IOFuture() : backend_private(nullptr), backend_type(BackendType::UNKNOWN) {}
-
-    bool is_valid() const { return backend_private != nullptr; }
-};
-
-// COOP channel setup parameters (OPTIONAL path)
-struct CoopChannelConfig {
-    void* device_channel;       // Device-side channel pointer
-    size_t channel_capacity;    // Max outstanding requests in channel
-    uint32_t timeout_ms;        // Timeout for channel operations
 };
 
 } // namespace backends
