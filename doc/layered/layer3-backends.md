@@ -460,7 +460,7 @@ Last verified 2026-07-27: unit 8/8, real-HW 7/7 + destructive write/read/verify 
 `MockBackend` + 11 device-agnostic tests pass; vendor-neutrality verified.
 
 ### NVMe backend — complete, hardware-verified
-Migrated to `IBackend` + `NvmeVirtualDevice`. `add_subdirectory(nvme)` is enabled in `backends/CMakeLists.txt`, and `libtutti_backends_nvme` builds as part of the default Layer 3 compile. `register` is realized as host methods (`acquire_target_handle` / `prepare_descriptors`), and the device-side `submit_one` runs from the GPU submit kernel with in-kernel CQ polling. GPU read and write paths are verified on real hardware (§6.2). Remaining gap: `submit_batch_cpu_sync` is still a stub and SGL descriptors are not implemented (§5.6).
+Migrated to `IBackend` + `NvmeVirtualDevice`. `add_subdirectory(nvme)` is enabled in `backends/CMakeLists.txt`, and `libtutti_backends_nvme` builds as part of the default Layer 3 compile. `register` is realized as host methods (`acquire_target_handle` / `prepare_descriptors`), and the device-side `submit_one` runs from the GPU submit kernel with in-kernel CQ polling. GPU read and write paths are verified on real hardware (§6.2). Outstanding gaps (CPU-sync stub, SGL, per-descriptor error readback) are tracked in §9.
 
 ### RDMA / GDS — not implemented
 Enum values reserved; no backend yet.
@@ -479,6 +479,29 @@ The device-agnostic surface:
 | `mock/include/mock_backend.h` | `MockBackend` (test backend) |
 
 Nothing in this surface includes libnvm or CUDA. Layer 2's facade types are forward-declared. The only cross-boundary type appears when a concrete NVMe backend downcasts an `IVirtualDevice*` to `NvmeVirtualDevice*` — confined to the NVMe backend, exactly as in Layer 2.
+
+---
+
+## 9. Known Gaps / Not Yet Implemented
+
+Layer 3's primary path — device-agnostic core, mock backend, and the NVMe **GPU submit** path (read + write) — is complete and hardware-verified. The following are the outstanding gaps as of 2026-07-27. None blocks the GPU fast path or Layer 4 integration, but each is a real limitation to be aware of.
+
+| # | Gap | Location | Impact | Status |
+|---|-----|----------|--------|--------|
+| 1 | **`submit_batch_cpu_sync` is a stub** — copies the handle to host, logs a warning, and returns `success=true` **without issuing any IO**. A caller of the CPU path gets a false "success" and no data movement. | `nvme/src/nvme_submission.cpp` (`submit_batch_cpu_sync`) | CPU synchronous submission is non-functional. Only the GPU path (`launch_batch_gpu_stream`) actually performs IO. | Not implemented |
+| 2 | **SGL descriptors not implemented** — `build_sgl_descriptors` always returns `false`; only PRP (SINGLE/DUAL/LIST) is supported. | `nvme/src/nvme_command_builder.cpp` / `nvme_command_builder.h` | No scatter-gather-list transfers. Highly fragmented buffers must be expressed as PRP lists (page-granular). | Not implemented |
+| 3 | **Kernel per-descriptor error reporting is a TODO** — the submit kernel does not write per-command completion status back to an output array; a failed `submit_one` (negative CID) is silently dropped by that thread. | `nvme/device/submit_batch_kernel.cu` | Batch submissions cannot report which individual descriptors failed. Stream-level `cudaStreamSynchronize` still catches kernel faults, but not logical NVMe command failures. | Partial (submit + CQ poll work; status readback missing) |
+| 4 | **RDMA / GDS backends absent** — `BackendType::RDMA` and `GDS` enum values are reserved but no backend implements them. | — | Only `LOCAL_NVME` and `MOCK` are registered with the factory. | Not implemented |
+
+### What is NOT a gap (clarifications)
+
+- **The "assume synchronous completion (placeholder)" comments in `submit_batch_kernel.cu`** are stale/misleading, not a real gap. Completion polling (`cq_poll` + `cq_dequeue`) happens one level down inside `submit_one_impl` (`nvme_device_helpers.cuh`), so the GPU read/write paths are fully synchronous and verified. See §5.5.
+- **The stale `VERIFICATION_REPORT.md`** under `tutti/backends/` (dated 2026-07-21) predates this redesign and refers to the deleted `backend_provider.h`; it is not authoritative — this document is.
+
+### Deferred design work
+
+- `register`'s exact granularity/input for non-NVMe transports is designed per concrete backend; only the NVMe form (`acquire_target_handle` / `prepare_descriptors`) exists today.
+- Performance work (PRP cache hit-rate tuning, batch-size sweeps, submission latency) has not been done.
 
 ---
 
