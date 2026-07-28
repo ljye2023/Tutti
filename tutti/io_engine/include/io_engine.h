@@ -13,7 +13,6 @@
 namespace tutti {
 
 struct MemoryRegion;  // accel/include/common/memory_region.h
-class IBackendProvider;
 class IAccelerator;
 
 class IIoEngine {
@@ -49,6 +48,19 @@ public:
         const std::vector<IoRequest>& requests,
         bool is_read,
         AccelStream stream) = 0;
+
+    //==========================================================================
+    // Single-Shard Submit (Blocking)
+    //
+    // Submit one shard IO end-to-end: acquire handle → fan-out → descriptors
+    // → launch → complete.  Suitable for low-fan-out or scatter callers that
+    // already know which shard to target.
+    //==========================================================================
+
+    virtual bool submit_one(
+        const SingleShardIoRequest& req,
+        bool                        is_read,
+        AccelStream                 stream) = 0;
 
     //==========================================================================
     // Capacity / Planning

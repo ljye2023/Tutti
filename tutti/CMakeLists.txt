@@ -129,7 +129,7 @@ add_subdirectory(accel)
 
 add_subdirectory(device_manager)   # Layer 2 ✅ ENABLED
 add_subdirectory(backends)         # Layer 3 ✅ ENABLED (device-agnostic core + mock + full NVMe backend)
-# add_subdirectory(io_engine)        # Layer 4 ✅ ENABLED
+add_subdirectory(io_engine)          # Layer 4 ✅ ENABLED
 # add_subdirectory(block_storage)    # Layer 5 ✅ ENABLED
 # add_subdirectory(coordinator)      # Layer 6 ✅ ENABLED
 # add_subdirectory(raw_device)       # Layer 5 (legacy)
@@ -179,6 +179,14 @@ if(BUILD_TESTING)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/backends/nvme/CMakeLists.txt")
         add_subdirectory(tests/backends/nvme ${CMAKE_CURRENT_BINARY_DIR}/tests_backends_nvme)
         message(STATUS "Tutti: added tests/backends/nvme (Layer 3 NVMe backend tests)")
+    endif()
+
+    # Layer 4 IO Engine tests (tutti/tests/io_engine).
+    # Standalone pure-math unit test for io_engine::StripeManager; no backend,
+    # HAL, or CUDA, so it is safe to configure everywhere.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_engine/CMakeLists.txt")
+        add_subdirectory(tests/io_engine ${CMAKE_CURRENT_BINARY_DIR}/tests_io_engine)
+        message(STATUS "Tutti: added tests/io_engine (Layer 4 stripe manager tests)")
     endif()
 endif()
 

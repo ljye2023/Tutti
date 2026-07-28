@@ -28,6 +28,22 @@ void* NvmeBackend::acquire_target_handle(const StorageTarget& target, VDeviceHan
         return nullptr;
     }
 
+    // Get-or-create: return a cached handle if one already exists for this
+    // (target_id, start_lba, vdev_index) triple.  See §3.1 design decision:
+    // handles live until shutdown(), so no per-IO release is needed.
+    const TargetCacheKey cache_key{
+        target.target_id,
+        (target.kind == StorageTargetKind::NVME_RAW ? target.start_lba : 0ULL),
+        hdl.index
+    };
+    {
+        std::lock_guard<std::mutex> lock(target_handles_mutex_);
+        auto it = target_handle_cache_.find(cache_key);
+        if (it != target_handle_cache_.end()) {
+            return it->second;
+        }
+    }
+
     // Build host-side template
     NvmeFileDeviceHandle host_handle;
     memset(&host_handle, 0, sizeof(host_handle));
@@ -145,7 +161,8 @@ void* NvmeBackend::acquire_target_handle(const StorageTarget& target, VDeviceHan
         return nullptr;
     }
 
-    // Track for cleanup
+    // Track for cleanup AND populate the get-or-create cache.
+    // Both operations share target_handles_mutex_ so they're atomic together.
     {
         std::lock_guard<std::mutex> lock(target_handles_mutex_);
         TargetHandleEntry entry;
@@ -154,6 +171,7 @@ void* NvmeBackend::acquire_target_handle(const StorageTarget& target, VDeviceHan
         entry.overflow_extents = d_overflow_extents;
         entry.target_id        = target.target_id;
         target_handles_[d_handle] = entry;
+        target_handle_cache_[cache_key] = d_handle;
     }
 
     fprintf(stderr, "[NvmeBackend] Acquired target handle: target_id=%lu, "

@@ -110,8 +110,3 @@ install(DIRECTORY include/
         PATTERN "*.cuh"
 )
 
-# =============================================================================
-# Tests
-# =============================================================================
-
-# Layer-specific tests are excluded; all tests live under tutti/tests/

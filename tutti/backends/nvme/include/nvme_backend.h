@@ -5,9 +5,11 @@
 #include "backends/include/backend_types.h"
 #include "backends/include/storage_target.h"
 #include "nvme_io_types.h"
+#include "batch_submitter.h"
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -60,7 +62,7 @@ class PrpPageCache;
 //
 //   submit_batch_cpu_sync(target_handle, descs, n, is_read)
 //       CPU synchronous submission (bootstrap / testing).
-class NvmeBackend : public IBackend {
+class NvmeBackend : public IBackend, public IBatchSubmitter {
 public:
     NvmeBackend();
     ~NvmeBackend() override;
@@ -99,10 +101,10 @@ public:
         const uint64_t*    ioaddrs,
         const SubSliceInfo* slices,
         uint32_t            n_slices,
-        BufferDescriptor*   out_descs);
+        BufferDescriptor*   out_descs) override;
 
     // Return PRP-list pages used by the descriptors back to the cache.
-    void release_descriptors(BufferDescriptor* descs, uint32_t n_descs);
+    void release_descriptors(BufferDescriptor* descs, uint32_t n_descs) override;
 
     // ── NVMe-specific: target handle management ──────────────────────────────
 
@@ -121,7 +123,7 @@ public:
         void*                    target_handle,
         const BufferDescriptor*  descs,
         uint32_t                 n_descs,
-        bool                     is_read);
+        bool                     is_read) override;
 
     // CPU synchronous submission (bootstrap / testing path).
     SubmissionResult submit_batch_cpu_sync(
@@ -147,6 +149,22 @@ private:
     };
     std::unordered_map<void*, TargetHandleEntry> target_handles_;
     mutable std::mutex                           target_handles_mutex_;
+
+    // Get-or-create cache for GPU target handles (§3.1 design decision).
+    // Key = (target_id, start_lba, vdev_index) to distinguish shards of the
+    // same file that may share a target_id but have different physical ranges.
+    // Protected by target_handles_mutex_. Entries live until shutdown().
+    struct TargetCacheKey {
+        uint64_t target_id;
+        uint64_t start_lba;    // 0 for NVME_FILE (not yet needed; disambiguates NVME_RAW shards)
+        uint32_t vdev_index;
+        bool operator<(const TargetCacheKey& o) const {
+            if (target_id  != o.target_id)  return target_id  < o.target_id;
+            if (start_lba  != o.start_lba)  return start_lba  < o.start_lba;
+            return vdev_index < o.vdev_index;
+        }
+    };
+    std::map<TargetCacheKey, void*> target_handle_cache_;
 
     // Internal helpers
     NvmeVirtualDevice* nvme_vdev_at(uint32_t i) const;

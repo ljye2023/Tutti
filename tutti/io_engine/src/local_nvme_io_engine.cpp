@@ -11,12 +11,12 @@ namespace local_nvme {
 struct LocalNvmeIoEngine::Impl {
     IoEngineImpl engine_impl;
 
-    Impl(backends::IBackendProvider* backend, IAccelerator* accel)
+    Impl(backends::nvme::IBatchSubmitter* backend, IAccelerator* accel)
         : engine_impl(backend, accel) {}
 };
 
 LocalNvmeIoEngine::LocalNvmeIoEngine(
-    backends::IBackendProvider* backend,
+    backends::nvme::IBatchSubmitter* backend,
     IAccelerator* accel,
     const LocalNvmeIoEngineConfig& config)
     : impl_(std::make_unique<Impl>(backend, accel)) {
@@ -38,6 +38,13 @@ bool LocalNvmeIoEngine::submit_batch_async(
     bool is_read,
     AccelStream stream) {
     return impl_->engine_impl.submit_batch_async(requests, is_read, stream);
+}
+
+bool LocalNvmeIoEngine::submit_one(
+    const SingleShardIoRequest& req,
+    bool is_read,
+    AccelStream stream) {
+    return impl_->engine_impl.submit_one(req, is_read, stream);
 }
 
 uint32_t LocalNvmeIoEngine::max_entries_per_batch() const {

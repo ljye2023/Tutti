@@ -6,7 +6,7 @@
 #pragma once
 
 #include "io_engine/include/io_engine.h"
-#include "backends/include/backend_provider.h"
+#include "backends/nvme/include/batch_submitter.h"
 #include <memory>
 
 namespace tutti {
@@ -23,7 +23,7 @@ struct LocalNvmeIoEngineConfig {
 class LocalNvmeIoEngine : public IIoEngine {
 public:
     LocalNvmeIoEngine(
-        backends::IBackendProvider* backend,
+        backends::nvme::IBatchSubmitter* backend,
         IAccelerator* accel,
         const LocalNvmeIoEngineConfig& config);
 
@@ -39,6 +39,11 @@ public:
         const std::vector<IoRequest>& requests,
         bool is_read,
         AccelStream stream) override;
+
+    bool submit_one(
+        const SingleShardIoRequest& req,
+        bool                        is_read,
+        AccelStream                 stream) override;
 
     uint32_t max_entries_per_batch() const override;
 

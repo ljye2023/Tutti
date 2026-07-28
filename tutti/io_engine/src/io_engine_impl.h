@@ -5,32 +5,26 @@
 
 #include "io_engine/include/io_engine.h"
 #include "io_engine/include/io_types.h"
-#include "backends/include/backend_provider.h"
-#include "backends/include/backend_types.h"
+#include "backends/nvme/include/batch_submitter.h"  // nvme::IBatchSubmitter, nvme::BufferDescriptor
 #include "accel/include/common/iaccel.h"
 #include <vector>
 #include <memory>
 
 namespace tutti {
 
-// Forward declarations from backends namespace
-namespace backends {
-    class IBackendProvider;
-}
-
 // Async operation context for deferred cleanup
 struct AsyncBatchContext {
-    std::vector<backends::BufferDescriptor> descriptors;
-    backends::IBackendProvider* backend;  // not owned
+    std::vector<backends::nvme::BufferDescriptor> descriptors;
+    backends::nvme::IBatchSubmitter* backend;  // not owned
     AccelEvent completion_event;
 
-    AsyncBatchContext(backends::IBackendProvider* b, IAccelerator* accel)
+    AsyncBatchContext(backends::nvme::IBatchSubmitter* b, IAccelerator* accel)
         : backend(b), completion_event(accel->create_event()) {}
 };
 
 class IoEngineImpl : public IIoEngine {
 public:
-    IoEngineImpl(backends::IBackendProvider* backend, IAccelerator* accel);
+    IoEngineImpl(backends::nvme::IBatchSubmitter* backend, IAccelerator* accel);
     virtual ~IoEngineImpl();
 
     // IIoEngine interface
@@ -44,16 +38,22 @@ public:
         bool is_read,
         AccelStream stream) override;
 
+    bool submit_one(
+        const SingleShardIoRequest& req,
+        bool                        is_read,
+        AccelStream                 stream) override;
+
     uint32_t max_entries_per_batch() const override;
 
     uint32_t slice_fanout(const MemoryRegion* region) const override;
 
 private:
-    backends::IBackendProvider* backend_;  // not owned
+    backends::nvme::IBatchSubmitter* backend_;  // not owned
     IAccelerator* accel_;        // not owned
 
-    backends::BufferDescriptor* d_descs_;  // GPU-resident scratch for descriptors
+    backends::nvme::BufferDescriptor* d_descs_;  // GPU-resident scratch for descriptors
     uint32_t max_batch_entries_;
+    size_t   max_io_size_;       // cached from metadata() at construction
 
     // Track pending async operations for deferred cleanup
     std::vector<std::shared_ptr<AsyncBatchContext>> pending_async_ops_;
