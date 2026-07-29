@@ -20,11 +20,11 @@
 
 | Tutti `MemoryKind` | CUDA Allocation Function | Properties |
 |-------------------|-------------------------|------------|
-| `HOST` | `malloc()` or `new` | Pageable, CPU-only, not DMA-capable |
-| `PINNED_HOST` | `cudaMallocHost()` or `cudaHostAlloc()` | Pinned, DMA-capable, device-accessible |
+| `HOST` | `malloc()` | Pageable, CPU-only, not DMA-capable |
+| `PINNED_HOST` | `cudaHostAlloc()` | Pinned, DMA-capable, device-accessible |
 | `DEVICE` | `cudaMalloc()` | GPU VRAM, not host-accessible |
-| `MANAGED` | `cudaMallocManaged()` | Unified memory, automatic migration |
-| `EXTERNAL` | `cudaHostRegister()` / IPC | User-managed, registered with runtime |
+| `MANAGED` | `cudaMallocManaged()` (via `allocate_device` only) | Unified memory, automatic migration |
+| `EXTERNAL` | (none — pointers stored as-is) | User-managed; HAL tracks only, runs no `cudaHostRegister`/IPC |
 
 ### Memory Region Structure
 
@@ -33,7 +33,7 @@
 | `region_id` | (none) | Tutti-specific registry ID |
 | `kind` | (implicit in allocation type) | Tracked by Tutti |
 | `device_id` | Device ID from context | From `cudaGetDevice()` |
-| `host_ptr` | Host pointer | From `cudaMallocHost()` or user pointer |
+| `host_ptr` | Host pointer | From `cudaHostAlloc()` (PINNED_HOST), `malloc()` (HOST), or user pointer |
 | `device_ptr` | Device pointer | From `cudaMalloc()` or `cudaHostGetDevicePointer()` |
 | `size` | (tracked by app) | CUDA doesn't expose size after allocation |
 | `external` | (none) | Tutti-specific for external memory tracking |
@@ -68,8 +68,8 @@
 | IAccelerator Method | CUDA API | Implementation Details |
 |--------------------|----------|----------------------|
 | `allocate_host(size, HOST)` | `malloc(size)` | Standard C allocation |
-| `allocate_host(size, PINNED_HOST)` | `cudaMallocHost(&ptr, size)` | Pinned memory for fast H↔D transfer |
-| `allocate_host(size, MANAGED)` | `cudaMallocManaged(&ptr, size)` | Unified memory |
+| `allocate_host(size, PINNED_HOST)` | `cudaHostAlloc(&ptr, size, cudaHostAllocDefault)` | Pinned memory for fast H↔D transfer |
+| `allocate_host(size, MANAGED)` | (rejected — returns nullptr) | MANAGED is not a valid host kind; use `allocate_device(size, MANAGED, dev)` |
 | `allocate_device(size, DEVICE, dev)` | `cudaSetDevice(dev)` + `cudaMalloc(&ptr, size + 65536)` | **Over-allocates by 64KB**, returns aligned sub-pointer |
 | `allocate_device(size, MANAGED, dev)` | `cudaSetDevice(dev)` + `cudaMallocManaged(&ptr, size)` | Unified memory on specific device |
 | `free(ptr, HOST)` | `free(ptr)` | Standard C free |
@@ -88,17 +88,19 @@
 
 | IAccelerator Method | CUDA API | Notes |
 |--------------------|----------|-------|
-| `register_host(ptr, size)` | `cudaHostRegister(ptr, size, cudaHostRegisterDefault)` | Make existing host memory DMA-capable |
+| `register_host(ptr, size)` | (none - tracking only) | Bookkeeping only; does **not** pin — no `cudaHostRegister` |
 | `register_device(ptr, size, dev)` | (none - tracking only) | Wraps existing device allocation |
-| `register_external(...)` | Varies by source | See External Memory Registration below |
-| `unregister(region)` | `cudaHostUnregister(region->host_ptr)` (if HOST) | Only for registered host memory |
+| `register_external(...)` | (none - tracking only) | Stores pointers + a deep copy of the spec; runs no syscalls (see note below) |
+| `unregister(region)` | (none) | Deletes the `ExternalMemorySpec` + erases pointer maps only; no `cudaHostUnregister`/`munmap`/IPC close |
 | `lookup(ptr)` | (none) | Tutti registry: `ptr_to_region_id_` map |
 | `lookup_by_id(id)` | (none) | Tutti registry: `regions_by_id_` map |
 
 #### External Memory Registration
 
-| Source Type | CUDA/System APIs | Flow |
-|-------------|------------------|------|
+> **Not implemented.** `register_external()` runs none of the APIs below — it stores the caller-supplied `host_ptr`/`device_ptr` and a deep copy of `spec`, nothing more. The table documents the *intended* flow for each source; today the caller must produce the pointers itself (e.g. do its own `shm_open`+`mmap`), and `unregister()` performs no matching teardown.
+
+| Source Type | Intended CUDA/System APIs | Intended Flow |
+|-------------|---------------------------|---------------|
 | `APP_MANAGED` | (none) | Track pointer only, no CUDA registration |
 | `DEVICE_IPC` | `cudaIpcOpenMemHandle(handle, &ptr, flags)` | Import device pointer from another process |
 | `HOST_SHM` | `shm_open()` → `mmap()` → `cudaHostRegister()` | Shared memory, then register |
@@ -140,16 +142,10 @@
 
 | IAccelerator Method | CUDA API | Direction Detection |
 |--------------------|----------|-------------------|
-| `memcpy_async(dst, src, size, stream)` | `cudaMemcpyAsync(dst, src, size, direction, stream)` | Auto-detect via `cudaPointerGetAttributes()` |
+| `memcpy_async(dst, src, size, stream)` | `cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream)` | Direction inferred by the CUDA runtime (UVA), not by the HAL |
 
 **Direction Detection Logic:**
-1. Query `src` and `dst` pointer attributes
-2. Determine direction:
-   - Host → Device: `cudaMemcpyHostToDevice`
-   - Device → Host: `cudaMemcpyDeviceToHost`
-   - Device → Device: `cudaMemcpyDeviceToDevice`
-   - Host → Host: `cudaMemcpyHostToHost` (rare)
-   - Unknown: `cudaMemcpyDefault` (runtime figures it out)
+The HAL does **no** direction detection. It passes `cudaMemcpyDefault` unconditionally (`cuda_accelerator.cu:404`) and relies on CUDA's Unified Virtual Addressing to infer the direction from the pointers. `cudaPointerGetAttributes()` is never called. Any pointer combination (H↔D, D↔D, H↔H) works as long as the pointers are UVA-visible.
 
 ---
 
@@ -176,13 +172,13 @@
 | IAccelerator Method | CUDA API | Flow |
 |--------------------|----------|------|
 | `ipc_export(region, out_handle)` | `cudaIpcGetMemHandle((cudaIpcMemHandle_t*)out_handle->data, region->device_ptr)` | Export device pointer as IPC handle |
-| `ipc_import(handle, device_id)` | `cudaSetDevice(device_id)` + `cudaIpcOpenMemHandle(&ptr, *(cudaIpcMemHandle_t*)handle.data, flags)` | Import and register as EXTERNAL region |
+| `ipc_import(handle, device_id)` | `cudaSetDevice(device_id)` + `cudaIpcOpenMemHandle(&ptr, ..., flags)` | **Non-functional** — opens the handle, then calls `register_external(..., size=0)` which returns nullptr; the opened pointer leaks |
 
-**IPC Handle Flow:**
-1. **Process A**: `ipc_export()` → `cudaIpcGetMemHandle()` → 64-byte handle
+**IPC Handle Flow (as intended vs. actual):**
+1. **Process A**: `ipc_export()` → `cudaIpcGetMemHandle()` → 64-byte handle *(works)*
 2. **Inter-process**: Transfer handle via shared memory / socket / etc.
-3. **Process B**: `ipc_import()` → `cudaIpcOpenMemHandle()` → device pointer
-4. **Cleanup**: Process B calls `unregister()` → `cudaIpcCloseMemHandle()`
+3. **Process B**: `ipc_import()` → `cudaIpcOpenMemHandle()` → device pointer *(the open succeeds, but registration fails on `size==0`, so `ipc_import` returns nullptr and leaks the pointer — see Known Issues in `layer1-accelerator-hal.md`)*
+4. **Cleanup (intended, not implemented)**: Process B calls `unregister()` → `cudaIpcCloseMemHandle()`. Today `unregister()` closes nothing.
 
 ---
 
@@ -194,8 +190,8 @@
 | PINNED_HOST | CPU pinned RAM | CPU + GPU (via PCIe) |
 | DEVICE | GPU VRAM | GPU only (unless HOST_MAPPED) |
 | MANAGED | Unified memory pool | CPU + GPU (auto-migrated) |
-| EXTERNAL (DEVICE_IPC) | GPU VRAM in another process | GPU only, shared via IPC |
-| EXTERNAL (HOST_SHM) | CPU shared memory | CPU + GPU (if registered) |
+| EXTERNAL (DEVICE_IPC) | GPU VRAM in another process | GPU only, shared via IPC (import path currently broken — see Known Issues) |
+| EXTERNAL (HOST_SHM) | CPU shared memory | CPU; GPU-visible only if the caller registered it (HAL does not) |
 
 ---
 

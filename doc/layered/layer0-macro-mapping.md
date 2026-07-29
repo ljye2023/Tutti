@@ -110,9 +110,19 @@ Huawei Ascend NPU support is a future target.
 
 ## Usage Example
 
+Real consumers of `accel.h` include it as:
+
 ```cpp
-// tutti/device_manager/nvme/queue_group.cuh
-#include "abstraction/accel.h"
+#include "tutti/abstraction/accel.h"
+```
+
+for example `tutti/device_manager/nvme/include/queue_acquire_helper.cuh:18`
+(pulls in `TUTTI_DEVICE`, `TUTTI_FORCEINLINE`) and
+`tutti/block_storage/include/gpu_file_resolve.cuh:8`.
+
+```cpp
+// e.g. tutti/device_manager/nvme/include/queue_acquire_helper.cuh
+#include "tutti/abstraction/accel.h"
 
 // Device function (GPU-only)
 TUTTI_DEVICE uint32_t sq_next_tail(uint32_t current, uint32_t size) {

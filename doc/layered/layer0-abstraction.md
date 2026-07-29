@@ -15,7 +15,7 @@ Layer 0 provides **compile-time vendor abstraction** for GPU programming through
 - Header-only, no library target
 - Zero runtime cost (pure preprocessor)
 - Single canonical header: `tutti/abstraction/accel.h`
-- Vendor selection via build-time `-D` flags
+- Vendor selected by the `TUTTI_ACCEL_*` macro that is compiled in (see below)
 - No vtables, no dynamic dispatch
 
 **Design Philosophy:**  
@@ -188,18 +188,34 @@ void signal_dma_ready(DmaDescriptor* desc, void* buffer, size_t size) {
 | **Host-only** | (no flag) | ✅ Implemented | For unit tests, gRPC services, host utilities |
 
 **Build-time Vendor Selection:**
-```bash
-# CUDA build
-cmake -DCMAKE_CUDA_COMPILER=nvcc -DTUTTI_ACCEL_CUDA=ON ..
 
-# Host-only build (no GPU)
-cmake -DTUTTI_ACCEL_CUDA=OFF ..
+There is **no** CMake `option()` or cache variable for the vendor. The `tutti_accel`
+target hardcodes `TUTTI_ACCEL_CUDA` as a `PUBLIC` compile definition
+(`tutti/accel/CMakeLists.txt:64-67`), which propagates transitively to every
+consumer. Passing `-DTUTTI_ACCEL_CUDA=ON`/`=OFF` on the CMake command line does
+**nothing** — it sets an unused cache entry and the target still compiles with
+`TUTTI_ACCEL_CUDA` defined.
 
-# ROCm build (future)
-cmake -DCMAKE_HIP_COMPILER=hipcc -DTUTTI_ACCEL_ROCM=ON ..
+To build another vendor (or host-only) today you must edit the
+`target_compile_definitions` in `tutti/accel/CMakeLists.txt` and rebuild. A
+proper `option()`/cache-driven selector is not yet implemented.
+
+```cmake
+# tutti/accel/CMakeLists.txt (current, hardcoded)
+target_compile_definitions(tutti_accel
+    PUBLIC
+        TUTTI_ACCEL_CUDA)
 ```
 
-**Important:** Exactly one vendor flag (or none) must be defined. Multiple flags will cause compile errors.
+**Important:** The `Flag` column in the table above lists the *macro that must be
+defined*, not a `-D...=ON/OFF` CMake option. Selecting a vendor other than CUDA
+requires editing the CMake definition directly.
+
+**Multiple-flag behavior:** `accel.h` is a plain `#if`/`#elif`/`#else` chain with
+no arity check. Defining more than one `TUTTI_ACCEL_*` macro does **not** trigger
+a compile error — the first matching branch (`TUTTI_ACCEL_CUDA`, tested first)
+silently wins and the others are ignored. It is the build's responsibility to
+define at most one; the header does not enforce it.
 
 ---
 
@@ -244,7 +260,7 @@ TUTTI_THREADFENCE_SYSTEM()                                     // System-wide fe
 **Rationale:**
 - Prevents macro redefinition conflicts
 - Single source of truth for all vendor mappings
-- Easy to audit (one file, ~150 lines)
+- Easy to audit (one file, 97 lines)
 - Matches CMake's vendor selection model
 
 **Rejected Alternative:** Per-vendor headers (`accel_cuda.h`, `accel_hip.h`) would require complex include logic and risk inconsistent definitions.
@@ -259,7 +275,7 @@ TUTTI_THREADFENCE_SYSTEM()                                     // System-wide fe
 - Dual-compilation functions are typically small utilities (hash functions, bit manipulation, address arithmetic)
 - Failing to inline them causes code bloat (function appears in both host and device object files)
 - Sites wanting dual-compilation without inlining can use `TUTTI_HOST TUTTI_DEVICE` separately
-- Matches existing usage in `gpu_file_resolve.h`
+- Matches existing usage in `tutti/block_storage/include/gpu_file_resolve.cuh`
 
 **Rejected Alternative:** Separate `TUTTI_HOST_DEVICE` and `TUTTI_INLINE` would require two annotations at every call site, increasing verbosity.
 
@@ -457,6 +473,30 @@ void launch(uint64_t* d_keys, uint32_t* d_hashes, int n, cudaStream_t stream) {
 
 ---
 
+## Implementation Status
+
+| Component | Status | Tested |
+|-----------|--------|--------|
+| CUDA branch (all 11 macros) | Complete — expands to real CUDA intrinsics (`accel.h:6-31`) | Implicitly via L1+ usage; no dedicated L0 tests |
+| Host-only fallback | Complete — qualifiers empty, `TUTTI_HOST_DEVICE`→`inline`, atomics→aligned plain ints, `TUTTI_LAUNCH_KERNEL`→`static_assert(false)`, fence→`((void)0)` (`accel.h:72-96`) | Implicitly (gRPC services, host utilities compile against it) |
+| ROCm branch — qualifiers / launch / fence | Complete — `__device__`/`__global__`/`__host__`, `hipLaunchKernelGGL`, `__threadfence_system()` (`accel.h:39-43,51-54`) | Not implemented (build) — no target defines `TUTTI_ACCEL_ROCM`, so this branch is never compiled |
+| ROCm branch — atomics | Stub — placeholder plain `unsigned int` / `unsigned long long`, marked `FIXME` (`accel.h:45-49`); no HIP atomic types, so no actual atomicity | Not tested |
+| SYCL branch | Intentionally-unimplemented — `#error` (`accel.h:56-64`) | — |
+| CANN branch | Intentionally-unimplemented — `#error` (`accel.h:66-70`) | — |
+| CMake vendor selector | Not implemented — `TUTTI_ACCEL_CUDA` hardcoded PUBLIC on `tutti_accel`; no `option()`/cache var (`tutti/accel/CMakeLists.txt:64-67`) | — |
+
+---
+
+## Known Issues & Gaps
+
+- **No arity check on vendor macros.** `accel.h` is a plain `#if`/`#elif`/`#else` chain (`accel.h:6,33,56,66,72`). Defining two `TUTTI_ACCEL_*` macros at once does *not* produce a compile error — the first branch tested (`TUTTI_ACCEL_CUDA`) silently wins and the rest are ignored. A future guard (e.g. a summed-arity `static_assert`/`#error`) is needed to make misconfiguration fail loudly.
+- **No build-time vendor selector.** `tutti/accel/CMakeLists.txt:64-67` hardcodes `TUTTI_ACCEL_CUDA` as a `PUBLIC` compile definition. There is no `option()` or cache variable, so `-DTUTTI_ACCEL_CUDA=ON/OFF` (and the analogous ROCm flag) on the CMake command line have no effect. Building host-only or ROCm requires editing the CMakeLists by hand.
+- **ROCm atomics are non-atomic placeholders.** `TUTTI_ATOMIC_*` map to bare `unsigned int` / `unsigned long long` under `TUTTI_ACCEL_ROCM` (`accel.h:45-49`, marked `FIXME`). Any DMA/completion flag or queue pointer built on these would lose the atomic/scope semantics the CUDA branch provides. Must be replaced with real HIP atomics before the ROCm path is usable — but note the branch is never compiled today.
+- **No dedicated Layer 0 tests.** Macro expansions are only validated implicitly through Layer 1+ consumers. There is no compile-only test suite asserting every branch (especially host-only and ROCm) expands to syntactically valid code, so breakage in an unbuilt branch would go unnoticed until that branch is first compiled.
+- **No abstraction for `__shared__` / `__constant__` memory or warp-level primitives.** Device code needing these must drop to raw CUDA syntax, defeating the single-source-portability goal for those constructs (see Known Limitations §2, §3).
+
+---
+
 ## Dependencies
 
 ### Layer 0 Depends On:
@@ -481,7 +521,7 @@ void launch(uint64_t* d_keys, uint32_t* d_hashes, int n, cudaStream_t stream) {
 ## References
 
 - **Implementation:** `tutti/abstraction/accel.h`
-- **Architecture:** `doc/architecture/layered-architecture-redesign.md`
+- **Architecture:** `doc/layered/architecture-overview.md` (L0–5 connective overview)
 - **Layer 1 (Next layer):** `doc/layered/layer1-accelerator-hal.md`
 - **CUDA Programming Guide:** https://docs.nvidia.com/cuda/cuda-c-programming-guide/
 - **HIP Programming Guide:** https://rocmdocs.amd.com/en/latest/Programming_Guides/HIP-GUIDE.html

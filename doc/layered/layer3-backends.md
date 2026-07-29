@@ -1,8 +1,8 @@
 # Layer 3: Backends
 
-**Version:** 1.1
-**Date:** 2026-07-27
-**Status:** Device-agnostic `IBackend` live; mock backend complete; NVMe backend migrated to `IBackend` + `NvmeVirtualDevice` and verified on real hardware (GPU read/write round-trip)
+**Version:** 1.2
+**Date:** 2026-07-29
+**Status:** Device-agnostic `IBackend` live; mock backend complete; NVMe backend migrated to `IBackend` + `NvmeVirtualDevice`. NVMe **RAW** GPU IO (read + write) verified on real hardware; NVMe **FILE** IO submission not yet wired end-to-end (handle-build only)
 **Library:** `libtutti_backends` (device-agnostic core + mock) · `libtutti_backends_nvme` (NVMe transport)
 **Location:** `tutti/backends/`
 
@@ -35,23 +35,28 @@ This document describes the **device-agnostic** surface (`IBackend`, the shared 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  IO Engine (Layer 4)                                              │
-│  selects a backend by type; drives register / submit_one         │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │  IBackend (device-agnostic SPI)
-                           │  + BackendFactory::create_backend(type)
-┌──────────────────────────▼──────────────────────────────────────┐
+│  create_backend(type) + initialize();  then holds an             │
+│  IBatchSubmitter* to drive the batch submission path             │
+└───────────┬───────────────────────────────────┬──────────────────┘
+            │ IBackend (device-agnostic SPI)     │ IBatchSubmitter
+            │ lifecycle / roster / type          │ (NVMe-scoped SPI:
+            │ + BackendFactory::create_backend   │  metadata /
+            │                                    │  prepare_descriptors /
+            │                                    │  acquire_target_handle /
+            │                                    │  launch_batch_gpu_stream)
+┌───────────▼────────────────────────────────────▼─────────────────┐
 │  Backends (Layer 3)                                               │
 │                                                                   │
-│  IBackend                                                         │
-│  ├── initialize(dm, cfg) → opens a vdevice roster from Layer 2   │
-│  ├── vdevice roster       (dense array, VDeviceHandle = index)    │
+│  IBackend                            IBatchSubmitter (nvme::)      │
+│  ├── initialize(dm, cfg) → vdevice roster from Layer 2           │
+│  ├── vdevice roster   (dense array, VDeviceHandle = index)        │
 │  └── metadata / type                                              │
 │                                                                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌─────────┐  │
-│  │ NvmeBackend  │  │ RdmaBackend  │  │ GdsBackend│  │  Mock   │  │
-│  │ (+ device-   │  │  (IBackend)  │  │ (IBackend)│  │ Backend │  │
-│  │  side submit)│  │              │  │           │  │(IBackend│  │
-│  └──────────────┘  └──────────────┘  └──────────┘  └─────────┘  │
+│  ┌──────────────────────────┐ ┌────────────┐ ┌──────────┐ ┌────┐ │
+│  │ NvmeBackend              │ │ RdmaBackend │ │ GdsBackend│ │Mock│ │
+│  │ : IBackend,IBatchSubmitter│ │  (IBackend) │ │ (IBackend)│ │    │ │
+│  │ (+ __device__ submit_one)│ │             │ │           │ │    │ │
+│  └──────────────────────────┘ └────────────┘ └──────────┘ └────┘ │
 │                                                                   │
 │  BackendFactory: type → constructor registry (self-registering)  │
 └──────────────────────────┬──────────────────────────────────────┘
@@ -176,7 +181,7 @@ struct SubmissionResult {
 };
 ```
 
-For **host-side** submission paths only (bootstrap, tests). Device-side `submit_one` paths report completion through their own transport mechanics and do not use this struct.
+For **host-side** submission paths only (bootstrap, tests). No method on the device-agnostic `IBackend` returns it — it is consumed only by concrete-backend host paths (NVMe's `submit_batch_cpu_sync`, itself a stub, §5.6). Device-side `submit_one` paths report completion through their own transport mechanics and do not use this struct.
 
 ---
 
@@ -292,17 +297,23 @@ IBackend*  (concrete backend, not yet usable)
 **Library:** `libtutti_backends_nvme`
 **Files:** `nvme/include/`, `nvme/src/`, `nvme/device/`
 
-`NvmeBackend` is the first concrete transport. It implements the device-agnostic `IBackend` contract (lifecycle, roster, metadata) and, on top of that, realizes the two operations the base interface deliberately leaves out — `register` and `submit_one` — in the form NVMe actually requires:
+`NvmeBackend` is the first concrete transport. It inherits **two** bases — `class NvmeBackend : public IBackend, public IBatchSubmitter` (`nvme_backend.h:65`):
 
-- **`register`** becomes a set of **non-virtual host methods** that build the GPU-resident state a submit needs: `acquire_target_handle` (per storage target) and `prepare_descriptors` (per IO buffer).
-- **`submit_one`** is a **`__device__` function** (`submit_read_one` / `submit_write_one`) invoked from a GPU submit kernel — it cannot be a host virtual method, which is exactly why it is absent from `IBackend`. The host launch entry point is `launch_batch_gpu_stream`.
+- **`IBackend`** — the device-agnostic contract (lifecycle, roster, metadata).
+- **`IBatchSubmitter`** (`nvme/include/batch_submitter.h`) — a **narrow, NVMe-scoped submission SPI** that realizes the operations `IBackend` deliberately leaves out. This is the interface the Layer 4 IO Engine actually holds (`IBatchSubmitter*`), so the engine stays unit-testable against a lightweight mock without CUDA/libnvm. It is explicitly **not** device-agnostic — it traffics in `nvme::SubSliceInfo` / `BufferDescriptor` — and is scoped under `nvme::` to be honest about that coupling. A genuinely neutral descriptor type would be needed before a second transport could reuse the engine.
+
+On top of these, NVMe realizes the two operations the base `IBackend` omits, in the form NVMe actually requires:
+
+- **`register`** becomes a set of **`IBatchSubmitter` virtual methods** (`override`) that build the GPU-resident state a submit needs: `acquire_target_handle` (per storage target) and `prepare_descriptors` / `release_descriptors` (per IO buffer). `metadata()` is also an `IBatchSubmitter` override. Only `release_target_handle` and `submit_batch_cpu_sync` are genuinely non-virtual host helpers.
+- **`submit_one`** is a **`__device__` function** (`submit_read_one` / `submit_write_one`) invoked from a GPU submit kernel — it cannot be a host virtual method, which is exactly why it is absent from both interfaces. The host launch entry point is `launch_batch_gpu_stream` (also an `IBatchSubmitter` override).
 
 `NvmeBackend` downcasts each `IVirtualDevice*` in its roster to `NvmeVirtualDevice*` — the sole cross-boundary cast, confined to this backend.
 
 ### 5.1 Component map
 
 ```
-NvmeBackend  (nvme_backend.cpp)          — IBackend impl + orchestration
+NvmeBackend  (nvme_backend.cpp)          — IBackend + IBatchSubmitter impl + orchestration
+ ├── IBatchSubmitter    (batch_submitter.h)         — Layer-4-facing submission SPI (nvme::)
  ├── roster: vector<NvmeVirtualDevice*>   (downcast from IVirtualDevice*)
  ├── NvmeCommandBuilder (nvme_command_builder.cpp)  — ioaddrs → PRP descriptors
  ├── PrpPageCache       (prp_page_cache.cpp)        — two-tier PRP-list page pool
@@ -311,6 +322,8 @@ NvmeBackend  (nvme_backend.cpp)          — IBackend impl + orchestration
         └── device/submit_batch_kernel.cu            — GPU kernel
                 └── device/nvme_device_helpers.cuh   — __device__ submit_one + CQ poll
 ```
+
+The Layer 4 IO Engine holds an `IBatchSubmitter*` (not a concrete `NvmeBackend*`), so it depends only on the narrow NVMe submission SPI — `metadata` / `prepare_descriptors` / `release_descriptors` / `acquire_target_handle` / `launch_batch_gpu_stream` — and stays mockable without CUDA or libnvm.
 
 `nvme_backend_registration.cpp` self-registers `NvmeBackend` with `BackendFactory` under `BackendType::LOCAL_NVME`, using the same explicit-registrar pattern as the mock backend (the `REGISTER_BACKEND` macro cannot token-paste a scoped enum value).
 
@@ -327,7 +340,7 @@ NvmeBackend  (nvme_backend.cpp)          — IBackend impl + orchestration
 | `launch_batch_gpu_stream(stream, handle, descs, n, is_read)` | `void` | Launch the GPU submit kernel on `stream` (one thread per descriptor). Primary fast path. |
 | `submit_batch_cpu_sync(handle, descs, n, is_read)` | `SubmissionResult` | CPU synchronous submission. **Currently a stub** (reports success without issuing IO) — bootstrap/testing placeholder, see §5.6. |
 
-Metadata: `backend_type()` → `LOCAL_NVME`, `backend_name()` → `"local_nvme"`, and `metadata()` reports `SUPPORTS_GPUDIRECT`, with `max_io_size` / `alignment_bytes` taken from the first vdevice's `max_data_size` / `blk_size`.
+Metadata: `backend_type()` → `LOCAL_NVME`, `backend_name()` → `"local_nvme"`, and `metadata()` reports `SUPPORTS_GPUDIRECT` only (no `SUPPORTS_SGL`), `max_batch_size = 4096`, with `max_io_size` / `alignment_bytes` taken from the first vdevice's `max_data_size` / `blk_size` (falling back to `0` / `4096` when the roster is empty).
 
 ### 5.3 Data types
 
@@ -360,13 +373,26 @@ SGL construction (`build_sgl_descriptors`) is declared but not yet implemented.
 4. **Enqueue** — `sq_enqueue` rings the SQ doorbell via libnvm's ticket protocol.
 5. **Complete** — `cq_poll` spins for the CQE, then `cq_dequeue` + `put_cid` retire it.
 
-> **Completion is handled inside `submit_one_impl`.** The step-4/5 TODO comments in `submit_batch_kernel.cu` ("assume synchronous completion (placeholder)") are stale: the CQ poll happens one level down in the device helper, so when `cudaStreamSynchronize` returns the CQE has already arrived and the DMA is complete. This is what makes the read/write-verify test sound.
+> **Completion is handled inside `submit_one_impl`.** The step-4/5 TODO comments in `submit_batch_kernel.cu` ("assume synchronous completion (placeholder)") are stale: the CQ poll happens one level down in the device helper (`nvme_device_helpers.cuh:114-117`), so when `cudaStreamSynchronize` returns the CQE has already arrived and the DMA is complete. This is what makes the RAW read/write-verify test sound. Note the kernel does *not* surface per-descriptor status: on a failed `submit_one` (negative CID) the thread just returns (`submit_batch_kernel.cu:57-67`, `TODO: Report error to output array`), so logical NVMe command failures are invisible to the host.
+
+#### RAW vs FILE submission — what actually runs end-to-end
+
+The device path (`resolve_lba` → `submit_one_impl`) is **kind-agnostic**: it walks the handle's extent array regardless of how the extents were produced. The difference is entirely in `acquire_target_handle` and in what has been exercised:
+
+- **`NVME_RAW` — implemented and hardware-verified.** `acquire_target_handle` synthesizes a single `LbaExtent{start_lba, length_blocks}` (`nvme_target_handle.cpp:119-141`); `launch_batch_gpu_stream` → `submit_batch_kernel` → `submit_one_impl` builds and submits a real NVMe RW command and polls the CQ inline. The real-HW `GpuSubmitSingleBlock` (read) and `GpuWriteReadVerify` (write→read→byte-compare) tests both drive `NVME_RAW` targets (§6.2).
+- **`NVME_FILE` — handle build only, from pre-supplied extents; the whole metadata-production layer is missing.** `acquire_target_handle`'s `NVME_FILE` branch is a pure **consumer**: it requires the caller to hand it a pre-computed `target.extents` host array (`storage_target.h:46-48`) and errors out immediately if `num_extents == 0 || extents == nullptr` (`nvme_target_handle.cpp:67-70`). Given real extents it fully builds the inline (≤ 8) + overflow extent arrays on the GPU (`nvme_target_handle.cpp:66-117`), and because the device path is kind-agnostic a single-extent-contained FILE IO *would* submit through the same `submit_one_impl`. Two things are missing, at two different points in the pipeline:
+  1. **Earlier — file → LBA-extent metadata production does not exist in the backend.** Nothing in `tutti/backends` turns a real filesystem file into an `LbaExtent[]`: `grep` for `fiemap` / `FS_IOC_FIEMAP` / `read_extents` / `NvmeFileHeader` across `tutti/` returns nothing. The only producer of a FILE `StorageTarget` today is the unit test, which fabricates a single extent by hand (`tutti/tests/backends/nvme/nvme_backend_test.cpp:327`). Per the design this file-metadata parsing belongs in the FILE-type IO path of the NVMe backend. The reference monolith at root `nvme_storage/` already implements it and is the model to port/adapt: `fiemap_helper` (`read_extents(fd, nvme_block_size)` wraps `FS_IOC_FIEMAP` → `LbaExtent[]` in NVMe block units, rejecting holes/unwritten/unaligned extents, capped at 124), the 4 KiB self-describing on-disk `NvmeFileHeader` (`nvme_file_header.h`, so a file recovers its extent table on reopen without a side table), and `NvmeFile` / `persistent_file_log` (the create/open/delete lifecycle that captures extents once via FIEMAP and caches them). Extent production must run **before** `acquire_target_handle` can be given a real file.
+  2. **Later — a single FILE IO that spans multiple extents is unimplemented.** `submit_one_impl` returns `-2` ("crosses extent boundary", `nvme_device_helpers.cuh:96`) when `transfer_blocks > block_count`. Finishing this means splitting a multi-extent transfer across extents inside `submit_one_impl` (or the host descriptor build).
+
+  On top of both, **no test drives an IO against a FILE target** — the only `NVME_FILE` test (`AcquireReleaseTargetHandle`) acquires/releases a handle and issues no IO — so an end-to-end FILE IO test must be added once a real producer feeds real extents in. Tracked as future work below.
 
 ### 5.6 Status and limitations
 
-- **GPU read/write path:** complete and hardware-verified.
-- **`submit_batch_cpu_sync`:** stub — returns success without issuing IO (`nvme_submission.cpp`). Real CPU submission (build SQE → `nvm_cmd_read`/`write` → poll CQ) is future work.
-- **SGL descriptors:** not implemented (PRP only).
+- **GPU RAW read/write path:** complete and hardware-verified (`NVME_RAW` targets).
+- **GPU FILE path:** handle build from **pre-supplied** extents complete; the file→extent metadata-production layer (FIEMAP / on-disk header parse) does **not** exist in the backend, so nothing turns a real file into the `LbaExtent[]` that `acquire_target_handle` demands (reference in `nvme_storage/`: `fiemap_helper`, `nvme_file_header`, `NvmeFile` / `persistent_file_log`). On top of that, IO submission is not wired end-to-end (no FILE IO test; multi-extent commands unimplemented — `submit_one_impl` returns `-2`). See §5.5.
+- **`submit_batch_cpu_sync`:** stub — copies the handle to host, logs a warning, and returns `success=true` / `completed_count=n_descs` **without issuing any IO** (`nvme_submission.cpp:78-97`). Real CPU submission (build SQE → `nvm_cmd_read`/`write` → poll CQ) is future work.
+- **Kernel per-descriptor error readback:** not implemented — failed commands are silently dropped (`submit_batch_kernel.cu:57-67`).
+- **SGL descriptors:** not implemented — `build_sgl_descriptors` always returns `false` (`nvme_command_builder.cpp`); PRP only. `metadata()` never sets `SUPPORTS_SGL`.
 - **Multi-page LIST correctness** relies on the caller supplying page-aligned `ioaddrs`; MDTS is enforced by the command builder.
 
 ---
@@ -451,23 +477,35 @@ Last verified 2026-07-27: unit 8/8, real-HW 7/7 + destructive write/read/verify 
 
 ---
 
-## 7. Current Implementation Status
+## Implementation Status
 
-### Device-agnostic core — complete
-`IBackend`, `backend_types.h` (`BackendType`, `VDeviceHandle`, `BackendConfig`, `BackendMetadata`, `SubmissionResult`), and `BackendFactory` are implemented and wired into the build (`add_subdirectory(backends)` enabled in `tutti/CMakeLists.txt`).
+| Component | Status | Tested |
+|-----------|--------|--------|
+| `IBackend` device-agnostic SPI (lifecycle, roster, `VDeviceHandle`, metadata) | Complete | Yes (`backend_test.cpp`) |
+| `backend_types.h` (`BackendType`, `VDeviceHandle`, `BackendConfig`, `BackendMetadata`, `BackendCapability`) | Complete | Yes (`backend_test.cpp`) |
+| `SubmissionResult` | Dead-reserved (defined; no core method returns it; only the NVMe CPU-sync stub uses it) | No |
+| `BackendFactory` (register / create / available / is_registered, mutex-guarded, last-wins) | Complete | Yes (`backend_test.cpp`) |
+| `REGISTER_BACKEND` macro | Dead-reserved (token-pastes the type → unusable for scoped enums; backends use an explicit static registrar instead) | No |
+| `StorageTarget` / `LbaExtent` / `StorageTargetKind` | Complete (definitions) — standalone header, not `#include`d by the core files nor in `COMMON_HEADERS`; consumed only by the NVMe backend | Indirectly (via NVMe tests) |
+| `MockBackend` (roster open + rollback, idempotent shutdown, metadata, self-registration) | Complete | Yes (11 cases, vendor-neutrality verified) |
+| NVMe multi-vdevice roster lifecycle (open/downcast/rollback/shutdown) | Complete | Yes (unit + real-HW) |
+| NVMe PRP descriptor build (SINGLE / DUAL / LIST) + two-tier page cache | Complete | Partial (DUAL on real HW; LIST > 2 pages not exercised under real IO) |
+| NVMe target handle acquire/release — `NVME_RAW` + `NVME_FILE` | Complete | `NVME_RAW` yes; `NVME_FILE` acquire/release only |
+| NVMe **FILE** handle build from **pre-supplied** extents (inline ≤ 8 + overflow) | Complete | Acquire/release only (extents hand-fabricated by the test) |
+| NVMe **FILE** file→extent metadata production (FIEMAP / on-disk header parse) | Not implemented (absent from `tutti/backends`; reference in `nvme_storage/`: `fiemap_helper`, `nvme_file_header`, `NvmeFile` / `persistent_file_log`) | No |
+| NVMe **RAW** GPU IO submission (`launch_batch_gpu_stream` → kernel → `submit_one_impl` + inline CQ poll) | Complete | Yes — real-HW read + write→read→verify |
+| NVMe **FILE** GPU IO submission end-to-end | Blocked on metadata production; also handle build only, no FILE IO test, multi-extent commands unimplemented | No |
+| NVMe single IO spanning multiple extents | Not implemented (`submit_one_impl` returns `-2`) | No |
+| NVMe kernel per-descriptor error/completion readback | Not implemented (`TODO`; failures silently dropped) | No |
+| NVMe `submit_batch_cpu_sync` | Stub (returns fake success, issues no IO) | No |
+| NVMe SGL descriptors (`build_sgl_descriptors`) | Not implemented (always returns `false`) | No |
+| RDMA / GDS backends | Not implemented (enum values reserved; `add_subdirectory` commented out) | No |
 
-### Mock backend — complete
-`MockBackend` + 11 device-agnostic tests pass; vendor-neutrality verified.
-
-### NVMe backend — complete, hardware-verified
-Migrated to `IBackend` + `NvmeVirtualDevice`. `add_subdirectory(nvme)` is enabled in `backends/CMakeLists.txt`, and `libtutti_backends_nvme` builds as part of the default Layer 3 compile. `register` is realized as host methods (`acquire_target_handle` / `prepare_descriptors`), and the device-side `submit_one` runs from the GPU submit kernel with in-kernel CQ polling. GPU read and write paths are verified on real hardware (§6.2). Outstanding gaps (CPU-sync stub, SGL, per-descriptor error readback) are tracked in §9.
-
-### RDMA / GDS — not implemented
-Enum values reserved; no backend yet.
+Both `add_subdirectory(backends)` (`tutti/CMakeLists.txt`) and `add_subdirectory(nvme)` (`backends/CMakeLists.txt`) are enabled; `libtutti_backends` (core + mock) and `libtutti_backends_nvme` build as part of the default Layer 3 compile.
 
 ---
 
-## 8. Vendor-Neutral Boundary
+## Vendor-Neutral Boundary
 
 The device-agnostic surface:
 
@@ -482,21 +520,25 @@ Nothing in this surface includes libnvm or CUDA. Layer 2's facade types are forw
 
 ---
 
-## 9. Known Gaps / Not Yet Implemented
+## Known Issues & Gaps
 
-Layer 3's primary path — device-agnostic core, mock backend, and the NVMe **GPU submit** path (read + write) — is complete and hardware-verified. The following are the outstanding gaps as of 2026-07-27. None blocks the GPU fast path or Layer 4 integration, but each is a real limitation to be aware of.
+Layer 3's primary path — device-agnostic core, mock backend, and the NVMe **RAW** GPU submit path (read + write) — is complete and hardware-verified. None of the items below blocks the RAW GPU fast path or Layer 4 integration, but each is a real limitation.
 
-| # | Gap | Location | Impact | Status |
-|---|-----|----------|--------|--------|
-| 1 | **`submit_batch_cpu_sync` is a stub** — copies the handle to host, logs a warning, and returns `success=true` **without issuing any IO**. A caller of the CPU path gets a false "success" and no data movement. | `nvme/src/nvme_submission.cpp` (`submit_batch_cpu_sync`) | CPU synchronous submission is non-functional. Only the GPU path (`launch_batch_gpu_stream`) actually performs IO. | Not implemented |
-| 2 | **SGL descriptors not implemented** — `build_sgl_descriptors` always returns `false`; only PRP (SINGLE/DUAL/LIST) is supported. | `nvme/src/nvme_command_builder.cpp` / `nvme_command_builder.h` | No scatter-gather-list transfers. Highly fragmented buffers must be expressed as PRP lists (page-granular). | Not implemented |
-| 3 | **Kernel per-descriptor error reporting is a TODO** — the submit kernel does not write per-command completion status back to an output array; a failed `submit_one` (negative CID) is silently dropped by that thread. | `nvme/device/submit_batch_kernel.cu` | Batch submissions cannot report which individual descriptors failed. Stream-level `cudaStreamSynchronize` still catches kernel faults, but not logical NVMe command failures. | Partial (submit + CQ poll work; status readback missing) |
-| 4 | **RDMA / GDS backends absent** — `BackendType::RDMA` and `GDS` enum values are reserved but no backend implements them. | — | Only `LOCAL_NVME` and `MOCK` are registered with the factory. | Not implemented |
+- **The NVMe FILE metadata-production layer (file → LBA extents) does not exist — the blocking prerequisite for real FILE IO.** `acquire_target_handle`'s `NVME_FILE` branch is a pure **consumer**: it demands a caller-supplied `target.extents` host array (`storage_target.h:46-48`) and errors immediately if `num_extents == 0 || extents == nullptr` (`nvme_target_handle.cpp:67-70`). Nothing in `tutti/backends` produces those extents from a real filesystem file — `grep` for `fiemap` / `FS_IOC_FIEMAP` / `read_extents` / `NvmeFileHeader` across `tutti/` returns nothing, and the only FILE `StorageTarget` produced today is the unit test's single hand-fabricated extent (`tutti/tests/backends/nvme/nvme_backend_test.cpp:327`). Per the design this file-metadata parsing belongs in the NVMe backend's FILE-type IO path. The reference monolith at root `nvme_storage/` is the model to port/adapt: `fiemap_helper` (`read_extents(fd, nvme_block_size)` wraps `FS_IOC_FIEMAP` → `LbaExtent[]` in NVMe block units, rejects holes/unwritten/unaligned, capped at 124), the 4 KiB self-describing on-disk `NvmeFileHeader` (extent table recovered on reopen without a side table), and `NvmeFile` / `persistent_file_log` (create/open/delete lifecycle that captures extents once via FIEMAP and caches them). Until extent production runs, `acquire_target_handle` cannot be given a real file, so end-to-end FILE IO is blocked at this earlier point in the pipeline — before the submit-split gap below is even reachable.
+- **NVMe FILE IO submission is not wired end-to-end.** Even given real extents, `acquire_target_handle` builds the `NVME_FILE` GPU handle (inline ≤ 8 + overflow extents, `nvme_target_handle.cpp:66-117`) and the kind-agnostic device path *would* submit a single-extent-contained FILE IO through the same `submit_one_impl` as RAW — but no test drives a FILE IO (the only `NVME_FILE` test, `AcquireReleaseTargetHandle`, issues none), and a FILE IO spanning **multiple extents** is unimplemented: `submit_one_impl` returns `-2` ("crosses extent boundary", `nvme_device_helpers.cuh:96`). A large multi-extent FILE IO fails silently per-command in the kernel. The seam to finish: split multi-extent transfers inside `submit_one_impl` (or the host descriptor build) and add an end-to-end FILE IO test. This gap is **later in the pipeline** than the missing metadata-production layer above.
+- **`submit_batch_cpu_sync` is a stub** (`nvme/src/nvme_submission.cpp:78-97`). It copies the handle to host, logs a warning, and returns `success=true` / `completed_count=n_descs` **without issuing any IO**. A caller of the CPU path gets a false "success" and no data movement — only `launch_batch_gpu_stream` performs real IO.
+- **Kernel per-descriptor error/completion readback is missing** (`nvme/device/submit_batch_kernel.cu:57-67`, `TODO`). The kernel does not write per-command status to an output array; a failed `submit_one` (negative CID) is silently dropped by that thread. Stream-level `cudaStreamSynchronize` still catches kernel faults, but not logical NVMe command failures — so `launch_batch_gpu_stream` callers cannot detect which individual descriptors failed.
+- **SGL descriptors are not implemented.** `NvmeCommandBuilder::build_sgl_descriptors` always returns `false` (`nvme/src/nvme_command_builder.cpp`); only PRP (SINGLE/DUAL/LIST) is supported, and `metadata()` never sets `SUPPORTS_SGL`. Highly fragmented buffers must be expressed as PRP lists (page-granular).
+- **PRP LIST (> 2 pages) and the prp-list cache are untested under real IO.** Real-HW tests exercise only the DUAL descriptor and the RAW GPU path; the LIST branch and the two-tier page cache are unit-covered at construction but not driven by a real transfer.
+- **RDMA / GDS backends are absent.** `BackendType::RDMA` and `GDS` are reserved but no backend implements them (`add_subdirectory(rdma)` / `(gds)` are commented out in `backends/CMakeLists.txt`). Only `LOCAL_NVME` and `MOCK` are registered with the factory.
+- **`SubmissionResult` and `REGISTER_BACKEND` are dead-reserved.** `SubmissionResult` is defined but no `IBackend` method returns it (only the NVMe CPU-sync stub uses it). `REGISTER_BACKEND` token-pastes its type argument, so it cannot register a scoped-enum value; every backend uses an explicit static registrar instead.
+- **`StorageTarget` linkage is undocumented at the core layer.** `storage_target.h` is a standalone header — not `#include`d by `backend.h` / `backend_factory.h` / the mock, and absent from `COMMON_HEADERS`. It is emitted by namespace producers and consumed only inside the NVMe backend (`acquire_target_handle`); there is no core-interface method (`acquire_target_handle` was intentionally kept off `IBackend`) that ties a descriptor to a handle.
 
 ### What is NOT a gap (clarifications)
 
-- **The "assume synchronous completion (placeholder)" comments in `submit_batch_kernel.cu`** are stale/misleading, not a real gap. Completion polling (`cq_poll` + `cq_dequeue`) happens one level down inside `submit_one_impl` (`nvme_device_helpers.cuh`), so the GPU read/write paths are fully synchronous and verified. See §5.5.
-- **The stale `VERIFICATION_REPORT.md`** under `tutti/backends/` (dated 2026-07-21) predates this redesign and refers to the deleted `backend_provider.h`; it is not authoritative — this document is.
+- **The "assume synchronous completion (placeholder)" comments in `submit_batch_kernel.cu`** are stale/misleading, not a real gap. Completion polling (`cq_poll` + `cq_dequeue`) happens one level down inside `submit_one_impl` (`nvme_device_helpers.cuh:114-117`), so the RAW GPU read/write paths are fully synchronous and verified. See §5.5.
+- **`register` / `submit_one` absent from `IBackend`** is a deliberate design boundary, not a missing feature — their signatures and host-vs-device residency are transport-specific (§3, `backend.h:33-51`).
+- **Any doc referring to `IBackendProvider`, `backend_provider.h`, `initialize(VDevice*)`, a `local_nvme/` directory, or the batch-submission virtuals** (`launch_batch_gpu_stream` / `submit_batch_*` / `prepare_descriptors` / `acquire_target_handle` on the base interface) describes the retired v0.1 design. The current interface is `IBackend` in `backend.h`; the NVMe subdirectory is `nvme/`; the stale `README.md` / `CMakeLists.txt` header comments and the `VERIFICATION_REPORT.md` (dated 2026-07-21) under `tutti/backends/` are **not** authoritative — this document is.
 
 ### Deferred design work
 
@@ -507,7 +549,7 @@ Layer 3's primary path — device-agnostic core, mock backend, and the NVMe **GP
 
 ## Related Documents
 
-- [Layered Architecture Redesign](../architecture/layered-architecture-redesign.md)
+- [Architecture Overview (L0–5)](architecture-overview.md)
 - [Layer 2: Device Manager](layer2-device-manager.md) — supplies the vdevices this layer consumes
 - [Backend SPI design](../design/backend-spi.md) — original SPI design notes
 

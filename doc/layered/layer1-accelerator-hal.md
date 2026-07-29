@@ -103,6 +103,8 @@ Constructors accept 1, 2, or 3 dimensions.
 | `ACCESS_WRITE` | 1<<1 | Device may write |
 | `ACCESS_HOST_MAPPED` | 1<<2 | Device memory host-accessible |
 
+> **Dead type:** `MemoryAccessFlags` is defined in `memory_kind.h` but is not referenced by any `IAccelerator` signature or by `CudaAccelerator`. It is reserved for future use and carries no behavior today.
+
 ### `MemoryRegion` — Unified Memory Handle
 **File:** `include/common/memory_region.h`
 
@@ -124,12 +126,14 @@ The central tracking structure returned by all `register_*` calls.
 
 Tagged union describing memory the HAL tracks but does not own.
 
-| `Source` | Backing | Union Payload |
-|----------|---------|---------------|
+| `Source` | Intended Backing | Union Payload |
+|----------|------------------|---------------|
 | `APP_MANAGED` | Caller allocation | (empty) |
 | `DEVICE_IPC` | `cudaIpcOpenMemHandle` | `uint8_t handle[64]` |
 | `HOST_SHM` | `shm_open` + `mmap` | `int shm_fd` |
 | `HOST_FD_MAP` | `fd` + `mmap` | `int fd; off_t offset` |
+
+> **Note:** the "Intended Backing" column documents what each source *represents*, not work the HAL performs. `register_external()` only records the caller-supplied pointers and a deep copy of the spec — it never calls `shm_open`, `mmap`, `cudaHostRegister`, or any IPC API, and `unregister()` performs no matching teardown. Bringing these pointers into existence is the caller's responsibility today (see Known Issues & Gaps).
 
 ---
 
@@ -151,7 +155,7 @@ The complete vendor-neutral API. 26 pure-virtual methods across 9 areas.
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `allocate_host` | `void* allocate_host(size_t size, MemoryKind kind)` | Allocate host memory (HOST / PINNED_HOST / MANAGED) |
+| `allocate_host` | `void* allocate_host(size_t size, MemoryKind kind)` | Allocate host memory (HOST / PINNED_HOST only; MANAGED returns nullptr here — use `allocate_device`) |
 | `allocate_device` | `void* allocate_device(size_t size, MemoryKind kind, int device_id)` | Allocate device memory, **64KB-aligned** |
 | `free` | `void free(void* ptr, MemoryKind kind)` | Release allocation; `kind` selects the free path |
 
@@ -159,10 +163,10 @@ The complete vendor-neutral API. 26 pure-virtual methods across 9 areas.
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `register_host` | `MemoryRegion* register_host(void* host_ptr, size_t size)` | Track/pin existing host memory |
+| `register_host` | `MemoryRegion* register_host(void* host_ptr, size_t size)` | Track existing host memory (bookkeeping only — does **not** pin; no `cudaHostRegister`) |
 | `register_device` | `MemoryRegion* register_device(void* device_ptr, size_t size, int device_id)` | Track existing device memory |
-| `register_external` | `MemoryRegion* register_external(void* host_ptr, void* device_ptr, size_t size, const ExternalMemorySpec& spec)` | Track external memory (IPC / SHM / fd / app) |
-| `unregister` | `void unregister(MemoryRegion* region)` | Remove from registry |
+| `register_external` | `MemoryRegion* register_external(void* host_ptr, void* device_ptr, size_t size, const ExternalMemorySpec& spec)` | Store the given pointers + a deep copy of `spec` (bookkeeping only — performs **no** `shm_open`/`mmap`/`cudaHostRegister`/IPC work) |
+| `unregister` | `void unregister(MemoryRegion* region)` | Erase pointer maps + delete the `ExternalMemorySpec`; does **not** unpin, `munmap`, or close IPC handles |
 | `lookup` | `MemoryRegion* lookup(const void* ptr) const` | Find region by contained pointer |
 | `lookup_by_id` | `MemoryRegion* lookup_by_id(uint64_t region_id) const` | Find region by ID |
 
@@ -194,7 +198,7 @@ The complete vendor-neutral API. 26 pure-virtual methods across 9 areas.
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `memcpy_async` | `bool memcpy_async(void* dst, const void* src, size_t size, AccelStream stream)` | Async copy; direction auto-detected |
+| `memcpy_async` | `bool memcpy_async(void* dst, const void* src, size_t size, AccelStream stream)` | Async copy; issued with `cudaMemcpyDefault` (UVA infers direction) |
 
 ### Kernel Launch
 
@@ -207,7 +211,7 @@ The complete vendor-neutral API. 26 pure-virtual methods across 9 areas.
 | Method | Signature | Purpose |
 |--------|-----------|---------|
 | `ipc_export` | `bool ipc_export(MemoryRegion* region, IpcHandle* out_handle)` | Export device memory as IPC handle |
-| `ipc_import` | `MemoryRegion* ipc_import(const IpcHandle& handle, int device_id)` | Import IPC handle as EXTERNAL region |
+| `ipc_import` | `MemoryRegion* ipc_import(const IpcHandle& handle, int device_id)` | **Non-functional** — opens the handle but calls `register_external(..., size=0)`, which rejects `size==0` and returns nullptr; the imported pointer leaks (see Known Issues) |
 
 ---
 
@@ -259,16 +263,16 @@ void CudaAccelerator::free(void* ptr, MemoryKind kind) {
 | Area | CUDA calls |
 |------|-----------|
 | Identity | `cudaGetDeviceCount`, `cudaSetDevice`, `cudaGetDevice` |
-| Host alloc | `malloc` / `cudaMallocHost` / `cudaMallocManaged` |
-| Device alloc | `cudaMalloc` (+ alignment) |
+| Host alloc | `malloc` (HOST) / `cudaHostAlloc` (PINNED_HOST); MANAGED rejected here |
+| Device alloc | `cudaMalloc` (+ alignment) for DEVICE; `cudaMallocManaged` for MANAGED |
 | Free | `free` / `cudaFreeHost` / `cudaFree` |
-| Register host | `cudaHostRegister` / `cudaHostUnregister` |
+| Register host | none — pure registry bookkeeping (no `cudaHostRegister`) |
 | Pointer xlate | `cudaHostGetDevicePointer` |
 | Streams | `cudaStreamCreate/Destroy/Synchronize` |
 | Events | `cudaEventCreate/Destroy/Record/Query`, `cudaStreamWaitEvent` |
-| Transfer | `cudaMemcpyAsync` (direction via `cudaPointerGetAttributes`) |
+| Transfer | `cudaMemcpyAsync` with `cudaMemcpyDefault` (UVA infers direction) |
 | Launch | `cudaLaunchKernel` |
-| IPC | `cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle` / `cudaIpcCloseMemHandle` |
+| IPC | `cudaIpcGetMemHandle` (export) / `cudaIpcOpenMemHandle` (import); no `cudaIpcCloseMemHandle` on teardown |
 
 > A full field-by-field mapping is in `doc/layered/layer1-cuda-mapping.md` (see project root `layer1-cuda-mapping.md`).
 
@@ -319,7 +323,9 @@ All public methods are thread-safe. The registry and allocation maps are shared 
 
 **Choice:** `ExternalMemorySpec` enumerates four concrete sources (APP_MANAGED, DEVICE_IPC, HOST_SHM, HOST_FD_MAP).
 
-**Rationale:** These are the real ways memory enters the system from outside the HAL. Making them explicit lets `unregister()` do the right teardown (e.g. `cudaIpcCloseMemHandle` for IPC, `munmap` for mappings) and documents supported integration paths.
+**Rationale:** These are the real ways memory enters the system from outside the HAL. Making them explicit documents the supported integration paths and gives `unregister()` a place to hook the right teardown per source.
+
+> **Current state:** the teardown is *not* implemented. `register_external()` stores pointers + a spec copy only, and `unregister()` deletes the spec and erases pointer maps — it does **not** call `cudaIpcCloseMemHandle`, `munmap`, or `cudaHostUnregister`. Imported IPC pointers and any host mappings are therefore leaked. See Known Issues & Gaps.
 
 ---
 
@@ -359,35 +365,25 @@ delete accel;
 
 ## Testing
 
-**File:** `tests/layer1_smoke_test.cu` — 11 tests
+**Location:** `tests/accel/*.cu` — a GoogleTest suite (~35 `TEST_F` cases) split by functional area. The old single-file `layer1_smoke_test.cu` has been retired.
 
-| # | Test | Covers |
-|---|------|--------|
-| 1 | `test_device_management` | device_count, get/set_device |
-| 2 | `test_host_memory` | HOST alloc/free + write |
-| 3 | `test_device_memory` | DEVICE alloc/free |
-| 4 | `test_pinned_memory` | PINNED_HOST alloc/free + write |
-| 5 | `test_memory_registration` | register_host, lookup, lookup_by_id, unregister |
-| 6 | `test_stream_lifecycle` | create/sync/destroy stream + memcpy |
-| 7 | `test_event_lifecycle` | create/record/query/wait/destroy event |
-| 8 | `test_memcpy_async` | H→D, D→H with verification |
-| 9 | `test_memcpy_device_to_device` | D→D with verification |
-| 10 | `test_device_memory_alignment_and_leak` | 64KB alignment + 200-iteration leak regression |
-| 11 | `test_kernel_launch` | `launch()` with a vector-add kernel |
+| File | Cases | Covers |
+|------|-------|--------|
+| `identity.cu` | 6 | device_count, get/set_device, invalid-device handling |
+| `memory.cu` | 8 | HOST / PINNED_HOST / DEVICE / MANAGED alloc + free paths, 64KB alignment |
+| `registry.cu` | 9 | register_host / register_device / register_external, lookup, lookup_by_id, unregister, null/zero-size guards |
+| `stream_event.cu` | 4 | stream + event lifecycle incl. cross-stream `wait_event` ordering |
+| `transfer.cu` | 3 | H→D, D→H, D→D `memcpy_async` with verification |
+| `kernel.cu` | 2 | `launch()` via function pointer + 64KB-alignment/200-iteration leak regression |
+| `ipc.cu` | 3 | `ipc_export` arg-validation; export→import roundtrip (see note) |
 
-### Coverage Gaps
+The shared fixture lives in `tests/accel/accel_test_fixture.h`; the build wiring is `tests/accel/CMakeLists.txt`.
 
-Not yet tested:
-- `MemoryKind::MANAGED` and `MemoryKind::EXTERNAL` allocation paths
-- `register_device()` and `register_external()` (all four sources)
-- `device_pointer_for()`
-- `ipc_export()` / `ipc_import()` (cross-process sharing)
-- `wait_event()` cross-stream ordering (called but not asserted)
-- Error handling (invalid device, null ptr, double free, unregister unknown)
-- Concurrency (thread-safety is claimed but not exercised)
-- Multi-GPU (only device 0 tested)
+### Coverage Notes
 
-**Recommendation priority:** IPC and external-memory tests first (core to multi-process use cases), then error handling and thread-safety, then multi-GPU.
+- **`ipc_import` is not verified end-to-end.** `ipc.cu`'s `ExportImportRoundtrip` calls `GTEST_SKIP()` when `ipc_export` is unsupported *or* when the in-process self-import returns nullptr — which it always does today because of the `size=0` bug (see Known Issues & Gaps). The metadata assertions after import are therefore never reached in-process.
+- **External-source flows** (`HOST_SHM`, `HOST_FD_MAP`, `DEVICE_IPC` via `register_external`) are covered only at the bookkeeping level; the HAL performs no backing syscalls, so there is nothing further to assert.
+- **Concurrency / multi-GPU** are still not exercised (thread-safety is claimed but not stress-tested; only device 0 is used).
 
 ---
 
@@ -415,11 +411,49 @@ Not yet tested:
 
 ---
 
+## Implementation Status
+
+| Component | Status | Tested |
+|-----------|--------|--------|
+| Identity (device_count / set / get) | Complete | Yes (`identity.cu`, incl. invalid-device) |
+| Alloc HOST / PINNED_HOST | Complete | Yes (`memory.cu`) |
+| Alloc DEVICE (64KB-aligned + raw-ptr free bookkeeping) | Complete | Yes (`memory.cu`, `kernel.cu` leak regression) |
+| Alloc MANAGED (via `allocate_device`) | Complete | Yes (`memory.cu`) |
+| Registry (register_host/device, lookup, lookup_by_id, unregister) | Complete | Yes (`registry.cu`) |
+| Pointer translation (`device_pointer_for`) | Complete | Yes (`registry.cu`/`transfer.cu`) |
+| Stream lifecycle | Complete | Yes (`stream_event.cu`) |
+| Event lifecycle (incl. cross-stream `wait_event`) | Complete | Yes (`stream_event.cu`) |
+| Transfer (`memcpy_async`, `cudaMemcpyDefault`) | Complete | Yes (`transfer.cu`) |
+| Kernel launch (`cudaLaunchKernel`) | Complete | Yes (`kernel.cu`) |
+| `ipc_export` | Complete | Yes — arg-validation (`ipc.cu`) |
+| `ipc_import` | Stub (non-functional; `size=0` bug) | Test GTEST_SKIPs it |
+| `register_external` backing (SHM / fd-map / IPC syscalls) | Not implemented (bookkeeping only) | N/A |
+| External teardown in `unregister` (IPC close / munmap / unpin) | Not implemented | No |
+| `register_host` pinning (`cudaHostRegister`) | Not implemented (bookkeeping only) | No |
+| `MemoryAccessFlags` | Dead-reserved (defined, never referenced) | No |
+| ROCm / SYCL backends | Not implemented | No |
+| Async memset / stream query | Not implemented (no such method) | No |
+
+---
+
+## Known Issues & Gaps
+
+- **`ipc_import` always returns nullptr and leaks the imported pointer.** After a successful `cudaIpcOpenMemHandle`, the method calls `register_external(nullptr, device_ptr, 0, spec)` (`src/cuda/cuda_accelerator.cu:495`). `register_external` rejects `size == 0` (`cuda_accelerator.cu:234`) and returns nullptr, so the opened device pointer is never registered and never closed — a leak on every call. The handle carries no size, so the fix requires threading a caller-supplied size into `ipc_import`. `tests/accel/ipc.cu` `GTEST_SKIP()`s past this rather than failing.
+- **External memory teardown is missing.** `unregister` (`cuda_accelerator.cu:260`) only deletes the `ExternalMemorySpec` and erases pointer maps. It does not call `cudaIpcCloseMemHandle` (DEVICE_IPC), `munmap` (HOST_SHM / HOST_FD_MAP), or `cudaHostUnregister`. Any externally-imported memory leaks its OS/driver resource.
+- **`register_external` performs no backing work.** It stores the supplied pointers and a deep copy of the spec (`cuda_accelerator.cu:228`). The documented flows (`shm_open`+`mmap` for HOST_SHM, `mmap` for HOST_FD_MAP, `cudaHostRegister`/IPC for EXTERNAL) are not executed; the caller must have already produced the pointers.
+- **`register_host` does not pin.** It is pure registry bookkeeping (`cuda_accelerator.cu:180`) — no `cudaHostRegister`. Memory registered this way is not made DMA-capable by the HAL, contrary to earlier "track/pin" wording.
+- **`allocate_host(MANAGED)` returns nullptr.** `allocate_host` handles only HOST and PINNED_HOST (`cuda_accelerator.cu:67`); MANAGED falls through to the error path. MANAGED memory is reachable only via `allocate_device(size, MANAGED, dev)`.
+- **`MemoryAccessFlags` is dead.** Defined in `include/common/memory_kind.h` but referenced by no signature or implementation. Either wire it into `register_*`/`allocate_*` semantics or drop it.
+- **No async memset and no stream-query method.** There is no `cudaMemset*` call anywhere in the backend and no stream-query entry point on `IAccelerator`; only `query_event` exists. Docs/READMEs that list these were aspirational.
+
+---
+
 ## Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.0 | 2026-07-22 | Initial CUDA implementation, 11 smoke tests |
+| 1.0 | 2026-07-22 | Initial CUDA implementation, single-file smoke test |
+| 1.1 | 2026-07-29 | Docs reconciled with code; GoogleTest suite (`tests/accel/*.cu`, ~35 cases); documented `ipc_import` bug + external-teardown/pinning gaps |
 
 ---
 
@@ -429,4 +463,4 @@ Not yet tested:
 - **CUDA impl:** `tutti/accel/include/cuda/cuda_accelerator.h`
 - **CUDA mapping (detailed):** `layer1-cuda-mapping.md`
 - **Previous layer:** `doc/layered/layer0-abstraction.md`
-- **Architecture:** `doc/architecture/layered-architecture-redesign.md`
+- **Architecture:** `doc/layered/architecture-overview.md` (L0–5 connective overview)

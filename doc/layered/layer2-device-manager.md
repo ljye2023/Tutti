@@ -30,7 +30,9 @@ N queue pairs total
     └── Process B: N − kernel − K pairs
 ```
 
-Within a process the pool is further divided among backends (file backend, raw device backend, …). A two-level allocator handles both splits.
+Within a process the pool is further divided among backends. A two-level allocator handles both splits.
+
+> **Illustrative naming.** Throughout this doc, "file backend" and "raw device backend" are used as *example* L2 consumers to motivate the per-backend split. **No such backends consume L2 today** — the raw-device / file-backend distinction is a planned Layer 3 shape, not implemented at L2. The only current L2 consumers are the mock test suite and the NVMe real-hardware tests (see §6).
 
 **Device Manager is the answer to all three problems.** It owns the physical device, arbitrates the cross-process grant, and slices the per-process grant into per-backend virtual devices — for every device type, not only NVMe.
 
@@ -40,9 +42,10 @@ Within a process the pool is further divided among backends (file backend, raw d
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Backends (Layer 3)                                               │
-│  local_nvme / rdma / gds                                         │
-│  call open_vdevice() once at initialize(); cast to subtype       │
+│  Backends (Layer 3)  — PLANNED consumer shape                     │
+│  local_nvme / rdma / gds  (none consume L2 yet)                   │
+│  call open_vdevice() once at initialize(); cast to subtype        │
+│  Today only the mock suite + NVMe real-HW tests call open_vdevice │
 └──────────────────────────┬──────────────────────────────────────┘
                            │  IDeviceManager (facade)
 ┌──────────────────────────▼──────────────────────────────────────┐
@@ -60,7 +63,7 @@ Within a process the pool is further divided among backends (file backend, raw d
 │                                                                   │
 │  Cross-process arbitration: ILeaseManager (DeviceService daemon) │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │  cudaMalloc d_qps, map doorbells
+                           │  cudaMallocManaged d_qps, map doorbells
 ┌──────────────────────────▼──────────────────────────────────────┐
 │  Layer 1: Accelerator HAL                                         │
 └─────────────────────────────────────────────────────────────────┘
@@ -192,8 +195,8 @@ The single interface callers (backends, coordinator) program against. Replaces t
 
 | Method | Return | Description |
 |--------|--------|-------------|
-| `Open()` | `bool` | Probe all registered drivers; build physical device registry. Must be called first. |
-| `Close()` | `void` | Release all virtual devices; tear down all physical devices |
+| `Open()` | `bool` | Probe all registered drivers; build physical device registry. Must be called first. **Idempotent:** a second call while already open returns `true` immediately without re-enumerating (guarded by `opened_`). |
+| `Close()` | `void` | Release all virtual devices; tear down all physical devices. No-op if not open. |
 
 #### Physical Device Registry
 
@@ -237,7 +240,7 @@ std::unique_ptr<IDeviceManager> create_device_manager(
     std::vector<std::unique_ptr<IDeviceDriver>> drivers);
 ```
 
-`Open()` iterates the drivers and calls `enumerate()` on each. A driver returning `n < 0` aborts `Open()` (returns `false`, clears the registry); `n == 0` is a success that simply contributes no devices. Note the rollback only clears the manager's registry — it does **not** call `shutdown()` on drivers that already enumerated, so partial-failure cleanup is the caller's responsibility.
+`Open()` iterates the drivers and calls `enumerate()` on each. A driver returning `n < 0` aborts `Open()` (returns `false`, clears `devices_`); `n == 0` is a success that simply contributes no devices. The rollback only clears the manager's registry — it does **not** call `shutdown()` on drivers that already enumerated. In practice that is usually harmless: the drivers stay owned by `DeviceManagerImpl`, so their destructors self-clean (e.g. `~DaemonNvmeDeviceDriver()` calls `shutdown()`, which joins the heartbeat thread, releases the lease, and tears down libnvm state). The leak only bites drivers whose destructor does **not** shut down — e.g. `MockDeviceDriver`, whose dtor does not release its lease/heartbeat, so a peer driver's failed `Open()` would strand a mock lease until the manager itself is destroyed. So the blanket "caller's responsibility" claim holds only for that class of driver.
 
 ---
 
@@ -310,18 +313,24 @@ Manages the per-process resource grant issued by the **DeviceService** daemon. M
 
 **Goal:** Prevent multiple processes from colliding on the same physical controller.
 
-**Mechanism:** A daemon (DeviceService) holds the physical controller exclusively. Each process requests a resource grant via IPC. The daemon tracks grants + PIDs and reaps grants whose heartbeat lapses.
+**Mechanism (as built):** The `nvmeservice` daemon holds the chrdev/bind for each NVMe and keeps the owner-side `nvm_ctrl_t` alive. Each process attaches as a client (`nvm_ctrl_attach_client`) and brings up its **own** per-fd queue group. Cross-process safety comes from two facts, **not** from a daemon-side queue accountant:
+
+1. The kernel B3 queue-group model gives every client fd an independent queue group, capped per fd by `NVM_MAX_QUEUES_PER_GROUP`; the kernel's user-QID pool is the single source of truth.
+2. The daemon owns the chrdev/bind, so no other process can open the controller as owner.
+
+The daemon keeps only a per-allocation **lease** (`{allocation_id → PID + starttime + last_heartbeat}`, see `Allocation` in `nvmeservice_state.h`) so the reaper can clean up dead clients' bookkeeping. `granted_queues` in the Connect grant is **policy advice only** — the client must not exceed it, but the kernel separately enforces the per-fd cap. There is **no** `{pid → resource_range}` ledger and no quota refund: when a dead client's fd closes, the kernel's `snvm_dev_release` fd-cascade reclaims the actual queues.
 
 ```
-        physical device (budget = N resource units)
+        physical device (budget = N resource units, kernel owns the ledger)
                         │
-   ┌────────────────────▼────────────────────┐   ← Level ①
-   │   DeviceService daemon                   │      physical budget → per-process grant
-   │   grant ledger + heartbeat + PID reaper  │
-   └──────┬───────────────────────────┬───────┘
-          │ grant(a units)            │ grant(b units)   a + b + system ≤ N
+   ┌────────────────────▼──────────────────────────┐   ← Level ①
+   │   nvmeservice daemon                            │     owns chrdev/bind + owner nvm_ctrl_t
+   │   per-allocation lease + heartbeat + PID reaper │     (NO queue ledger; policy-only grant)
+   └──────┬───────────────────────────┬─────────────┘
+          │ attach_client + grant(a)  │ attach_client + grant(b)
           ▼                           ▼
    Process A: DM (in-proc)        Process B: DM (in-proc)
+   own per-fd queue group         own per-fd queue group  (kernel caps each fd)
 ```
 
 **Single-process mode:** Registry opens the device directly; grant = entire budget; `ILeaseManager` is a no-op.
@@ -330,28 +339,30 @@ Manages the per-process resource grant issued by the **DeviceService** daemon. M
 
 **Goal:** Carve this process's grant into per-backend virtual devices.
 
-**Mechanism:** `IDeviceManager` maintains a free-list per physical device. Each backend calls `open_vdevice()` once at initialization.
+**Mechanism:** `IDeviceManager` tracks the per-physical-device grant via an atomic counter (`NvmePhysicalDevice::reserve`/`release`), not a free-list of specific queue indices. Each backend calls `open_vdevice()` once at initialization; the returned quota is a *count*, and the driver assigns which physical queues back it.
+
+The two diagrams below are **illustrative** — "file backend" / "raw backend" are placeholder names for future L3 consumers (none exist today; see the §1 note and §6):
 
 ```
    Process A: DM (in-proc)
    grant = 16 queue pairs
         │
-        ├── vDevice 0 → file backend    (queues 0–7)
-        └── vDevice 1 → raw backend     (queues 8–15)
+        ├── vDevice 0 → [example] file backend    (8 QPs)
+        └── vDevice 1 → [example] raw backend     (8 QPs)
 ```
 
-**NVMe example with two processes:**
+**NVMe example with two processes (illustrative):**
 ```
 NVMe Controller (32 QPs total)
     │
     ├── kernel blk-mq: QPs 0–3  (fixed)
     │
-    ├── Process A: QPs 4–19
-    │       ├── file backend vDevice:  QPs 4–11
-    │       └── raw backend vDevice:  QPs 12–19
+    ├── Process A: 16 QPs granted
+    │       ├── [example] file backend vDevice:  8 QPs
+    │       └── [example] raw backend vDevice:   8 QPs
     │
-    └── Process B: QPs 20–31
-            └── file backend vDevice: QPs 20–31
+    └── Process B: 12 QPs granted
+            └── [example] file backend vDevice: 12 QPs
 ```
 
 ---
@@ -366,11 +377,12 @@ There are **three** scopes, not two:
 ┌─────────────────────────────────────────────────────────────┐
 │  SYSTEM-WIDE  (one per machine — lives in DeviceService)      │
 │                                                               │
-│  • Physical device handle (nvm_ctrl_t / RDMA verb ctx / …)    │
-│  • Global resource budget (hardware truth: total N QPs)       │
-│  • Grant ledger  { process_id → resource_range }              │
-│  • Heartbeat tracker  { lease_id → last_seen_time }           │
-│  • Dead-process reaper thread                                 │
+│  • Owner-side physical handle (nvm_ctrl_t) + chrdev/bind      │
+│  • Global resource budget (hardware truth: kernel's QID pool) │
+│  • Lease table  { allocation_id → PID + starttime + last_hb } │
+│    (bookkeeping only — NOT a { pid → resource_range } ledger) │
+│  • Dead-process reaper thread (cleans up leases; the kernel   │
+│    fd-cascade reclaims the actual queues)                     │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -395,10 +407,10 @@ There are **three** scopes, not two:
 
 | Object | Scope | Owner | Notes |
 |--------|-------|-------|-------|
-| Physical device handle | System | DeviceService daemon | Opened once. Daemon is the exclusive holder in multi-process mode. Direct mode: this process owns it. |
-| Global resource budget | System | DeviceService daemon | Hardware truth. No per-process code can know the full picture without querying the daemon. |
-| Grant ledger | System | DeviceService daemon | Maps `{pid, lease_id} → resource_range`. Only the daemon can reclaim a dead process's range safely. |
-| Heartbeat tracker | System | DeviceService daemon | Reaper thread sweeps stale entries. |
+| Physical device handle | System | nvmeservice daemon | Owner-side `nvm_ctrl_t` + chrdev/bind, opened once. Daemon is the exclusive owner in multi-process mode; clients `attach_client`. Direct mode: this process owns it. |
+| Global resource budget | System | Kernel (via daemon) | Hardware truth = the kernel's user-QID pool. The daemon does **not** keep a queue ledger; each client fd gets its own kernel-capped queue group. |
+| Lease table | System | nvmeservice daemon | Maps `allocation_id → {PID, starttime, last_heartbeat}` (`Allocation` in `nvmeservice_state.h`). Bookkeeping for the reaper only — **not** a `{pid → resource_range}` allocator. No quota is decremented or refunded. |
+| Heartbeat / reaper | System | nvmeservice daemon | Reaper thread sweeps leases whose PID died; the kernel `snvm_dev_release` fd-cascade reclaims the queues themselves. |
 | `IDeviceManager` | Process | In-proc (Coordinator) | One per process. Manages this process's slice. |
 | `IDeviceDriver` instances | Process | In-proc (IDeviceManager) | One per device type per process. In daemon mode, it talks to DeviceService; in direct mode, it opens the device itself. |
 | `IPhysicalDevice*` | Process | In-proc (IDeviceDriver) | **Per-process view only.** `process_grant()` = this process's grant, not hardware total. `available_grant()` = grant minus already-allocated vDevices. |
@@ -491,6 +503,8 @@ DaemonNvmeDeviceDriver(IAccelerator* accel, ILeaseManager* lease_mgr,
 
 The `ILeaseManager` lifetime is managed by the caller (typically the Coordinator). The driver does not own it.
 
+> **Note on `IAccelerator* accel_`:** both NVMe drivers take an `IAccelerator*`, but it is **not wired into queue allocation**. `DirectNvmeDeviceDriver` only `assert()`-checks it is non-null in its constructor and otherwise never touches it; `DaemonNvmeDeviceDriver` stores it and never reads it at all. Actual GPU queue allocation (`daemon_nvme_alloc_queues()`) calls CUDA directly (`cudaMallocManaged`, `cudaSetDevice`, `cudaHostGetDevicePointer`), bypassing L1's HAL. The `accel` parameter is a placeholder for a future wiring where queue memory would flow through `IAccelerator::allocate()` (see the `// allocate NvmeQueueGroup via accel_->allocate();` TODO in `direct_nvme_device_driver.cpp`). The "L2 → L1 IAccelerator" edge in the §2 box therefore reflects intended, not current, coupling.
+
 ---
 
 ## 5. NVMe Concrete Types
@@ -509,8 +523,14 @@ struct NvmeVirtualDevice : IVirtualDevice {
     // IVirtualDevice implementation (phys_id, vdev_id, type, resource_count, caps)
 
     // NVMe-specific fields
-    nvm_queue_t* d_qps;       // GPU-resident queue slice: d_qps[0..queue_quota-1]
-    uint32_t     queue_quota; // number of QPs in this slice
+    nvm_queue_t* d_qps = nullptr;   // GPU-resident queue slice: d_qps[0..queue_quota-1]
+    uint32_t     queue_quota = 0;   // number of QPs in this slice
+
+    // libnvm controller handle. Non-null only on the real gRPC path
+    // (mock_mode=false); the daemon driver copies ctx.ctrl here so backends
+    // can call nvm_dma_map_data_device() to register IO buffers for DMA.
+    nvm_ctrl_t*  ctrl = nullptr;
+
     uint32_t namespace_id;
     uint32_t blk_size;
     uint32_t blk_size_log;
@@ -523,17 +543,19 @@ struct NvmeVirtualDevice : IVirtualDevice {
 
 | Helper | Description |
 |--------|-------------|
-| `acquire_queue(d_qps, n_qps)` | Round-robin queue selection via atomic ticket |
+| `acquire_queue(d_qps, n_qps)` | Pure hash selection: `(blockDim.x * 32 + threadIdx.x) % n_qps`. No atomic, no ticket — it just spreads warps deterministically across the slice. |
 | `issue_nvme_cmd(qp, prp1, prp2, n_blocks, lba, opcode, out_cid)` | Compose SQE + ring doorbell |
 | `poll(qp, cid)` | Busy-poll CQ for completion of command `cid` |
+
+> The interface header `nvme/include/queue_acquire_helper.cuh` still carries a stale comment describing `acquire_queue` as "round-robin + atomic ticket"; the actual implementation in `nvme/src/queue_acquire_helper_impl.cuh` is the pure modulo hash above.
 
 **Concrete NVMe files** (under `nvme/`, not part of the vendor-neutral API):
 
 | File | Provides |
 |------|----------|
-| `nvme/include/nvme_physical_device.h` | `NvmePhysicalDevice : IPhysicalDevice` (ctrl handle, queue group, ns metadata) |
+| `nvme/include/nvme_physical_device.h` | `NvmePhysicalDevice : IPhysicalDevice` (ctrl handle, `queue_group` pointer, ns metadata) |
 | `nvme/include/nvme_virtual_device.h` | `NvmeVirtualDevice : IVirtualDevice` (the downcast target above) |
-| `nvme/include/nvme_queue_group.h` | `NvmeQueueGroup` (GPU-resident queue array) |
+| `nvme/include/nvme_queue_group.h` | `NvmeQueueGroup` — **dead/reserved**. A skeletal class with getters only; it is never instantiated or populated, and `NvmePhysicalDevice::queue_group` stays `nullptr` everywhere. The real GPU queue array is built by `daemon_nvme_alloc_queues()` and handed to `NvmeVirtualDevice::d_qps` directly, bypassing this class. |
 | `nvme/include/direct_nvme_device_driver.h` | `DirectNvmeDeviceDriver : IDeviceDriver` |
 | `nvme/include/daemon_nvme_device_driver.h` | `DaemonNvmeDeviceDriver : IDeviceDriver` |
 | `nvme/include/queue_acquire_helper.cuh` | device-side queue mechanics (above) |
@@ -622,8 +644,53 @@ Nothing above Layer 2 includes libnvm. The `nvm_types.h` include in `NvmeVirtual
 
 ---
 
+## 9. Implementation Status
+
+The status vocabulary is: **Complete** (built and behaving), **Stub** (present but fabricates/returns placeholder data), **Not implemented** (only a reserved name/enum), **Dead-reserved** (a type exists but is never instantiated), **Intentionally-unimplemented** (deliberately absent by design). §6 gives the narrative; this table is the checklist.
+
+| Component | Status | Tested |
+|-----------|--------|--------|
+| Vendor-neutral core (`DeviceManagerImpl` + `create_device_manager` factory) | Complete | Yes — `tests/device_manager/device_manager_test.cpp` (lifecycle, registry, alloc, teardown, idempotent Open) |
+| Mock backend (`MockDeviceDriver` / `MockPhysicalDevice` / `MockVirtualDevice`, real grant accounting) | Complete | Yes — `device_manager_test.cpp`, `physical_device_test.cpp` |
+| `NullLeaseManager` (direct-mode no-op) | Complete | Yes — `lease_manager_test.cpp` |
+| `MockLeaseManager` (heartbeat/release counting for tests) | Complete | Yes — `lease_manager_test.cpp` (injection, per-driver ownership) |
+| NVMe daemon driver — mock-grant path (`mock_mode=true`) + `#else` fallback | Complete | Yes — `tests/device_manager/nvme/daemon_driver_test.cpp` (unit tier) |
+| NVMe daemon driver — real gRPC/libnvm path + `daemon_nvme_alloc_queues` (fills `d_qps` when `ctrl != null`) | Complete | Yes, on hardware — gated `TUTTI_NVME_REAL_HW=1` + `TUTTI_NVMESERVICE_ENABLED`; `daemon_driver_test.cpp` + `device_manager_real_hw_test.cpp` |
+| `nvmeservice` daemon (owner B3 bring-up, ACL, symlinks, lease reaper) | Complete | Yes — exercised by the real-HW tier |
+| `IDeviceManager` facade over the daemon driver (open_vdevice → downcast → field access) | Complete | Yes — `device_manager_real_hw_test.cpp` (unit + real-HW tiers) |
+| NVMe **direct** driver (`DirectNvmeDeviceDriver`) | Stub | Partially — enumerate() fabricates one 16-QP device; `d_qps` stays null. No real libnvm discovery. |
+| `NvmeQueueGroup` | Dead-reserved | No — never instantiated; `NvmePhysicalDevice::queue_group` stays null |
+| Real daemon-mode `ILeaseManager` (e.g. `DeviceServiceLeaseManager`) | Not implemented | N/A — injected mgr is always a `MockLeaseManager`; the authoritative keep-alive is `NvmeServiceClient`'s own gRPC bidi-stream heartbeat |
+| Daemon-side queue-quota ledger (`{pid → resource_range}`) | Intentionally-unimplemented | N/A — by design; the kernel B3 per-fd queue group + fd-cascade own the queue budget |
+| `IAccelerator` wiring into queue allocation | Not implemented | N/A — `accel_` is assert-checked (direct) / stored-unused (daemon); queue alloc calls CUDA directly |
+| RDMA / GDS drivers (`RdmaVirtualDevice` / `GdsVirtualDevice`) | Not implemented | N/A — reserved `DeviceType` values only |
+
+---
+
+## 10. Known Issues & Gaps
+
+The items below are what a future implementer must fix; each names the symptom and the code location.
+
+- **`DirectNvmeDeviceDriver::enumerate()` is a stub.** It fabricates one device (`"0000:17:00.0"`, 16 QPs) and never opens real hardware; `alloc_vdevice()` leaves `d_qps == nullptr` (`// left null in mock`). Any backend that takes the direct path and dereferences `d_qps` will fault. Location: `nvme/src/direct_nvme_device_driver.cpp` (`enumerate`, `alloc_vdevice`).
+
+- **`NvmeQueueGroup` is dead code.** The class in `nvme/include/nvme_queue_group.h` is never instantiated and `NvmePhysicalDevice::queue_group` is never set; it advertises a GPU-resident queue array that does not exist. The real queue array comes from `daemon_nvme_alloc_queues()` straight into `NvmeVirtualDevice::d_qps`. Either wire the direct path through this class or delete it. Location: `nvme/include/nvme_queue_group.h`, `nvme/include/nvme_physical_device.h:41`.
+
+- **Stale comment on `acquire_queue`.** The public header `nvme/include/queue_acquire_helper.cuh` documents "round-robin + atomic ticket," but `nvme/src/queue_acquire_helper_impl.cuh` is a pure `(blockDim.x*32 + threadIdx.x) % n_qps` hash with no atomic and no fairness guarantee. Two warps hashing to the same queue contend inside libnvm; there is no ticket to serialize them. Fix the comment (or implement the ticket if fairness is actually wanted). Location: `nvme/include/queue_acquire_helper.cuh:11-13,24-28`.
+
+- **`IAccelerator* accel_` is dead weight.** Both NVMe driver constructors require it (`DirectNvmeDeviceDriver` even `assert()`s it non-null), but neither uses it for allocation — `daemon_nvme_alloc_queues()` calls CUDA directly. The L1 HAL is bypassed, so any accelerator-portability guarantees L1 is meant to provide do not hold for L2 queue memory. Location: `nvme/src/direct_nvme_device_driver.cpp:22-23`, `nvme/src/daemon_nvme_device_driver.cpp:68`, `nvme/src/daemon_nvme_queue_alloc.cu`.
+
+- **No real daemon-mode `ILeaseManager`.** In daemon mode the injected `lease_mgr_` is a `MockLeaseManager` even in the real-HW tests, and `DaemonNvmeDeviceDriver::heartbeat_loop()` beats against it purely for higher-level tracking. The load-bearing cross-process keep-alive is `NvmeServiceClient`'s own gRPC bidi-stream heartbeat, which is a separate mechanism. A production `ILeaseManager` that actually talks to the daemon does not exist. Location: `nvme/src/daemon_nvme_device_driver.cpp:233-253`.
+
+- **Partial-`Open()` failure can strand a lease for leak-on-failure drivers.** `DeviceManagerImpl::Open()` rolls back by clearing `devices_` but does **not** call `shutdown()` on drivers that already enumerated. NVMe drivers self-clean via their destructors, but `MockDeviceDriver`'s dtor does not release its lease/heartbeat, so a mixed driver set where a later driver fails to enumerate leaves an earlier mock driver's lease held until the manager is destroyed. Location: `src/common/device_manager_impl.cpp:37-64`, `mock/src/mock_device_driver.cpp` (no dtor override).
+
+- **`DirectNvmeDeviceDriver::shutdown()` releases an empty lease id.** It calls `lease_mgr_->release_lease("")` unconditionally; harmless with `NullLeaseManager` but meaningless with any real lease manager since no lease id was ever acquired. Location: `nvme/src/direct_nvme_device_driver.cpp:142-149`.
+
+- **Documented "file backend" / "raw device backend" consumers do not exist.** No Layer 3 backend consumes L2 today; the split is a planned L3 shape. The only current callers of `open_vdevice()` are the mock suite and the NVMe real-HW tests. Location: `tests/device_manager/**`.
+
+---
+
 ## Related Documents
 
-- [Layered Architecture Redesign](../architecture/layered-architecture-redesign.md)
+- [Architecture Overview (L0–5)](architecture-overview.md)
 - [Layer 1: Accelerator HAL](layer1-accelerator-hal.md) — peer foundation layer
 - [Layer 3: Backends](layer3-backends.md) — consumer of this API

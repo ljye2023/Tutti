@@ -29,9 +29,9 @@ accel/
 - Device management (enumerate, set active device)
 - Memory allocation (host, device, pinned, managed)
 - Memory registration and tracking
-- Stream lifecycle (create, destroy, synchronize, query)
+- Stream lifecycle (create, destroy, synchronize)
 - Event lifecycle (create, destroy, record, wait, query)
-- Async memory operations (memcpy, memset)
+- Async memory copy (`memcpy_async`; no `memset` — not implemented)
 - Kernel launch via runtime API
 - IPC memory handles (export/import)
 - Host ↔ Device pointer translation
@@ -62,25 +62,24 @@ Output: `libtutti_accel.a`
 
 ## Testing
 
-Layer 1 includes comprehensive smoke tests:
+Layer 1 is covered by a GoogleTest suite under `tutti/tests/accel/*.cu` (~35 cases), split by functional area (`identity`, `memory`, `registry`, `stream_event`, `transfer`, `kernel`, `ipc`). Build and run the accel test targets via CTest:
 
 ```bash
-cd build_tutti
-./bin/layer1_smoke_test
+cd build
+ctest -R accel --output-on-failure
 ```
 
 Tests cover:
-1. ✅ Device management
-2. ✅ Host memory allocation
-3. ✅ Device memory allocation  
-4. ✅ Pinned host memory
-5. ✅ Memory registration
-6. ✅ Stream lifecycle
-7. ✅ Event lifecycle
-8. ✅ Async memcpy (H↔D, D↔D)
-9. ✅ Kernel launch
+1. ✅ Device management (incl. invalid device)
+2. ✅ Host / pinned / device / managed allocation + 64KB alignment
+3. ✅ Memory registration (register_host/device/external, lookup, unregister)  
+4. ✅ Stream lifecycle
+5. ✅ Event lifecycle (incl. cross-stream wait)
+6. ✅ Async memcpy (H↔D, D↔D)
+7. ✅ Kernel launch + 200-iteration leak regression
+8. ⚠️ IPC export arg-validation; `ipc_import` roundtrip is `GTEST_SKIP`ped (import is non-functional — see `doc/layered/layer1-accelerator-hal.md` Known Issues)
 
-**Current Status:** 10/10 tests passing
+**Current Status:** accel suite green; `ipc_import` roundtrip skipped (non-functional, see Known Issues)
 
 ## API Example
 
