@@ -23,26 +23,34 @@
 #ifndef NVFS_P2P_H
 #define NVFS_P2P_H
 
-#include "nv-p2p.h"
+#include <linux/types.h>
+#include <linux/scatterlist.h>
+#include <linux/pci.h>
+#include "metax_p2p.h"
 
-typedef int (*nvidia_p2p_dma_unmap_pages_fptr) (struct pci_dev*,
-		struct nvidia_p2p_page_table*,
-		struct nvidia_p2p_dma_mapping*);
-typedef int (*nvidia_p2p_get_pages_fptr) (uint64_t, uint32_t,
-		uint64_t,
-		uint64_t ,
-		struct nvidia_p2p_page_table **,
-		void (*free_callback)(void *data),
-		void *);
-typedef int (*nvidia_p2p_put_pages_fptr)(uint64_t, uint32_t,
-		uint64_t,
-		struct nvidia_p2p_page_table *);
-typedef int (*nvidia_p2p_dma_map_pages_fptr)(struct pci_dev *,
-		        struct nvidia_p2p_page_table *,
-			struct nvidia_p2p_dma_mapping **);
-typedef int (*nvidia_p2p_free_dma_mapping_fptr)(struct nvidia_p2p_dma_mapping *);
-typedef int (*nvidia_p2p_free_page_table_fptr)(struct nvidia_p2p_page_table *);
+typedef int (*metax_p2p_acquire_mem_fptr)(uint64_t, size_t, void **, int (*)(void *), void *);
+typedef int (*metax_p2p_get_mem_fptr)(void *, struct sg_table **);
+typedef int (*metax_p2p_put_mem_fptr)(void *, struct sg_table *);
+typedef void (*metax_p2p_release_mem_fptr)(void *);
+typedef uint32_t (*metax_p2p_get_page_size_fptr)(void *);
+typedef uint64_t (*metax_p2p_get_bus_offset_fptr)(void *);
 
+struct nvidia_p2p_page_table {
+	void *handle;
+	struct sg_table *sgt;
+	uint32_t entries;
+	uint32_t virtual_entries;
+	uint32_t page_size;
+    void (*free_callback)(void *data);
+    void *data;
+};
+typedef struct nvidia_p2p_page_table nvidia_p2p_page_table_t;
+
+struct nvidia_p2p_dma_mapping {
+	uint64_t *dma_addresses;
+	uint32_t entries;
+};
+typedef struct nvidia_p2p_dma_mapping nvidia_p2p_dma_mapping_t;
 
 int nvfs_nvidia_p2p_dma_unmap_pages(struct pci_dev *peer,
 		struct nvidia_p2p_page_table *page_table,
@@ -58,6 +66,8 @@ int nvfs_nvidia_p2p_put_pages(uint64_t p2p_token, uint32_t va_space,
 		struct nvidia_p2p_page_table *page_table);
 int nvfs_nvidia_p2p_dma_map_pages(struct pci_dev *peer,
 		        struct nvidia_p2p_page_table *page_table,
+				uint32_t request_page_size,
+				uint32_t request_naddr,
 			        struct nvidia_p2p_dma_mapping **dma_mapping);
 int nvfs_nvidia_p2p_free_dma_mapping(struct nvidia_p2p_dma_mapping *dma_mapping);
 int nvfs_nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table);

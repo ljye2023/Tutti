@@ -369,7 +369,7 @@ struct map* map_userspace(struct list* list, const struct ctrl* ctrl, u64 vaddr,
 
     list_insert(list, &md->list);
 
-    //printk(KERN_DEBUG "Mapped %lu host pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu host pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }
@@ -598,7 +598,7 @@ int map_gpu_memory(struct map* map, struct list* list)
 
     /* ---- Normal path: nvidia_p2p_get_pages + dma_map_pages ---- */
     gd->mappings = (nvidia_p2p_dma_mapping_t**)  kmalloc(sizeof(nvidia_p2p_dma_mapping_t*) * max_num_ctrls, GFP_KERNEL);
-    
+
     if (gd->mappings == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
@@ -609,7 +609,7 @@ int map_gpu_memory(struct map* map, struct list* list)
         gd->mappings[j] = NULL;
 
     // get the io addr
-    err = nvfs_nvidia_p2p_get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages, 
+    err = nvfs_nvidia_p2p_get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages,
             (void (*)(void*)) force_release_gpu_memory, map);
     if (err != 0)
     {
@@ -625,7 +625,7 @@ int map_gpu_memory(struct map* map, struct list* list)
     {
         ctrl = container_of(element, struct ctrl, list);
 
-        err = nvfs_nvidia_p2p_dma_map_pages(ctrl->pdev, gd->pages, gd->mappings + j);
+        err = nvfs_nvidia_p2p_dma_map_pages(ctrl->pdev, gd->pages,  map->page_size, map->n_addrs, gd->mappings + j);
         if (err != 0)
         {
             //printk(KERN_ERR "nvfs_nvidia_p2p_dma_map_pages() failed for nvme%u: %d\n", j-1, err);
@@ -650,17 +650,17 @@ int map_gpu_memory(struct map* map, struct list* list)
 
 
 
-    if (map->n_addrs != gd->pages->entries)
+    if (map->n_addrs != gd->pages->virtual_entries)
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, gd->pages->entries);
+        printk(KERN_WARNING "map_gpu_memory: Requested %lu GPU pages, but only got %u\n", map->n_addrs, gd->pages->virtual_entries);
     }
 
-    map->n_addrs = gd->pages->entries;
+    map->n_addrs = gd->pages->virtual_entries;
 
     //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
 //    for (j = 0; j < map->n_addrs; j++)
 //        printk("\tpaddr: %llx\n", (uint64_t) map->addrs[j]);
-    
+
     return 0;
 }
 
@@ -677,7 +677,7 @@ int map_gpu_ioqueue_memory(struct map* map)
     }
 
     gd->mappings = (nvidia_p2p_dma_mapping_t**)  kmalloc(sizeof(nvidia_p2p_dma_mapping_t*) * 1, GFP_KERNEL);
-    
+
     if (gd->mappings == NULL)
     {
         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
@@ -693,7 +693,7 @@ int map_gpu_ioqueue_memory(struct map* map)
     map->release = release_gpu_ioqueue_memory;
 
     // get the io addr
-    err = nvfs_nvidia_p2p_get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages, 
+    err = nvfs_nvidia_p2p_get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages,
             (void (*)(void*)) force_release_gpu_ioqueue_memory, map);
     if (err != 0)
     {
@@ -701,7 +701,7 @@ int map_gpu_ioqueue_memory(struct map* map)
         return err;
     }
 
-    err = nvfs_nvidia_p2p_dma_map_pages(map->pdev, gd->pages, &gd->mappings[0]);
+    err = nvfs_nvidia_p2p_dma_map_pages(map->pdev, gd->pages, map->page_size, map->n_addrs, &gd->mappings[0]);
     if (err != 0)
     {
         //printk(KERN_ERR "nvfs_nvidia_p2p_dma_map_pages() failed for nvme%u: %d\n", j-1, err);
@@ -715,17 +715,17 @@ int map_gpu_ioqueue_memory(struct map* map)
     }
 
 
-    if (map->n_addrs != gd->pages->entries)
+    if (map->n_addrs != gd->pages->virtual_entries)
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, gd->pages->entries);
+        printk(KERN_WARNING "map_gpu_ioqueue_memory: Requested %lu GPU pages, but only got %u\n", map->n_addrs, gd->pages->virtual_entries);
     }
 
-    map->n_addrs = gd->pages->entries;
+    map->n_addrs = gd->pages->virtual_entries;
 
     //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
 //    for (j = 0; j < map->n_addrs; j++)
 //        printk("\tpaddr: %llx\n", (uint64_t) map->addrs[j]);
-    
+
     return 0;
 }
 
@@ -759,7 +759,7 @@ struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 va
 
     list_insert(list, &md->list);
 
-    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }
@@ -789,7 +789,7 @@ struct map* map_device_ioqueue_memory(struct list* list, const struct ctrl* ctrl
 
     list_insert(list, &md->list);
 
-    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n", 
+    //printk(KERN_DEBUG "Mapped %lu GPU pages starting at address %llx\n",
     //        md->n_addrs, md->vaddr);
     return md;
 }

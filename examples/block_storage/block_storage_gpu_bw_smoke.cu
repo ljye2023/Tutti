@@ -213,9 +213,10 @@ struct R6BwIoCtx {
 
 __global__ void bw_read_kernel(const R6BwIoCtx* ctx, uint32_t n) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) return;
-    const auto& c = ctx[tid];
-    tutti::submit_read_one(c.dh, c.prp1, c.prp2, c.shard_off, c.nbytes);
+    for (uint32_t i = tid; i < n; i += blockDim.x * gridDim.x) {
+        const auto& c = ctx[i];
+        tutti::submit_read_one(c.dh, c.prp1, c.prp2, c.shard_off, c.nbytes);
+    }
 }
 
 // Dummy compute kernel: each thread runs `iters` FMAs on a single
@@ -541,7 +542,8 @@ int main(int argc, char** argv) {
 
     // [11] warmup
     constexpr uint32_t kBlockDim = 64;
-    const     uint32_t kGridDim  = (num_ios_actual + kBlockDim - 1) / kBlockDim;
+    // const     uint32_t kGridDim  = (num_ios_actual + kBlockDim - 1) / kBlockDim;
+    const     uint32_t kGridDim  = 16;
     {
         NvtxRange _r("warmup_io_kernel", kClrSetup);
         bw_read_kernel<<<kGridDim, kBlockDim>>>(d_ctx, num_ios_actual);

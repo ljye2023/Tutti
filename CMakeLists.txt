@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.18)
 
-set (CMAKE_CUDA_ARCHITECTURES 90)
+set (CMAKE_CUDA_ARCHITECTURES 52)
 set (CMAKE_C_STANDARD 99)
 set (CMAKE_CXX_STANDARD 20)
 set (CMAKE_CUDA_STANDARD 20)
@@ -16,10 +16,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 
-set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90,code=sm_90")
+set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_52,code=sm_52")
 
 find_package (Threads REQUIRED)
-find_package(CUDAToolkit 12.6 REQUIRED)
+find_package(CUDAToolkit 11.6 REQUIRED)
 find_package(PkgConfig)
 
 # Imported-target configuration fallback：
@@ -54,8 +54,8 @@ else()
     message(FATAL_ERROR "Not found CUDA!")
 endif()
 
-if(CUDAToolkit_VERSION VERSION_LESS 12.6)
-    message(FATAL_ERROR "CUDA version must be at least 12.6 (found: ${CUDAToolkit_VERSION})")
+if(CUDAToolkit_VERSION VERSION_LESS 11.6)
+    message(FATAL_ERROR "CUDA version must be at least 11.6 (found: ${CUDAToolkit_VERSION})")
 endif()
 
 message(STATUS "Using CUDA ${CMAKE_CUDA_COMPILER_VERSION}")
@@ -78,7 +78,7 @@ message(STATUS "Using CUDA ${CMAKE_CUDA_COMPILER_VERSION}")
 #
 # Pre-CUDA-13 toolkits do not have this directory; the if(EXISTS ...)
 # guard keeps the shim a no-op there so older bring-up environments
-# (e.g. CUDA 12.6 boxes) still build unchanged.
+# (e.g. CUDA 11.6 boxes) still build unchanged.
 # ---------------------------------------------------------------------------
 if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
     # CMake exposes the per-triple include dir as CUDAToolkit_INCLUDE_DIRS[0];
@@ -145,7 +145,9 @@ if (no_cc)
 endif ()
 
 include_directories ("${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/src"
-                     "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include")
+                     "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include"
+                     "/opt/maca/include/mcr"
+                     "/opt/maca/include")
 
 # Try to find Nvidia driver
 if (CUDAToolkit_FOUND AND NOT no_cuda)
@@ -450,7 +452,7 @@ add_subdirectory(examples)
 # Macro for creating sample target
 macro (make_sample target binary_name files)
     cuda_add_executable (${target} EXCLUDE_FROM_ALL ${files})
-    
+
     add_dependencies (${target} libnvm)
     target_link_libraries (${target} PRIVATE libnvm)
 

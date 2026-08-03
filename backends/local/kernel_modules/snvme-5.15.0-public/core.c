@@ -132,7 +132,7 @@ static void nvme_set_queue_dying(struct nvme_ns *ns)
 	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
 		return;
 
-	blk_set_queue_dying(ns->queue);
+	blk_mark_disk_dead(ns->disk);
 	blk_mq_unquiesce_queue(ns->queue);
 
 	set_capacity_and_notify(ns->disk, 0);
@@ -1214,7 +1214,7 @@ int nvme_execute_passthru_rq(struct request *rq)
 
 /*
  * Recommended frequency for KATO commands per NVMe 1.4 section 7.12.1:
- * 
+ *
  *   The host should send Keep Alive commands at half of the Keep Alive Timeout
  *   accounting for transport roundtrip times [..].
  */
@@ -1541,7 +1541,7 @@ int snvme_set_queue_count(struct nvme_ctrl *ctrl, int *count)
 	} else {
 		nr_io_queues = min(result & 0xffff, result >> 16) + 1;
 		*count = min(*count, nr_io_queues);
-		
+
 	}
 
 	return 0;
@@ -1981,7 +1981,7 @@ static int nvme_send_ns_head_pr_command(struct block_device *bdev,
 	srcu_read_unlock(&head->srcu, srcu_idx);
 	return ret;
 }
-	
+
 static int nvme_send_ns_pr_command(struct nvme_ns *ns, struct nvme_command *c,
 		u8 data[16])
 {
