@@ -80,7 +80,7 @@ tutti/build-profile-host/
 tutti/build_host/
 tutti/build_cuda/
 
-chat/
+/chat/
 
 # Kernel module build artifacts (out-of-tree kbuild debris).
 Module.symvers

@@ -1,0 +1,372 @@
+
+=== Round 13 Baseline — 2026-08-02T13:11:40+08:00 ===
+BUILD_DIR=build/round11-s2-cuda-hw
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18264ms total
+round 2: 18320ms total
+round 3: 18263ms total
+median: round 2: 18320ms totalms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7f3bef500000 (raw=0x7f3bef4f5a00, 64K-aligned=1)
+  rbuf=0x7f3bef520000 (64K-aligned=1)
+  read_buf=0x7f3bef520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7f3bd6e00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7f3bd6e00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): round 2: 18320ms totalms
+=== End Baseline ===
+=== Round 13 Baseline — 2026-08-02T13:26:18+08:00 ===
+BUILD_DIR=build/round11-s2-cuda-hw
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18265ms total
+round 2: 18253ms total
+round 3: 18277ms total
+median: 18265ms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7fd393500000 (raw=0x7fd3934f5a00, 64K-aligned=1)
+  rbuf=0x7fd393520000 (64K-aligned=1)
+  read_buf=0x7fd393520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7fd378e00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7fd378e00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): 18265ms
+=== End Baseline ===
+=== Round 13 Baseline — 2026-08-02T13:45:31+08:00 ===
+BUILD_DIR=/data/home/ryeqiu/Tutti/tutti/build_p7_cuda
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18275ms total
+round 2: 18259ms total
+round 3: 18286ms total
+median: 18275ms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7feeb3500000 (raw=0x7feeb34f5a00, 64K-aligned=1)
+  rbuf=0x7feeb3520000 (64K-aligned=1)
+  read_buf=0x7feeb3520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7fee98e00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7fee98e00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): 18275ms
+=== End Baseline ===
+=== Round 13 Baseline — 2026-08-02T13:49:23+08:00 ===
+BUILD_DIR=/data/home/ryeqiu/Tutti/tutti/build_p7_cuda
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18486ms total
+round 2: 18482ms total
+round 3: 18297ms total
+median: 18482ms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7f4b2f500000 (raw=0x7f4b2f4f5a00, 64K-aligned=1)
+  rbuf=0x7f4b2f520000 (64K-aligned=1)
+  read_buf=0x7f4b2f520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7f4b14e00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7f4b14e00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): 18482ms
+=== End Baseline ===
+=== Round 13 Baseline — 2026-08-02T13:52:54+08:00 ===
+BUILD_DIR=/data/home/ryeqiu/Tutti/tutti/build_p7_cuda
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18274ms total
+round 2: 18307ms total
+round 3: 18552ms total
+median: 18307ms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7f7c9d500000 (raw=0x7f7c9d4f5a00, 64K-aligned=1)
+  rbuf=0x7f7c9d520000 (64K-aligned=1)
+  read_buf=0x7f7c9d520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7f7c84e00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7f7c84e00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): 18307ms
+=== End Baseline ===
+=== Round 13 Baseline — 2026-08-02T13:56:26+08:00 ===
+BUILD_DIR=/data/home/ryeqiu/Tutti/tutti/build_p7_cuda
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18272ms total
+round 2: 18272ms total
+round 3: 18283ms total
+median: 18272ms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7fe8b3500000 (raw=0x7fe8b34f5a00, 64K-aligned=1)
+  rbuf=0x7fe8b3520000 (64K-aligned=1)
+  read_buf=0x7fe8b3520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7fe898e00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7fe898e00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): 18272ms
+=== End Baseline ===
+=== Round 13 Baseline — 2026-08-02T14:53:56+08:00 ===
+BUILD_DIR=/data/home/ryeqiu/Tutti/tutti/build_p7_cuda
+--- Hardware Contract Tests ---
+[datapath contract test]
+
+=== Full Summary ===
+  passed: 735
+  failed: 0
+RESULT: PASS
+datapath: passed=735 failed=0
+[runtime contract test]
+
+=== Summary ===
+  passed: 115
+  failed: 0
+RESULT: PASS
+runtime: passed=115 failed=0
+--- Sequential IO Baseline (3 rounds, median) ---
+round 1: 18264ms total
+round 2: 18284ms total
+round 3: 18381ms total
+median: 18284ms
+--- Per-test-case timing ---
+  code=5 msg=register_memory: DataPath not initialized (controller not attached)
+  init status: ok=0 code=1 msg=queue group requested but queue_depth or block_size is 0
+--- 26. E2E 4KiB write/read/verify ---
+  write_buf=0x7f2555500000 (raw=0x7f25554f5a00, 64K-aligned=1)
+  rbuf=0x7f2555520000 (64K-aligned=1)
+  read_buf=0x7f2555520000 (64K-aligned=1)
+--- 33. batch SINGLE write+read+verify ---
+--- 34. batch LIST write+read+verify (1MiB) ---
+--- 46. DUAL 8KiB E2E + descriptor ---
+  DUAL entry: len=8192 prp1=0x21a049410000 prp2=0x21a049411000 ioaddrs[0]=0x21a049410000 ioaddrs[1]=0x21a049411000
+--- 47. LIST 1MiB fan-out + PRP2 IOVA ---
+  LIST entry[0]: tgt_off=0 len=131072 prp1=0x21a04c200000 prp2=0x21a049e00000 (prp_list_ioaddr=0x21a049e00000, buf=0x7f253ae00000)
+  LIST entry[7]: tgt_off=917504 len=131072 prp1=0x21a04c2e0000 prp2=0x21a049e07000 (prp_list_ioaddr=0x21a049e07000, buf=0x7f253ae00000)
+--- 52. LIST shutdown timeout retains all PRP resources ---
+  resolve_lba failure: state=2 status=entry 0: resolve_lba failed bytes=0
+  custom CQ poll budget: 42
+--- 57. completion status SINGLE/DUAL/LIST ---
+  LIST entry_count=8, all results==0
+  nvme-error injection: state=2 status=entry 0: NVMe CQ error (dword3=0x30000) bytes=0
+  query-error injection: state=2 status=cudaEventQuery error: unknown error
+  timeout op: state=2 status=entry 0: CQ poll timeout bytes=0
+--- 70. arena exhaustion and recovery ---
+--- 71. arena zero-alloc hot path + reuse ---
+--- 72. arena LIST PRP from pool + regression ---
+--- 66. PRP cache: repeated LIST hit ---
+=== Baseline Summary ===
+datapath contract: 735 passed, 0 failed
+runtime contract: 115 passed, 0 failed
+median wall-clock (3 rounds): 18284ms
+=== End Baseline ===
