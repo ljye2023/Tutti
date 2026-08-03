@@ -69,3 +69,23 @@ sweep_logs/
 # Exported chat history (not source)
 history_*.md
 tutti_build/
+
+# Local CUDA-like profile verification build trees.
+tutti/build-profile-cuda/
+tutti/build-profile-host/
+tutti/build-profile-cuda/
+tutti/build-profile-host/
+
+# Phase 3 gate script working build trees (scripts/phase3_gate.sh).
+tutti/build_host/
+tutti/build_cuda/
+
+chat/
+
+# Kernel module build artifacts (out-of-tree kbuild debris).
+Module.symvers
+modules.order
+*.o
+*.ko
+*.mod
+*.mod.c

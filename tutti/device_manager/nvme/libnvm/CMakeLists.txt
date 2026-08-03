@@ -48,6 +48,7 @@ set_target_properties(libnvm PROPERTIES
 target_include_directories(libnvm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/uapi>
         $<INSTALL_INTERFACE:include/libnvm>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

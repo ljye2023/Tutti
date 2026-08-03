@@ -67,7 +67,7 @@ message(STATUS "Using CUDA ${CMAKE_CUDA_COMPILER_VERSION}")
 # collectively CCCL) were relocated from `<cuda_root>/include/cuda/...` to
 # `<cuda_root>/targets/<triple>/include/cccl/cuda/...`. CUDA's own nvcc
 # driver injects this path automatically when compiling .cu files, but
-# host-only .cpp translation units (e.g. backends/local/nvme/libnvm/src/
+# host-only .cpp translation units (e.g. tutti/device_manager/nvme/libnvm/src/
 # ctrl.cpp) compiled with g++ still need it on their include path or
 # every `#include <cuda/atomic>` chain breaks at preprocess time.
 #
@@ -144,8 +144,27 @@ if (no_cc)
     set(CCUDA_NVCC_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
 endif ()
 
-include_directories ("${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/src"
-                     "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include")
+# ---------------------------------------------------------------------------
+# Phase 3 header hygiene: add the tutti/ subdirectory BEFORE the global
+# libnvm include_directories below.  This ensures that contract targets
+# (tutti_api, tutti_spi, tutti_cuda_like, tutti_types) and their consumer
+# tests — all created inside tutti/CMakeLists.txt — do NOT inherit the
+# libnvm private include paths.  Consumers linking only tutti_api must
+# not be able to #include <nvm_types.h> or any other local-NVMe private
+# header.  The global includes are still available to legacy root-scope
+# targets (libnvm, nvmeservice, memory, device_manager, …) added below.
+# ---------------------------------------------------------------------------
+set(TUTTI_BUILD_HARDWARE_STACK OFF CACHE BOOL
+    "Nested tutti/ hardware stack (forced OFF when included from repo root)" FORCE)
+if(EXISTS "${PROJECT_SOURCE_DIR}/tutti/CMakeLists.txt")
+    add_subdirectory(tutti)
+    message(STATUS "Added tutti subdirectory (hardware stack disabled from root; placed before global libnvm includes for header hygiene)")
+endif()
+
+# Global libnvm include paths — available to root-scope legacy targets only.
+# The tutti/ subdirectory (added above) does NOT inherit these.
+include_directories ("${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/libnvm/src"
+                     "${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/libnvm/include")
 
 # Try to find Nvidia driver
 if (CUDAToolkit_FOUND AND NOT no_cuda)
@@ -174,7 +193,8 @@ endif ()
 
 
 # Library source files
-set (libnvm_root "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/")
+# libnvm source of truth: tutti/device_manager/nvme/libnvm/ (root tree copy removed)
+set (libnvm_root "${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/libnvm/")
 file (GLOB libnvm_source "${libnvm_root}/src/*.cpp")
 file (GLOB libnvm_cuda_source "${libnvm_root}/src/*.cu")
 file (GLOB libnvm_linux_source "${libnvm_root}/src/linux/*.cpp")
@@ -184,7 +204,7 @@ file (GLOB libnvm_include "${libnvm_root}/include/*.h")
 # # Module source files
 #
 # snvme 内核模块按 kernel baseline 分目录维护：
-#   backends/local/kernel_modules/snvme-<tag>/
+#   tutti/device_manager/nvme/kernel_modules/snvme-<tag>/
 #
 # 命名规范：<tag> 必须是该 baseline 对应 `uname -r` 的前缀，例如：
 #   snvme-5.15.0-public           -> 上游 5.15.0
@@ -196,7 +216,8 @@ file (GLOB libnvm_include "${libnvm_root}/include/*.h")
 set (SNVME_KERNEL_VERSION "" CACHE STRING
     "snvme baseline tag (= dir suffix). Leave empty to auto-detect from `uname -r`.")
 
-set (snvme_root_dir "${PROJECT_SOURCE_DIR}/backends/local/kernel_modules")
+# snvme kernel module source of truth: tutti/device_manager/nvme/kernel_modules/
+set (snvme_root_dir "${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/kernel_modules")
 
 # 收集所有合法 baseline tag（必须含 Makefile.in）
 file (GLOB _snvme_cands RELATIVE "${snvme_root_dir}" "${snvme_root_dir}/snvme-*")
@@ -251,7 +272,7 @@ endif ()
 message (STATUS "Using snvme kernel baseline: ${SNVME_KERNEL_VERSION} (${module_root})")
 set (module_output "${CMAKE_BINARY_DIR}/module")
 # for Makefile.in, do not delete
-set (module_ccflags "-I${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include -I${driver_include}")
+set (module_ccflags "-I${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/libnvm/include -I${driver_include}")
 configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
 message (STATUS "Configuring module build in ${module_output}")
 
@@ -314,35 +335,18 @@ set_target_properties (libnvm PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$O
 install (FILES ${libnvm_include} DESTINATION "include")
 install (TARGETS libnvm DESTINATION "lib")
 
-# ---------------------------------------------------------------------------
-# Tutti core layers
-#
-# Layered subdirectories (all under tutti:: namespace):
-#
-#   tutti/           -- New refactored layered architecture
-#   memory/          -- HostDeviceMemorySubsystem (libnvm DMA mapping +
-#                       cudaMalloc / malloc + register_external)
-#   device_manager/  -- LocalNvmeDirectRegistry (IN_PROCESS) +
-#                       NvmeServiceBackedRegistry (SERVICE_CLIENT)
-#
-# Layer dependency:
-#   memory          -> libnvm + CUDA::cudart
-#   device_manager  -> libnvm + nvmeservice (gRPC client)
-# ---------------------------------------------------------------------------
+# (tutti/ subdirectory added earlier, before the global libnvm includes,
+#  to prevent private header propagation into contract targets.)
 
-# Add tutti subdirectory if it exists
-if(EXISTS "${PROJECT_SOURCE_DIR}/tutti/CMakeLists.txt")
-    add_subdirectory(tutti)
-    message(STATUS "Added tutti subdirectory")
-endif()
-
-add_subdirectory(memory)
+# memory/ — retired (Round 13 S3); cache concepts migrated to
+# tutti/data_paths/local_nvme/metadata/ (Round 11 S2).
 
 # The legacy monolithic GPU-file tree has been moved out of
 # the repository (kept as an external backup); nothing here references it.
 
-# NVMeService
-set (nvmeservice_root "${PROJECT_SOURCE_DIR}/backends/local/NVMeService")
+# NVMeService — tutti side is the single source of truth (Round 13 S3).
+# backends/local/NVMeService/ deleted; root build compiles from tutti/ side.
+set (nvmeservice_root "${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/nvmeservice")
 file (GLOB nvmeservice_sources "${nvmeservice_root}/src/*.cpp" "${nvmeservice_root}/src/*.cu")
 
 # ---------------------------------------------------------------------------
@@ -416,43 +420,31 @@ set_target_properties(nvmeservice PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_target_properties(nvmeservice PROPERTIES OUTPUT_NAME "nvmeservice")
 install (TARGETS nvmeservice DESTINATION "lib")
 
-# NVMeService example executables (daemon + client smoke test)
-add_subdirectory(backends/local/NVMeService/examples)
+# tutti_daemon: production daemon (source migrated to tutti side, Round 13 S3).
+# examples/ and backends/local/NVMeService/examples/ deleted; the daemon
+# target is defined here for root build (standalone tutti/ defines it in
+# tutti/device_manager/nvme/nvmeservice/examples/CMakeLists.txt).
+add_executable(tutti_daemon "${nvmeservice_root}/examples/tutti_daemon.cpp")
+target_link_libraries(tutti_daemon PRIVATE
+    nvmeservice libnvm gRPC::grpc++ protobuf::libprotobuf Threads::Threads CUDA::cudart)
+set_target_properties(tutti_daemon PROPERTIES
+    BUILD_RPATH "$ORIGIN:$ORIGIN/../lib" INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
+install(TARGETS tutti_daemon DESTINATION "bin")
 
-# device_manager depends on nvmeservice (for the gRPC-backed registry),
-# so it must be added AFTER nvmeservice has been declared.
-add_subdirectory(device_manager)
+# device_manager/ (root) — retired (Round 13 S3); control plane migrated to
+# tutti/data_paths/local_nvme/control/ (Round 10 S2).
 
-# nvme_storage depends on device_manager (for LocalNvmeDevice payload).
-add_subdirectory(nvme_storage)
+# Legacy trees deleted in Round 13 Session 2 (no production consumers):
+#   nvme_storage/     — removed
+#   block_storage/    — removed
+#   io_engine/        — removed
+#   coordinator/      — removed
+#   adapters/kv_cache/— removed
+# Their add_subdirectory calls and example/test wiring have been removed.
+# Design docs archived in doc/history/.
 
-# block_storage layers GpuFile / shard-striping abstractions on top of
-# nvme_storage: the interface + a pure resolve helper as a header-only
-# INTERFACE library, plus the host/GPU-side implementation.
-add_subdirectory(block_storage)
-
-# io_engine layers batch IO orchestration on top of memory + block_storage
-# + nvme_storage: the host-side batch builder + the GPU kernel.
-add_subdirectory(io_engine)
-
-# coordinator/ is the top-level orchestrator: one Coordinator owns
-# the registry -> nvme_storage -> block_storage -> memory -> io_engine
-# chain and exposes high-level bootstrap / create_gpu_file /
-# register_tensor / submit_batch.  Must be added AFTER all the layers
-# it links against.
-add_subdirectory(coordinator)
-
-# adapters/ holds framework-facing integration layers that compose the
-# core runtime without polluting it.  kv_cache implements the
-# per-layer K/V byte-offset + auto-chunking semantics on top of the
-# generic io_engine (Roadmap.md "Adapter Layer").  Added after the
-# coordinator it links against, before the examples that exercise it.
-add_subdirectory(adapters/kv_cache)
-
-# examples/ holds the end-to-end smokes.  e2e_smoke drives the
-# whole stack through the Coordinator.  Added last so every layer +
-# the coordinator target is already declared.
-add_subdirectory(examples)
+# examples/ — retired (Round 13 S3); tutti_daemon migrated to
+# tutti/device_manager/nvme/nvmeservice/examples/, smokes deleted with legacy trees.
 
 # tests/ holds layer-specific smoke tests. Added after all layers
 # and core libraries are declared.

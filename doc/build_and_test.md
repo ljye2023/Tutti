@@ -3,7 +3,7 @@
 This document has two parts:
 
 1. **Build** — how to prepare the environment and compile Tutti plus the snvme kernel module.
-2. **SNVMe Testing** — how to use the smoke-test suite under `backends/local/kernel_modules/test/` to validate the snvme driver, climbing from the safest test to the most destructive.
+2. **SNVMe Testing** — how to use the smoke-test suite under `tutti/device_manager/nvme/kernel_modules/test/` to validate the snvme driver, climbing from the safest test to the most destructive.
 
 > Any concrete PCI BDF (e.g. `0000:e3:00.0`), disk mount point, etc. shown below is an **example / host-specific** value. Confirm the right one on your own host with the tooling in [Step 4](#step-4--pick-a-test-device); don't copy it blindly.
 
@@ -45,7 +45,7 @@ Personal overrides (custom `VCPKG_ROOT`, an explicit `SNVME_KERNEL_VERSION`, a d
 
 ### snvme baseline auto-selection
 
-The snvme kernel module is maintained per kernel baseline under `backends/local/kernel_modules/snvme-<tag>/`, e.g.:
+The snvme kernel module is maintained per kernel baseline under `tutti/device_manager/nvme/kernel_modules/snvme-<tag>/`, e.g.:
 
 - `snvme-5.15.0-public` — upstream 5.15.0
 
@@ -72,11 +72,11 @@ To unload / reload, use `make rmmod` or the `scripts/reset_snvme.sh` helper (see
 ## 1.4 Build the test code
 
 ```bash
-cd backends/local/kernel_modules/test
+cd tutti/device_manager/nvme/kernel_modules/test
 make -j$(nproc)
 ```
 
-The test binaries depend on the SNVMe UAPI header `backends/local/nvme/libnvm/include/ioctl.h` (already pulled in via `-I` by the Makefile). The role of each binary is described in [Part 2 Step 3](#step-3--build-the-test-binaries).
+The test binaries depend on the SNVMe UAPI header `tutti/include/uapi/tutti_snvme.h` (already pulled in via `-I` by the Makefile). The role of each binary is described in [Part 2 Step 3](#step-3--build-the-test-binaries).
 
 ---
 
@@ -136,7 +136,7 @@ sudo bash scripts/reset_snvme.sh            # unbind + rmmod + insmod
 ## Step 3 — Build the test binaries
 
 ```bash
-cd backends/local/kernel_modules/test
+cd tutti/device_manager/nvme/kernel_modules/test
 make
 ```
 
@@ -177,7 +177,7 @@ export TGT=0000:e3:00.0     # ← replace with your own target BDF
 These exercise only the UAPI and won't detach the in-tree `nvme` driver — safe even on a production host:
 
 ```bash
-cd backends/local/kernel_modules/test
+cd tutti/device_manager/nvme/kernel_modules/test
 
 # 5a. libc-only UAPI smoke: chrdev create/remove + NVM_MAP_HOST_MEMORY + BAR0 mmap
 sudo ./snvme_smoke        $TGT

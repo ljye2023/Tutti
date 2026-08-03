@@ -107,8 +107,8 @@ struct map* map_find(const struct list* list, u64 vaddr);
  * Used by snvm_dev_fops.release to reclaim pinned host pages / nvidia
  * p2p references when a userspace process exits without issuing
  * NVM_UNMAP_*.  Returns number of descriptors freed.  Each unmap also
- * triggers map->release() (release_user_pages / nvidia_p2p_put_pages
- * / nvidia_p2p_free_dma_mapping), so this is safe to call from
+ * triggers map->release() (release_user_pages / peer_memory_ops.put_pages
+ * / peer_memory_ops.free_dma_mapping), so this is safe to call from
  * file->release context where the process is on its way out.
  */
 unsigned long map_purge_by_owner(struct list* list, struct task_struct* owner);

@@ -39,7 +39,7 @@
 #include "nvfs-pci.h"
 #include "list.h"
 #include "ctrl.h"
-#include "nvfs-p2p.h"
+#include "peer_memory.h"
 
 #define DRIVER_NAME         "libsnvm helper"
 #define PCI_DRIVER_NAME		"snvme"
@@ -3625,7 +3625,7 @@ MODULE_DEVICE_TABLE(pci, nvme_id_table);
  * / .mmap -- no .open or .release.  That meant a userspace process dying
  * between NVM_MAP_* and NVM_UNMAP_* leaked:
  *   1. pinned host pages on the host_list,
- *   2. nvidia_p2p_get_pages references on the device_list /
+ *   2. peer_memory get_pages references on the device_list /
  *      device_queue_list (rmmod snvme will then refuse with "module in
  *      use" until reboot).
  *
@@ -3939,7 +3939,7 @@ static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl);
  *      from the DMA engine's perspective.
  *
  *   2. Drain maps (B2): unmap_and_release each one.  This frees
- *      pinned host pages / nvidia_p2p refs, removes the map from
+ *      pinned host pages / peer_memory refs, removes the map from
  *      both the global list and g->maps.
  *
  *   3. Release the group_id back to the IDA and kfree(g).
@@ -4225,7 +4225,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
                 mutex_unlock(&own->groups_lock);
             }
 
-            if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
+            if (copy_to_user((void __user*)(uintptr_t) request.ioaddrs, map->addrs,
                              map->n_addrs * sizeof(uint64_t)))
             {
                 /*
@@ -4333,7 +4333,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 				mutex_unlock(&own->groups_lock);
 			}
 
-			if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
+			if (copy_to_user((void __user*)(uintptr_t) request.ioaddrs, map->addrs,
 			                 map->n_addrs * sizeof(uint64_t)))
 			{
 				if (request.map_kind == NVM_MAP_KIND_DATA) {
@@ -4605,6 +4605,15 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			drequest.max_user_qid         = ndev->ctrl_max_io_queues;
 			drequest.max_queues_per_group = NVM_MAX_QUEUES_PER_GROUP;
 			drequest.sgl_supported        = (uint32_t)ndev->ctrl.sgls;
+
+			/* ABI handshake: report the UAPI version and capability
+			 * set this kernel was compiled with.  Userspace checks
+			 * these in NVM_GET_DEV_INFO's return; mismatch =>
+			 * fail-closed.  Old kernels (pre-UAPI-consolidation)
+			 * report abi_version == 0 because memset zeroes the
+			 * struct; userspace treats 0 as "unknown / legacy". */
+			drequest.abi_version          = TUTTI_SNVME_ABI_VERSION;
+			drequest.capabilities         = TUTTI_SNVME_CAP_ALL;
 
 			snvme_put_ns(ns);
 
@@ -5646,8 +5655,8 @@ static int __init nvme_init(void)
 {
     int ret;
     snvm_registered = 0;
-	if(nvfs_nvidia_p2p_init()) {
-		printk("Could not load nvidia_p2p* symbols\n");
+	if(peer_memory_ops.init()) {
+		printk("Could not load peer_memory symbols\n");
 		ret = -EOPNOTSUPP;
 		return ret;
 	}
@@ -5657,7 +5666,7 @@ static int __init nvme_init(void)
 	 * loaded, this caches its phxfs_p2p_* function pointers and holds
 	 * a module reference for snvme's lifetime (so phoenixfs cannot be
 	 * unloaded while snvme is loaded).  If phoenixfs is absent, GPU
-	 * memory registration falls back to the native nvidia_p2p path.
+	 * memory registration falls back to the native peer_memory path.
 	 */
 	map_p2p_service_probe();
 
@@ -5707,7 +5716,7 @@ static void __exit nvme_exit(void)
 
 	clean_driver();
 
-	nvfs_nvidia_p2p_exit();
+	peer_memory_ops.exit();
 	ret = clear_ctrl_list(&ctrl_list);
 	if(ret!=curr_ctrls)
 		printk("release ctrl error!, cur is %d, release %d",curr_ctrls,ret);

@@ -54,6 +54,25 @@ set_target_properties(nvmeservice_client_example PROPERTIES
 install(TARGETS nvmeservice_daemon_example nvmeservice_client_example
         DESTINATION "bin")
 
+# ---- tutti_daemon (production) -------------------------------------------
+# The owner-side daemon: brings up NVMe controllers via libnvm B3 and
+# serves gRPC so SERVICE_CLIENT Coordinators can attach.  Plain host C++
+# (no CUDA device code).  Migrated from root examples/ in Round 13 S3.
+add_executable(tutti_daemon tutti_daemon.cpp)
+target_link_libraries(tutti_daemon PRIVATE
+    nvmeservice
+    libnvm
+    gRPC::grpc++
+    protobuf::libprotobuf
+    Threads::Threads
+    CUDA::cudart
+)
+set_target_properties(tutti_daemon PROPERTIES
+    BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
+)
+install(TARGETS tutti_daemon DESTINATION "bin")
+
 # Copy the canonical sys_config.yaml from the repo root next to the
 # binaries so users can run them without figuring out a path.
 if(EXISTS "${CMAKE_SOURCE_DIR}/sys_config.yaml")

@@ -96,7 +96,7 @@ static int ioctl_map(const struct device* dev, const struct va_range* va, uint64
     struct nvm_ioctl_map request = {
         .vaddr_start = (uintptr_t) m->buffer,
         .n_pages     = va->n_pages,
-        .ioaddrs     = ioaddrs,
+        .ioaddrs     = (uint64_t)(uintptr_t) ioaddrs,
         .ioq_idx     = wire_ioq_idx,
         .is_cq       = wire_is_cq,
         .group_id    = m->group_id,
@@ -180,6 +180,26 @@ int ioctl_get_dev_info(nvm_ctrl_t* ctrl, struct disk* d)
     if (err < 0){
         printf("ioctl_get_dev_info err is %d\n",err);
         return errno;
+    }
+    /* ABI handshake — fail-closed.
+     *
+     * The kernel reports its compiled-in TUTTI_SNVME_ABI_VERSION in
+     * dev_info.abi_version.  If the kernel's version does not match
+     * the userspace header's version, the struct layouts may differ
+     * and proceeding would risk memory corruption.  Return ENODEV
+     * (not EPERM/EINVAL) so the caller sees "device not compatible"
+     * rather than a generic permission/format error.
+     *
+     * abi_version == 0 means the kernel predates the UAPI
+     * consolidation (memset-zeroed reserved field); treat as
+     * incompatible. */
+    if (dev_info.abi_version != TUTTI_SNVME_ABI_VERSION) {
+        nvm_error("ABI version mismatch: kernel=%u userspace=%u "
+                  "(device fd=%d)",
+                  (unsigned)dev_info.abi_version,
+                  (unsigned)TUTTI_SNVME_ABI_VERSION,
+                  container->device->fd_dev);
+        return ENODEV;
     }
     /* Legacy fields (unchanged semantics).  Note nr_user_q reads back as
      * 0 in the B3 flow (kernel sets it only when the legacy
@@ -324,8 +344,10 @@ static inline int ioctl_queue_helper(nvm_ctrl_t* ctrl, int arg, enum nvm_ioctl_t
     }
 
     if (err < 0){
-        printf("ioctl_queue_helper err is %d\n",err);
-        return errno;
+        int saved_errno = errno;
+        nvm_error("ioctl_queue_helper ioctl type=0x%x failed: errno=%d (%s)",
+                  type, saved_errno, strerror(saved_errno));
+        return saved_errno;
     }
 
     return 0;
@@ -580,6 +602,19 @@ int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
         if (ioctl(container->device->fd_dev,
                   NVM_GET_DEV_INFO, out_info) == 0 &&
             out_info->disk_name[0] != '\0') {
+            /* ABI handshake — fail-closed (same check as
+             * ioctl_get_dev_info above).  If the kernel reports a
+             * different ABI version, return ENODEV immediately
+             * rather than continuing with potentially mismatched
+             * struct layouts. */
+            if (out_info->abi_version != TUTTI_SNVME_ABI_VERSION) {
+                nvm_error("ABI version mismatch (B3): kernel=%u "
+                          "userspace=%u (device fd=%d)",
+                          (unsigned)out_info->abi_version,
+                          (unsigned)TUTTI_SNVME_ABI_VERSION,
+                          container->device->fd_dev);
+                return ENODEV;
+            }
             return 0;
         }
         last_err = errno;

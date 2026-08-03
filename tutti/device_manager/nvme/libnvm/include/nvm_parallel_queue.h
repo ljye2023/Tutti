@@ -444,6 +444,51 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
     }
 }
 
+/*
+ * Bounded CQ poll: like cq_poll but returns NVM_CQ_TIMEOUT when the
+ * poll budget (max_polls iterations) is exhausted without finding the
+ * completion. This prevents the GPU kernel from spinning forever on a
+ * dead controller / lost completion.
+ *
+ * Returns the CQ slot index on success, or NVM_CQ_TIMEOUT on timeout.
+ * The caller must check for NVM_CQ_TIMEOUT and record a per-entry
+ * failure instead of assuming success.
+ */
+#define NVM_CQ_TIMEOUT 0xFFFFFFFFu
+
+__forceinline__ __device__
+uint32_t cq_poll_bounded(nvm_queue_t* cq, uint16_t search_cid,
+                          uint32_t max_polls)
+{
+    unsigned int ns = 8;
+    uint32_t polls = 0;
+
+    while (polls < max_polls) {
+        uint32_t head = cq->head.load(cuda::memory_order_relaxed);
+        for (size_t i = 0; i < cq->qs_minus_1; i++) {
+            uint32_t cur_head = head + i;
+            bool search_phase = ((~(cur_head >> cq->qs_log2)) & 0x01);
+            uint32_t loc = cur_head & (cq->qs_minus_1);
+            uint32_t cpl_entry = ((nvm_cpl_t*)cq->vaddr)[loc].dword[3];
+            uint32_t cid = (cpl_entry & 0x0000ffff);
+            bool phase = (cpl_entry & 0x00010000) >> 16;
+            if ((cid == search_cid) && (phase == search_phase)){
+                return loc;
+            }
+            if (phase != search_phase)
+                break;
+        }
+        ++polls;
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+         if (ns < 256) {
+             ns *= 2;
+         }
+#endif
+    }
+    return NVM_CQ_TIMEOUT;
+}
+
 __forceinline__ __device__
 void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0) {
     cq->tail.fetch_add(1, cuda::memory_order_acq_rel);

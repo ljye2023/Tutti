@@ -26,10 +26,11 @@ ccflags-y += @module_ccflags@
 snvme-core-y				:= core.o
 snvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
 
-# snvme.ko object list.  The auxiliary helpers (nvfs-pci/nvfs-p2p/
-# list/ctrl/map) are kernel-version-agnostic and copied verbatim from
-# snvme-5.15.0; pci.c is the file that carries the 5.4-specific port.
-snvme-objs := nvfs-pci.o nvfs-p2p.o list.o ctrl.o map.o pci.o
+# snvme.ko object list.  The auxiliary helpers (nvfs-pci/peer_memory/
+# compat/list/ctrl/map) are kernel-version-agnostic and copied verbatim
+# from snvme-5.15.0; pci.c is the file that carries the 5.4-specific
+# port.
+snvme-objs := nvfs-pci.o peer_memory.o compat.o list.o ctrl.o map.o pci.o
 
 KERNEL_SRC := /lib/modules/$(shell uname -r)/build
 

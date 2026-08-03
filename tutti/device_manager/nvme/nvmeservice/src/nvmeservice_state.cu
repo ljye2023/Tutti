@@ -3,6 +3,7 @@
 #include <nvm_types.h>
 #include <nvm_ctrl.h>
 #include <nvm_error.h>
+#include "tutti_verbose.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -176,18 +177,21 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
 
     install_gpu_symlinks(dev);
 
-    std::fprintf(stderr,
+    // Bring-up banner — info level, gated by TUTTI_VERBOSE.
+    TUTTI_INFO(
         "nvmeservice: device=%d pci=%s snvme=%s ns=%u qdepth=%u "
         "max_user_qid=%u max_q_per_grp=%u allowed_gpus={",
         device_id, nvme.pci_addr.c_str(), dev.snvme_dev_path.c_str(),
         dev.namespace_id, dev.queue_depth,
         dev.max_user_qid, dev.max_queues_per_group);
-    bool first = true;
-    for (int gid : dev.allowed_gpus) {
-        std::fprintf(stderr, "%s%d", first ? "" : ",", gid);
-        first = false;
+    if (tutti_verbose()) {
+        bool first = true;
+        for (int gid : dev.allowed_gpus) {
+            std::fprintf(stderr, "%s%d", first ? "" : ",", gid);
+            first = false;
+        }
+        std::fprintf(stderr, "}\n");
     }
-    std::fprintf(stderr, "}\n");
 
     devices_.push_back(std::move(dev));
 }
@@ -482,7 +486,8 @@ void ServiceState::reaper_loop() {
             auto it = allocations_.find(aid);
             if (it == allocations_.end()) continue;
             const Allocation& alloc = it->second;
-            std::fprintf(stderr,
+            // Reaper diagnostic — info level, gated by TUTTI_VERBOSE.
+            TUTTI_INFO(
                 "nvmeservice reaper: dropped lease device=%d cuda_device=%d "
                 "(pid=%u, allocation_id=%s); kernel fd-close already reclaimed "
                 "the actual queues / DATA maps\n",

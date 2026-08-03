@@ -1,7 +1,6 @@
 #include "map.h"
 #include "list.h"
 #include "ctrl.h"
-#include <linux/version.h>
 #include <linux/sched.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -11,18 +10,19 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/module.h>
-#include "nvfs-p2p.h"
+#include "peer_memory.h"
+#include "compat.h"
 
 
 
 struct gpu_region
 {
-    nvidia_p2p_page_table_t* pages;
-    nvidia_p2p_dma_mapping_t** mappings;
+    struct peer_page_table* pages;
+    struct peer_dma_mapping** mappings;
     /*
      * Phoenix service path: when non-NULL, pages/mappings are unused
      * and cleanup goes through phx_deregister_fn instead of
-     * nvidia_p2p_dma_unmap_pages + nvidia_p2p_put_pages.
+     * peer_memory_ops.dma_unmap_pages + peer_memory_ops.put_pages.
      */
     void*                    phx_handle;
 };
@@ -40,7 +40,7 @@ uint32_t max_num_ctrls = 8;
  * Phoenix P2P service (phoenixfs.ko) integration.
  *
  * When Phoenix has remapped a GPU's BAR via devm_memremap_pages
- * (MEMORY_DEVICE_PCI_P2PDMA), nvidia_p2p_dma_map_pages fails for that
+ * (MEMORY_DEVICE_PCI_P2PDMA), the peer-memory dma_map_pages fails for that
  * GPU.  Phoenix exports phxfs_p2p_register/phxfs_p2p_deregister which
  * pin the GPU pages and return the physical addresses directly as bus
  * addresses (valid under IOMMU=pt).  We resolve these symbols once at
@@ -298,15 +298,7 @@ static long map_user_pages(struct map* map)
         return -ENOMEM;
     }
 
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 5, 7)
-#warning "Building for older kernel, not properly tested"
-    retval = get_user_pages(current, current->mm, map->vaddr, map->n_addrs, 1, 0, pages, NULL);
-#elif LINUX_VERSION_CODE <= KERNEL_VERSION(4, 8, 17)
-#warning "Building for older kernel, not properly tested"
-    retval = get_user_pages(map->vaddr, map->n_addrs, 1, 0, pages, NULL);
-#else
-    retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages, NULL);
-#endif
+    retval = compat_get_user_pages(map->vaddr, map->n_addrs, 1, pages);
     if (retval <= 0)
     {
         kfree(pages);
@@ -409,7 +401,7 @@ static void force_release_gpu_memory(struct map* map)
             {
                 ctrl = container_of(element, struct ctrl, list);
                 if (gd->mappings[j] != NULL)
-                    nvfs_nvidia_p2p_dma_unmap_pages(ctrl->pdev, gd->pages, gd->mappings[j++]);
+                    peer_memory_ops.dma_unmap_pages(ctrl->pdev, gd->pages, gd->mappings[j++]);
 
                 element = list_next(element);
             }
@@ -419,7 +411,7 @@ static void force_release_gpu_memory(struct map* map)
 
         if (gd->pages != NULL)
         {
-            nvfs_nvidia_p2p_free_page_table(gd->pages);
+            peer_memory_ops.free_page_table(gd->pages);
         }
 
         kfree(gd);
@@ -440,13 +432,13 @@ static void force_release_gpu_ioqueue_memory(struct map* map)
         if (gd->mappings != NULL)
         {
             if (gd->mappings[0] != NULL)
-                nvfs_nvidia_p2p_dma_unmap_pages(map->pdev, gd->pages, gd->mappings[0]);
+                peer_memory_ops.dma_unmap_pages(map->pdev, gd->pages, gd->mappings[0]);
             kfree(gd->mappings);
 
         }
         if (gd->pages != NULL)
         {
-            nvfs_nvidia_p2p_free_page_table(gd->pages);
+            peer_memory_ops.free_page_table(gd->pages);
         }
         kfree(gd);
         map->data = NULL;
@@ -468,7 +460,7 @@ void release_gpu_memory(struct map* map)
         {
             /*
              * Phoenix service path: delegate cleanup to Phoenix.  It
-             * does nvidia_p2p_put_pages (or skips it if the pages were
+             * does the peer-memory put_pages (or skips it if the pages were
              * already force-reclaimed via its free_cb) + frees its
              * internal state + module_put.  phx_deregister_fn is
              * guaranteed non-NULL here because snvme holds a reference
@@ -492,7 +484,7 @@ void release_gpu_memory(struct map* map)
             {
                 ctrl = container_of(element, struct ctrl, list);
                 if (gd->mappings[j] != NULL)
-                    nvfs_nvidia_p2p_dma_unmap_pages(ctrl->pdev, gd->pages, gd->mappings[j++]);
+                    peer_memory_ops.dma_unmap_pages(ctrl->pdev, gd->pages, gd->mappings[j++]);
 
                 element = list_next(element);
             }
@@ -502,7 +494,7 @@ void release_gpu_memory(struct map* map)
 
         if (gd->pages != NULL)
         {
-            nvfs_nvidia_p2p_put_pages(0, 0, map->vaddr, gd->pages);
+            peer_memory_ops.put_pages(0, 0, map->vaddr, gd->pages);
         }
 
         kfree(gd);
@@ -524,14 +516,14 @@ void release_gpu_ioqueue_memory(struct map* map)
         {
 
             if (gd->mappings[0] != NULL)
-                nvfs_nvidia_p2p_dma_unmap_pages(map->pdev, gd->pages, gd->mappings[0]);
+                peer_memory_ops.dma_unmap_pages(map->pdev, gd->pages, gd->mappings[0]);
 
             kfree(gd->mappings);
 
         }
         if (gd->pages != NULL)
         {
-            nvfs_nvidia_p2p_put_pages(0, 0, map->vaddr, gd->pages);
+            peer_memory_ops.put_pages(0, 0, map->vaddr, gd->pages);
         }
 
         kfree(gd);
@@ -579,7 +571,7 @@ int map_gpu_memory(struct map* map, struct list* list)
         {
             /*
              * Phoenix pinned the pages and returned bus addresses
-             * directly (skipping nvidia_p2p_dma_map_pages, which fails
+             * directly (skipping the peer-memory dma_map_pages, which fails
              * once Phoenix has remapped the GPU BAR).  The handle owns
              * the lifecycle -- including the phoenixfs module refcount
              * -- until release_gpu_memory -> phx_deregister_fn.
@@ -596,8 +588,8 @@ int map_gpu_memory(struct map* map, struct list* list)
          */
     }
 
-    /* ---- Normal path: nvidia_p2p_get_pages + dma_map_pages ---- */
-    gd->mappings = (nvidia_p2p_dma_mapping_t**)  kmalloc(sizeof(nvidia_p2p_dma_mapping_t*) * max_num_ctrls, GFP_KERNEL);
+    /* ---- Normal path: peer_memory get_pages + dma_map_pages ---- */
+    gd->mappings = (struct peer_dma_mapping**)  kmalloc(sizeof(struct peer_dma_mapping*) * max_num_ctrls, GFP_KERNEL);
     
     if (gd->mappings == NULL)
     {
@@ -609,11 +601,11 @@ int map_gpu_memory(struct map* map, struct list* list)
         gd->mappings[j] = NULL;
 
     // get the io addr
-    err = nvfs_nvidia_p2p_get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages, 
+    err = peer_memory_ops.get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages,
             (void (*)(void*)) force_release_gpu_memory, map);
     if (err != 0)
     {
-        printk(KERN_ERR "nvfs_nvidia_p2p_get_pages() failed: %d\n", err);
+        printk(KERN_ERR "peer_memory_ops.get_pages() failed: %d\n", err);
         return err;
     }
 
@@ -625,10 +617,10 @@ int map_gpu_memory(struct map* map, struct list* list)
     {
         ctrl = container_of(element, struct ctrl, list);
 
-        err = nvfs_nvidia_p2p_dma_map_pages(ctrl->pdev, gd->pages, gd->mappings + j);
+        err = peer_memory_ops.dma_map_pages(ctrl->pdev, gd->pages, gd->mappings + j);
         if (err != 0)
         {
-            //printk(KERN_ERR "nvfs_nvidia_p2p_dma_map_pages() failed for nvme%u: %d\n", j-1, err);
+            //printk(KERN_ERR "peer_memory_ops.dma_map_pages() failed for nvme%u: %d\n", j-1, err);
             return err;
         }
         j++;
@@ -640,7 +632,7 @@ int map_gpu_memory(struct map* map, struct list* list)
         if (j == 1) {
             for (i = 0; i < map->n_addrs; ++i)
             {
-                map->addrs[i] = gd->mappings[0]->dma_addresses[i];
+                map->addrs[i] = peer_memory_dm_addresses(gd->mappings[0])[i];
                 //printk("++paddr: %llx\n", (uint64_t) map->addrs[i]);
             }
         }
@@ -650,12 +642,12 @@ int map_gpu_memory(struct map* map, struct list* list)
 
 
 
-    if (map->n_addrs != gd->pages->entries)
+    if (map->n_addrs != peer_memory_pt_entries(gd->pages))
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, gd->pages->entries);
+        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, peer_memory_pt_entries(gd->pages));
     }
 
-    map->n_addrs = gd->pages->entries;
+    map->n_addrs = peer_memory_pt_entries(gd->pages);
 
     //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
 //    for (j = 0; j < map->n_addrs; j++)
@@ -676,7 +668,7 @@ int map_gpu_ioqueue_memory(struct map* map)
         return -ENOMEM;
     }
 
-    gd->mappings = (nvidia_p2p_dma_mapping_t**)  kmalloc(sizeof(nvidia_p2p_dma_mapping_t*) * 1, GFP_KERNEL);
+    gd->mappings = (struct peer_dma_mapping**)  kmalloc(sizeof(struct peer_dma_mapping*) * 1, GFP_KERNEL);
     
     if (gd->mappings == NULL)
     {
@@ -693,34 +685,34 @@ int map_gpu_ioqueue_memory(struct map* map)
     map->release = release_gpu_ioqueue_memory;
 
     // get the io addr
-    err = nvfs_nvidia_p2p_get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages, 
+    err = peer_memory_ops.get_pages(0, 0, map->vaddr, GPU_PAGE_SIZE * map->n_addrs, &gd->pages,
             (void (*)(void*)) force_release_gpu_ioqueue_memory, map);
     if (err != 0)
     {
-        printk(KERN_ERR "nvfs_nvidia_p2p_get_pages() failed: %d\n", err);
+        printk(KERN_ERR "peer_memory_ops.get_pages() failed: %d\n", err);
         return err;
     }
 
-    err = nvfs_nvidia_p2p_dma_map_pages(map->pdev, gd->pages, &gd->mappings[0]);
+    err = peer_memory_ops.dma_map_pages(map->pdev, gd->pages, &gd->mappings[0]);
     if (err != 0)
     {
-        //printk(KERN_ERR "nvfs_nvidia_p2p_dma_map_pages() failed for nvme%u: %d\n", j-1, err);
+        //printk(KERN_ERR "peer_memory_ops.dma_map_pages() failed for nvme%u: %d\n", j-1, err);
         return err;
     }
 
     for (i = 0; i < map->n_addrs; ++i)
     {
-        map->addrs[i] = gd->mappings[0]->dma_addresses[i];
+        map->addrs[i] = peer_memory_dm_addresses(gd->mappings[0])[i];
         //printk("++paddr: %llx\n", (uint64_t) map->addrs[i]);
     }
 
 
-    if (map->n_addrs != gd->pages->entries)
+    if (map->n_addrs != peer_memory_pt_entries(gd->pages))
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, gd->pages->entries);
+        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, peer_memory_pt_entries(gd->pages));
     }
 
-    map->n_addrs = gd->pages->entries;
+    map->n_addrs = peer_memory_pt_entries(gd->pages);
 
     //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
 //    for (j = 0; j < map->n_addrs; j++)

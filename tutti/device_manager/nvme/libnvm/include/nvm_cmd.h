@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 
 
@@ -46,6 +47,18 @@ enum nvm_admin_command_set
     NVM_ADMIN_GET_FEATURES  = NVM_CMD_OPCODE(0, 2, 2)   // 0Ah
 };
 
+
+
+/*
+ * Zero-initialize the entire 64-byte SQE before setting any fields.
+ * This prevents reserved/control DWORDs from carrying stack garbage.
+ * Must be called before nvm_cmd_header / nvm_cmd_data_ptr / nvm_cmd_rw_blks.
+ */
+__device__ __host__ static inline
+void nvm_cmd_clear(nvm_cmd_t* cmd)
+{
+    memset(cmd, 0, sizeof(nvm_cmd_t));
+}
 
 
 /*

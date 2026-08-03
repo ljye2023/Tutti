@@ -172,7 +172,7 @@
 #include "list.h"
 #include "map.h"
 #include "ioctl.h"
-#include "nvfs-p2p.h"
+#include "peer_memory.h"
 #include "nvfs-pci.h"
 
 /*
@@ -4799,7 +4799,7 @@ static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl);
  *      from the DMA engine's perspective.
  *
  *   2. Drain maps (B2): unmap_and_release each one.  This frees
- *      pinned host pages / nvidia_p2p refs, removes the map from
+ *      pinned host pages / peer_memory refs, removes the map from
  *      both the global list and g->maps.
  *
  *   3. Release the group_id back to the IDA and kfree(g).
@@ -5091,7 +5091,7 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 			mutex_unlock(&own->groups_lock);
 		}
 
-		if (copy_to_user((void __user *)request.ioaddrs, map->addrs,
+		if (copy_to_user((void __user *)(uintptr_t)request.ioaddrs, map->addrs,
 				 map->n_addrs * sizeof(uint64_t))) {
 			/*
 			 * PORTING.md section 7.3.1 trap #4: roll back every
@@ -5199,7 +5199,7 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 			mutex_unlock(&own->groups_lock);
 		}
 
-		if (copy_to_user((void __user *)request.ioaddrs, map->addrs,
+		if (copy_to_user((void __user *)(uintptr_t)request.ioaddrs, map->addrs,
 				 map->n_addrs * sizeof(uint64_t))) {
 			if (request.map_kind == NVM_MAP_KIND_DATA) {
 				struct snvm_dev_owner *own = file->private_data;
@@ -5502,6 +5502,15 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		 * (SGL Not Supported).
 		 */
 		drequest.sgl_supported       = (uint32_t)ndev->ctrl.sgls;
+
+		/* ABI handshake: report the UAPI version and capability
+		 * set this kernel was compiled with.  Userspace checks
+		 * these in NVM_GET_DEV_INFO's return; mismatch =>
+		 * fail-closed.  Old kernels (pre-UAPI-consolidation)
+		 * report abi_version == 0 because memset zeroes the
+		 * struct; userspace treats 0 as "unknown / legacy". */
+		drequest.abi_version         = TUTTI_SNVME_ABI_VERSION;
+		drequest.capabilities        = TUTTI_SNVME_CAP_ALL;
 
 		snvme_put_ns(ns);
 
@@ -6170,10 +6179,10 @@ static int svm_mmap_registers(struct file *file, struct vm_area_struct *vma)
  * had no .release hook, so when a userspace process exited without
  * issuing NVM_UNMAP_HOST_MEMORY / NVM_UNMAP_DEVICE_MEMORY /
  * NVM_UNMAP_DEVICE_QUEUE_MEMORY for every map it had created, the
- * pinned host pages and nvidia_p2p_* references stayed live forever:
+ * pinned host pages and peer_memory references stayed live forever:
  *
  *   - host_list:         get_user_pages refs never put_page()d
- *   - device_list:       nvidia_p2p_get_pages refs never freed
+ *   - device_list:       peer_memory get_pages refs never freed
  *   - device_queue_list: ditto, plus dma_mapping leaks
  *   - ctrl->ioq_map_num / ctrl->cq_num never decremented
  *
@@ -6552,13 +6561,13 @@ static int __init nvme_init(void)
 	snvm_registered = 0;
 
 	/*
-	 * Resolve nvidia_p2p_* symbols from the NVIDIA GPU driver.  Failure
+	 * Resolve peer_memory symbols from the NVIDIA GPU driver.  Failure
 	 * here is fatal: CUDA_QUEUE / CUDA memory mapping in map.c depends
 	 * on these symbols, and without them libnvm's GPU-side registration
 	 * path would silently crash.
 	 */
-	if (nvfs_nvidia_p2p_init()) {
-		pr_err("snvme: could not load nvidia_p2p_* symbols\n");
+	if (peer_memory_ops.init()) {
+		pr_err("snvme: could not load peer_memory symbols\n");
 		return -EOPNOTSUPP;
 	}
 
@@ -6567,7 +6576,7 @@ static int __init nvme_init(void)
 	 * loaded, this caches its phxfs_p2p_* function pointers and holds
 	 * a module reference for snvme's lifetime (so phoenixfs cannot be
 	 * unloaded while snvme is loaded).  If phoenixfs is absent, GPU
-	 * memory registration falls back to the native nvidia_p2p path.
+	 * memory registration falls back to the native peer_memory path.
 	 */
 	map_p2p_service_probe();
 
@@ -6580,7 +6589,7 @@ static int __init nvme_init(void)
 	 * snvm_cdev_init MUST stay the last fallible step here.
 	 * Its own internal goto-chain is the only cleanup path
 	 * for the chrdev / sysfs resources it sets up; nvme_init's
-	 * outer error path only knows how to undo nvfs_nvidia_p2p_init.
+	 * outer error path only knows how to undo peer_memory_ops.init.
 	 *
 	 * If you add a new fallible step AFTER snvm_cdev_init, you
 	 * MUST also call snvm_cdev_release() in the new error label
@@ -6602,7 +6611,7 @@ static int __init nvme_init(void)
 	return 0;
 
 err_p2p_exit:
-	nvfs_nvidia_p2p_exit();
+	peer_memory_ops.exit();
 	return ret;
 }
 
@@ -6739,7 +6748,7 @@ static void __exit nvme_exit(void)
 	map_p2p_service_release();
 
 	/* Step 6: drop the GPU/p2p notifier registration. */
-	nvfs_nvidia_p2p_exit();
+	peer_memory_ops.exit();
 }
 
 MODULE_AUTHOR("Matthew Wilcox <willy@linux.intel.com>");

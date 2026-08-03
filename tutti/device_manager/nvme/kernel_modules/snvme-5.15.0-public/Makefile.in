@@ -10,7 +10,7 @@ snvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
 snvme-core-$(CONFIG_BLK_DEV_ZONED)	+= zns.o
 snvme-core-$(CONFIG_NVME_HWMON)		+= hwmon.o
 
-snvme-objs := nvfs-pci.o nvfs-p2p.o list.o ctrl.o map.o pci.o 
+snvme-objs := nvfs-pci.o peer_memory.o compat.o list.o ctrl.o map.o pci.o
 
 KERNEL_SRC := /lib/modules/$(shell uname -r)/build
 

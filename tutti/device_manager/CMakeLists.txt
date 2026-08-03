@@ -1,36 +1,26 @@
 # tutti/device_manager/CMakeLists.txt
-# Layer 2: Device Manager - Complete NVMe Virtualization Stack
 #
-# Provides:
-#   - Common: IDeviceManager, IPhysicalDevice, IVirtualDevice, IDeviceDriver, ILeaseManager
-#   - NVMe: Nvme{Physical,Virtual}Device, Direct/Daemon NVMe drivers, queue helpers
-#   - libnvm: User-space NVMe queue library
-#   - NVMeService: Cross-process arbitration daemon
-#   - snvme: Kernel module for NVMe user queues
+# Layer 2 container — shrunk by T-041 (Round 10 Session 2).
 #
-# Dependencies: Layer 0 (abstraction), Layer 1 (accel)
+# The control-plane driver/common/mock sources that used to live here were
+# deleted in 2026-08 dead-code cleanup (the production DataPath talks to
+# libnvm directly; the driver abstraction layer had no consumer). What
+# remains in this directory is the single-source-of-truth for libnvm and
+# the optional gRPC nvmeservice daemon, plus the snvme kernel_modules tree
+# (built out-of-tree, not by CMake).
+#
+# Per Session 1: libnvm and kernel_modules stay at this location. nvmeservice
+# stays here too (optional gRPC daemon); its consumer attribution is documented
+# in chat/round10/result2.md.
 
 # =============================================================================
-# Layer Configuration
+# libnvm — user-space NVMe queue library (wraps snvme kernel module)
 # =============================================================================
-
-set(LAYER_NAME "tutti_device_manager")
-set(LAYER_NUMBER 2)
-set(DEPENDS_ON "tutti_abstraction;tutti_accel")
-
-# =============================================================================
-# libnvm Library
-# =============================================================================
-
-# libnvm is the user-space NVMe queue library that wraps snvme kernel module
 add_subdirectory(nvme/libnvm)
 
 # =============================================================================
-# NVMeService Daemon
+# nvmeservice — cross-process arbitration daemon (gRPC, optional)
 # =============================================================================
-
-# NVMeService provides cross-process arbitration (Level-1 allocator)
-# NVMeService requires gRPC - make it optional
 find_package(gRPC CONFIG QUIET)
 if(gRPC_FOUND)
     add_subdirectory(nvme/nvmeservice)
@@ -39,270 +29,5 @@ else()
     message(STATUS "NVMeService disabled (gRPC not found)")
 endif()
 
-# =============================================================================
-# Source Collection
-# =============================================================================
-
-# Common headers (transport-agnostic interfaces)
-set(COMMON_HEADERS
-    include/common/device_type.h
-    include/common/idevice_manager.h
-    include/common/iphysical_device.h
-    include/common/ivirtual_device.h
-    include/common/idevice_driver.h
-    include/common/ilease_manager.h
-    include/common/null_lease_manager.h
-    include/common/device_manager_impl.h
-)
-
-# NVMe-specific headers
-set(NVME_HEADERS
-    nvme/include/nvme_physical_device.h
-    nvme/include/nvme_virtual_device.h
-    nvme/include/nvme_queue_group.h
-    nvme/include/direct_nvme_device_driver.h
-    nvme/include/daemon_nvme_device_driver.h
-    nvme/include/daemon_nvme_queue_alloc.h
-    nvme/include/queue_acquire_helper.cuh
-)
-
-set(NVME_SOURCES
-    nvme/src/nvme_physical_device.cpp
-)
-
-# New Layer 2 common sources (DeviceManagerImpl, etc.)
-set(COMMON_SOURCES
-    src/common/device_manager_impl.cpp
-)
-
-# New NVMe driver sources (DirectNvmeDeviceDriver, DaemonNvmeDeviceDriver).
-# daemon_nvme_queue_alloc.cu is the CUDA helper for daemon-mode queue allocation;
-# it lives in the same driver source set so it is part of tutti_device_manager.
-set(NVME_DRIVER_SOURCES
-    nvme/src/direct_nvme_device_driver.cpp
-    nvme/src/daemon_nvme_device_driver.cpp
-)
-
-# CUDA sources for daemon queue allocation helper.
-# Kept separate so CMake applies CUDA-specific flags only to these files.
-set(NVME_CUDA_DRIVER_SOURCES
-    nvme/src/daemon_nvme_queue_alloc.cu
-)
-
-# Mock backend sources (in-memory IDeviceDriver, peer to nvme)
-set(MOCK_HEADERS
-    mock/include/mock_physical_device.h
-    mock/include/mock_virtual_device.h
-    mock/include/mock_lease_manager.h
-    mock/include/mock_device_driver.h
-)
-
-set(MOCK_SOURCES
-    mock/src/mock_device_driver.cpp
-)
-
-set(NVME_CUDA_HEADERS
-    nvme/src/queue_acquire_helper_impl.cuh
-)
-
-set(LAYER_SOURCES
-    ${COMMON_SOURCES}
-    ${NVME_SOURCES}
-    ${NVME_DRIVER_SOURCES}
-    ${NVME_CUDA_DRIVER_SOURCES}
-    ${MOCK_SOURCES}
-)
-
-set(LAYER_HEADERS
-    ${COMMON_HEADERS}
-    ${NVME_HEADERS}
-    ${NVME_CUDA_HEADERS}
-)
-
-# =============================================================================
-# Library Target
-# =============================================================================
-
-add_library(${LAYER_NAME} ${LAYER_SOURCES})
-
-set_target_properties(${LAYER_NAME} PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    POSITION_INDEPENDENT_CODE ON
-    OUTPUT_NAME "tutti_device_manager"
-    BUILD_RPATH "$ORIGIN"
-    INSTALL_RPATH "$ORIGIN"
-)
-
-# =============================================================================
-# Include Directories
-# =============================================================================
-
-target_include_directories(${LAYER_NAME}
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/nvme/include>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/mock/include>
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
-        $<INSTALL_INTERFACE:include>
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/nvme/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/nvme/libnvm/include
-)
-
-# When nvmeservice is available (gRPC found), add its include paths so that
-# daemon_nvme_device_driver.cpp and daemon_nvme_queue_alloc.cu can reach
-# nvmeservice_client.h, queue.h, buffer.h, and the generated proto headers.
-if(gRPC_FOUND)
-    target_include_directories(${LAYER_NAME}
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/nvme/nvmeservice/src
-    )
-    # Signal to the driver sources that nvmeservice gRPC support is compiled in.
-    target_compile_definitions(${LAYER_NAME}
-        PRIVATE TUTTI_NVMESERVICE_ENABLED=1
-    )
-endif()
-
-# =============================================================================
-# Dependencies
-# =============================================================================
-
-target_link_libraries(${LAYER_NAME}
-    PUBLIC
-        tutti_accel
-    PRIVATE
-        libnvm
-        CUDA::cudart
-)
-
-# When nvmeservice is available (gRPC found), link the gRPC client library so
-# DaemonNvmeDeviceDriver can open sessions with the daemon.
-if(gRPC_FOUND)
-    target_link_libraries(${LAYER_NAME}
-        PRIVATE
-            nvmeservice
-            gRPC::grpc++
-            protobuf::libprotobuf
-    )
-endif()
-
-# =============================================================================
-# Layer Metadata (for validation)
-# =============================================================================
-
-set_target_properties(${LAYER_NAME} PROPERTIES
-    TUTTI_LAYER_NUMBER ${LAYER_NUMBER}
-    TUTTI_LAYER_DEPENDENCIES "${DEPENDS_ON}"
-)
-
-# =============================================================================
-# Installation
-# =============================================================================
-
-install(TARGETS ${LAYER_NAME}
-    EXPORT tutti_targets
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION bin
-)
-
-# Install common headers
-install(DIRECTORY include/common/
-    DESTINATION include/tutti/device_manager/common
-    FILES_MATCHING PATTERN "*.h"
-)
-
-# Install nvme headers
-install(DIRECTORY nvme/include/
-    DESTINATION include/tutti/device_manager/nvme
-    FILES_MATCHING
-        PATTERN "*.h"
-        PATTERN "*.cuh"
-)
-
-install(DIRECTORY mock/include/
-    DESTINATION include/tutti/device_manager/mock
-    FILES_MATCHING PATTERN "*.h"
-)
-
-# =============================================================================
-# Kernel Module Reference
-# =============================================================================
-
-# kernel_modules/ contains snvme kernel module sources
-# Build instructions in kernel_modules/PORTING.md
-# Supports:
-#   - Linux 5.15.0 (snvme-5.15.0-public)
-#   - Linux 5.4.241 (snvme-5.4.241-1-tlinux4-0017)
-
-# =============================================================================
-# Documentation
-# =============================================================================
-
-# Layer 2 (Device Manager) owns:
-#
-# 1. Physical Device Management
-#    - snvme kernel module (kernel_modules/)
-#    - libnvm user-space library (libnvm/)
-#    - Controller bring-up (init_b3, attach_client)
-#
-# 2. Cross-Process Arbitration (Level-1)
-#    - NVMeService daemon (nvmeservice/)
-#    - Lease management and heartbeat
-#    - Dead-process queue reclamation
-#
-# 3. In-Process Virtualization (Level-2)
-#    - IVirtualDevice interface (include/common/)
-#    - Per-backend IDeviceDriver::alloc_vdevice (nvme/src/)
-#    - Per-backend vDevice allocation
-#
-# 4. Device-Side Queue Mechanics
-#    - Queue helpers (nvme/include/queue_acquire_helper.cuh)
-#    - acquire_queue, issue_nvme_cmd, poll
-#
-# Directory Structure:
-#
-# include/common/           - Transport-agnostic interfaces
-#   device_type.h          - DeviceType enum
-#   idevice_manager.h      - IDeviceManager interface (entry point)
-#   iphysical_device.h     - IPhysicalDevice interface
-#   ivirtual_device.h      - IVirtualDevice interface
-#   idevice_driver.h       - IDeviceDriver plugin interface
-#   ilease_manager.h       - ILeaseManager interface
-#   null_lease_manager.h   - NullLeaseManager (direct-mode no-op)
-#   device_manager_impl.h  - DeviceManagerImpl / create_device_manager
-#
-# nvme/                     - All NVMe-specific code
-#   include/               - NVMe-specific types
-#     nvme_physical_device.h - NvmePhysicalDevice (IPhysicalDevice)
-#     nvme_virtual_device.h  - NvmeVirtualDevice (IVirtualDevice)
-#     nvme_queue_group.h   - NvmeQueueGroup class
-#     direct_nvme_device_driver.h  - DirectNvmeDeviceDriver
-#     daemon_nvme_device_driver.h  - DaemonNvmeDeviceDriver
-#     queue_acquire_helper.cuh - Device-side queue helpers
-#   src/                   - NVMe implementations
-#     nvme_physical_device.cpp - NvmePhysicalDevice implementation
-#     direct_nvme_device_driver.cpp / daemon_nvme_device_driver.cpp
-#     queue_acquire_helper_impl.cuh - Device-side helper implementations
-#   libnvm/                - User-space NVMe library
-#     include/             - libnvm public headers
-#     src/                 - libnvm implementation
-#   nvmeservice/           - Cross-process daemon
-#     src/                 - NVMeService implementation
-#     NVMeService.md       - Documentation
-#   kernel_modules/        - snvme kernel module
-#     snvme-5.15.0-public/ - Linux 5.15.0 version
-#     snvme-5.4.241-1-tlinux4-0017/ - Linux 5.4.241 version
-#     PORTING.md           - Kernel porting guide
-
-# =============================================================================
-# Tests
-# =============================================================================
-
-# Layer-specific tests are excluded; all tests live under tutti/tests/
+# kernel_modules/ contains the snvme kernel module sources; built out-of-tree
+# by the deployment system (see kernel_modules/PORTING.md), not by CMake.

@@ -19,6 +19,9 @@
 #   -j <N>              Parallel build jobs (default: nproc)
 #   -h, --help          Show this help
 #
+# Environment:
+#   TUTTI_ACCELERATOR   Accelerator profile: CUDA (default) or HOST
+#
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"   # <repo>/tutti (cmake source dir)
@@ -29,6 +32,12 @@ BUILD_TYPE="RelWithDebInfo"
 CUDA_ARCH="89"
 JOBS="$(nproc)"
 RECONFIGURE=0
+ACCELERATOR="${TUTTI_ACCELERATOR:-CUDA}"
+ACCELERATOR="${ACCELERATOR^^}"
+if [[ "$ACCELERATOR" != "CUDA" && "$ACCELERATOR" != "HOST" ]]; then
+  echo "ERROR: TUTTI_ACCELERATOR='$ACCELERATOR' is not supported. Supported: CUDA, HOST" >&2
+  exit 2
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -71,10 +80,11 @@ if [[ "$RECONFIGURE" -eq 1 && -f "$BUILD_DIR/CMakeCache.txt" ]]; then
 fi
 
 if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
-  echo "Configuring Tutti (build type=$BUILD_TYPE, CUDA arch=$CUDA_ARCH) in $BUILD_DIR"
+  echo "Configuring Tutti (build type=$BUILD_TYPE, CUDA arch=$CUDA_ARCH, accelerator=$ACCELERATOR) in $BUILD_DIR"
   cmake -S "$HERE" -B "$BUILD_DIR" \
     -DCMAKE_TOOLCHAIN_FILE="$REPO/third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH"
+    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+    -DTUTTI_ACCELERATOR="$ACCELERATOR"
 else
   echo "Reusing existing CMake configuration in $BUILD_DIR (use --reconfigure to force)"
 fi

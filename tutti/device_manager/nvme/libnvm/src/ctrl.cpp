@@ -199,7 +199,7 @@ int _nvm_ctrl_init(nvm_ctrl_t** handle, struct device* dev, const struct device_
  * Release controller handle (OWNER-ONLY path).
  *
  * Unconditionally cascades through:
- *   nvm_queue_clear      -- legacy admin queue scrub
+ *   nvm_queue_clear      -- removed: kernel has no NVM_CLEAR_IOQ_NUM handler
  *   nvm_device_unbind    -- SNVM_DEVICE_UNBIND ioctl: detaches snvme
  *                           from the PCI BDF.  System-wide effect:
  *                           the in-tree nvme driver gets the device
@@ -223,7 +223,11 @@ void nvm_ctrl_free(nvm_ctrl_t* ctrl)
 {
     if (ctrl != NULL)
     {   
-        nvm_queue_clear(ctrl);
+        /* nvm_queue_clear() removed: kernel never implemented
+         * NVM_CLEAR_IOQ_NUM, so the ioctl always failed with -EINVAL.
+         * Cleanup is handled by nvm_device_unbind() + _nvm_ctrl_put()
+         * (fd close triggers kernel snvm_dev_release cascade).
+         * Restore this call if a future kernel adds the handler. */
         nvm_device_unbind(ctrl);
         struct controller* container = _nvm_container_of(ctrl, struct controller, handle);
         nvm_chrdev_remove(container->device->fd_control, &ctrl->pdev_addr);
