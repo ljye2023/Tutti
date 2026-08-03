@@ -111,7 +111,7 @@ bool LocalNvmeIoEngine::launch_async_locked(
         return false;
     }
     cerr = launch_nvme_batch_xfer(stream, d_scratch_, count, is_read,
-                                   /*threads_per_block=*/32);
+                                   /*threads_per_block=*/64);
     if (cerr != cudaSuccess) {
         std::fprintf(stderr,
             "[io_engine] LocalNvmeIoEngine: launch_nvme_batch_xfer "

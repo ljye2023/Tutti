@@ -46,74 +46,74 @@ void nvme_batch_xfer_kernel(const NvmeBatchEntry* entries,
                             bool                  is_read)
 {
     const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= count) return;
+    for (uint32_t i = tid; i < count; i += blockDim.x*gridDim.x) {
+        // Value-copy 40 bytes from device memory.  This is what the
+        // legacy `auto ctx = io_ctx->d_ioctxs[tid]` does too -- we
+        // dereference the GPU-resident pointer fields below.
+        const NvmeBatchEntry e = entries[i];
 
-    // Value-copy 40 bytes from device memory.  This is what the
-    // legacy `auto ctx = io_ctx->d_ioctxs[tid]` does too -- we
-    // dereference the GPU-resident pointer fields below.
-    const NvmeBatchEntry e = entries[tid];
+        if (e.prp_entry == nullptr ||
+            e.shards    == nullptr ||
+            e.num_shards == 0) {
+            // Defensive: legacy returns silently on a null prp_entry /
+            // empty span.  Use a one-shot printf so a misbuild prints
+            // exactly once per offending tid in dmesg-style logs.
+            printf("nvme_batch_xfer_kernel: tid=%u skipped "
+                "(prp_entry=%p shards=%p num_shards=%u)\n",
+                tid, (const void*)e.prp_entry,
+                (const void*)e.shards, e.num_shards);
+            continue;
+        }
 
-    if (e.prp_entry == nullptr ||
-        e.shards    == nullptr ||
-        e.num_shards == 0) {
-        // Defensive: legacy returns silently on a null prp_entry /
-        // empty span.  Use a one-shot printf so a misbuild prints
-        // exactly once per offending tid in dmesg-style logs.
-        printf("nvme_batch_xfer_kernel: tid=%u skipped "
-               "(prp_entry=%p shards=%p num_shards=%u)\n",
-               tid, (const void*)e.prp_entry,
-               (const void*)e.shards, e.num_shards);
-        return;
-    }
+        // (3a) Stripe selection -- via block_storage's gpu_file_resolve at
+        // TENSOR_SIZE granularity (R6 invariant).  The previous form used
+        // the sub-IO size (prp_entry->data_length, i.e. MDTS) as the
+        // stripe unit; that is only equivalent when tensor_size == MDTS
+        // (one sub-IO per tensor).  With tensor_size > MDTS the fan-out
+        // sub-IOs were round-robined across shards at sub-IO granularity,
+        // scattering one tensor's pieces onto the WRONG shards and into
+        // wrong shard offsets (resolve_lba failures / cross K/V
+        // corruption).  Correct form: the whole tensor lives on ONE shard;
+        // sub-IOs are contiguous within it.
+        const uint64_t sub_io = e.prp_entry->data_length;
+        if (sub_io == 0) {
+            printf("nvme_batch_xfer_kernel: tid=%u zero sub_io\n", tid);
+            continue;
+        }
+        if (e.tensor_size == 0 || (e.file_offset % e.tensor_size) != 0) {
+            printf("nvme_batch_xfer_kernel: tid=%u bad tensor_size=%u "
+                "file_offset=%llu\n", tid, e.tensor_size,
+                (unsigned long long)e.file_offset);
+            continue;
+        }
+        uint32_t fd_idx   = 0;
+        uint64_t base_off = 0;
+        gpu_file_resolve(e.tensor_size, e.num_shards, e.file_offset,
+                        &fd_idx, &base_off);
+        const uint64_t file_off = base_off + (uint64_t)e.prp_idx * sub_io;
 
-    // (3a) Stripe selection -- via block_storage's gpu_file_resolve at
-    // TENSOR_SIZE granularity (R6 invariant).  The previous form used
-    // the sub-IO size (prp_entry->data_length, i.e. MDTS) as the
-    // stripe unit; that is only equivalent when tensor_size == MDTS
-    // (one sub-IO per tensor).  With tensor_size > MDTS the fan-out
-    // sub-IOs were round-robined across shards at sub-IO granularity,
-    // scattering one tensor's pieces onto the WRONG shards and into
-    // wrong shard offsets (resolve_lba failures / cross K/V
-    // corruption).  Correct form: the whole tensor lives on ONE shard;
-    // sub-IOs are contiguous within it.
-    const uint64_t sub_io = e.prp_entry->data_length;
-    if (sub_io == 0) {
-        printf("nvme_batch_xfer_kernel: tid=%u zero sub_io\n", tid);
-        return;
-    }
-    if (e.tensor_size == 0 || (e.file_offset % e.tensor_size) != 0) {
-        printf("nvme_batch_xfer_kernel: tid=%u bad tensor_size=%u "
-               "file_offset=%llu\n", tid, e.tensor_size,
-               (unsigned long long)e.file_offset);
-        return;
-    }
-    uint32_t fd_idx   = 0;
-    uint64_t base_off = 0;
-    gpu_file_resolve(e.tensor_size, e.num_shards, e.file_offset,
-                     &fd_idx, &base_off);
-    const uint64_t file_off = base_off + (uint64_t)e.prp_idx * sub_io;
+        NvmeFileDeviceHandle* dh = e.shards[fd_idx];
+        if (dh == nullptr) {
+            printf("nvme_batch_xfer_kernel: tid=%u shards[%u] == nullptr\n",
+                tid, fd_idx);
+            continue;
+        }
 
-    NvmeFileDeviceHandle* dh = e.shards[fd_idx];
-    if (dh == nullptr) {
-        printf("nvme_batch_xfer_kernel: tid=%u shards[%u] == nullptr\n",
-               tid, fd_idx);
-        return;
-    }
-
-    // (3b) Virtual file offset -> physical NVMe LBA translation +
-    //      command issue, both inside R5b's submit_*_one.
-    if (is_read) {
-        submit_read_one (dh,
-                         e.prp_entry->prp1,
-                         e.prp_entry->prp2,
-                         file_off,
-                         sub_io);
-    } else {
-        submit_write_one(dh,
-                         e.prp_entry->prp1,
-                         e.prp_entry->prp2,
-                         file_off,
-                         sub_io);
+        // (3b) Virtual file offset -> physical NVMe LBA translation +
+        //      command issue, both inside R5b's submit_*_one.
+        if (is_read) {
+            submit_read_one (dh,
+                            e.prp_entry->prp1,
+                            e.prp_entry->prp2,
+                            file_off,
+                            sub_io);
+        } else {
+            submit_write_one(dh,
+                            e.prp_entry->prp1,
+                            e.prp_entry->prp2,
+                            file_off,
+                            sub_io);
+        }
     }
 }
 
@@ -141,8 +141,9 @@ cudaError_t launch_nvme_batch_xfer(cudaStream_t          stream,
         return cudaErrorInvalidValue;
     }
 
-    const uint32_t blocks =
-        (count + threads_per_block - 1) / threads_per_block;
+    // const uint32_t blocks =
+    //     (count + threads_per_block - 1) / threads_per_block;
+    const uint32_t blocks = 16;
 
     nvme_batch_xfer_kernel
         <<<blocks, threads_per_block, 0, stream>>>(
