@@ -10,7 +10,7 @@
 #include <memory>
 #include <cstddef>
 #include <cstdint>
-#include "cuda.h"
+#include <tutti/cuda_like.h>
 #include "nvm_types.h"
 #include "nvm_dma.h"
 #include "nvm_util.h"

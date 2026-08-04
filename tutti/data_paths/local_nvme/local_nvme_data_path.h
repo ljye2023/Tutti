@@ -27,6 +27,8 @@
 #include "tutti/data_paths/local_nvme/metadata/metadata_arena.h"
 #include "tutti/data_paths/local_nvme/metadata/handle_workspace_cache.h"
 #include "tutti/data_paths/local_nvme/metadata/prp_page_cache.h"
+#include "tutti/data_paths/local_nvme/metadata/desc_pool.h"
+#include "tutti/data_paths/local_nvme/metadata/prp_buf_pool.h"
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor (Round 16 S6 test accessor)
 
 #include <nvm_ctrl.h>
@@ -359,9 +361,15 @@ private:
             std::uint64_t num_descs = 0;   // total sub-IO descriptors
             std::uint64_t bytes_per_slice = 0;  // granularity used (= min(io_granularity, MDTS))
             std::uint64_t ios_per_slice = 0;    // sub-IOs per slice
-            // PRP-list pages (GPU-resident, for LIST path)
-            void* d_prp_pages = nullptr;   // cudaMalloc'd
-            std::uint64_t num_prp_pages = 0;
+            // PRP-list DMA mapping (host-pinned, DMA-mapped via nvm_dma_map_data_host).
+            // prp2 in each AddressDescriptor points into the pool segment's ioaddrs[].
+            // The NVMe controller reads PRP lists from these IOVAs via PCIe DMA.
+            // R19 S3: sub-page packing — 16 slices share one 4KiB page
+            // (each slice's list uses ≤31 entries = 248B, packed at 256B slots).
+            // R19 S3b: pool-managed (PrpBufPool). Ownership is in the pool;
+            // freed on DataPath shutdown. No per-unregister nvm_dma_unmap.
+            PrpBufRef prp_buf_ref;          // pool sub-allocation reference
+            std::uint64_t num_prp_pages = 0;    // pages allocated (≤ num_slices/16)
             bool valid = false;
         };
         PrebuiltDesc prebuilt;
@@ -522,6 +530,14 @@ private:
     // Memory registration table: token -> MemReg.
     std::unordered_map<std::uint64_t, MemReg> mem_regs_;
     std::uint64_t next_mem_token_ = 1;
+
+    // R19 S3 REQUIRED 3: GPU descriptor pool — replaces per-registration
+    // cudaMalloc for pre-built AddressDescriptor[] arrays.
+    DescPool desc_pool_;
+
+    // R19 S3b REQUIRED 1: host-pinned PRP-list buffer pool — replaces
+    // per-registration nvm_dma_map_data_host for pre-built PRP pages.
+    PrpBufPool prp_buf_pool_;
 };
 
 } // namespace tutti::data_paths::local_nvme

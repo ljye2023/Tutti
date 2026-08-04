@@ -44,7 +44,7 @@
 #include <mutex>
 #include <vector>
 
-#include <cuda_runtime.h>   // cudaMallocHost / cudaFreeHost
+#include <tutti/cuda_like.h>   // cudaMallocHost / cudaFreeHost
 
 namespace tutti::data_paths::local_nvme {
 

@@ -16,7 +16,7 @@
 #include <nvm_ctrl.h>
 #include <nvm_dma.h>
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <algorithm>
 #include <chrono>

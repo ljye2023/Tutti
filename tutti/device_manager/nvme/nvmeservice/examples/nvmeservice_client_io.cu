@@ -9,7 +9,7 @@
 
 #include "nvmeservice_client_io.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <nvm_types.h>
 #include <nvm_ctrl.h>

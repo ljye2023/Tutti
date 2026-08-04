@@ -13,12 +13,13 @@ cmake_minimum_required(VERSION 3.18)
 # Accelerator profile (must be defined and validated before project())
 # ---------------------------------------------------------------------------
 
-set(TUTTI_ACCELERATOR "CUDA" CACHE STRING "Tutti accelerator profile: CUDA|HOST")
+set(TUTTI_ACCELERATOR "CUDA" CACHE STRING "Tutti accelerator profile: CUDA|HOST|MUSA|MACA")
 string(TOUPPER "${TUTTI_ACCELERATOR}" TUTTI_ACCELERATOR)
-if(NOT TUTTI_ACCELERATOR MATCHES "^(CUDA|HOST)$")
+if(NOT TUTTI_ACCELERATOR MATCHES "^(CUDA|HOST|MUSA|MACA)$")
     message(FATAL_ERROR
         "TUTTI_ACCELERATOR='${TUTTI_ACCELERATOR}' is not supported. "
-        "Supported values: CUDA, HOST")
+        "Supported values: CUDA, HOST, MUSA, MACA "
+        "(MUSA/MACA are framework stubs — see doc/gpu-porting-guide.md)")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -26,9 +27,17 @@ endif()
 # ---------------------------------------------------------------------------
 
 if(TUTTI_ACCELERATOR STREQUAL "CUDA")
-    project(Tutti LANGUAGES C CXX CUDA)
+    project(Tutti VERSION 0.1.1 LANGUAGES C CXX CUDA)
+elseif(TUTTI_ACCELERATOR STREQUAL "MUSA" OR TUTTI_ACCELERATOR STREQUAL "MACA")
+    # MUSA/MACA toolchains: the device language is supplied by the Metax
+    # compiler.  By default we still enable CUDA language so that nvcc is
+    # picked up (many MUSA SDKs ship an nvcc-compatible front end).  Metax
+    # may override this in cmake/accelerators/MUSA.cmake via enable_language().
+    # If the toolchain does NOT provide nvcc, remove CUDA from LANGUAGES and
+    # enable the MUSA language explicitly — see doc/gpu-porting-guide.md.
+    project(Tutti VERSION 0.1.1 LANGUAGES C CXX CUDA)
 else()
-    project(Tutti LANGUAGES C CXX)
+    project(Tutti VERSION 0.1.1 LANGUAGES C CXX)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -201,7 +210,16 @@ if(TUTTI_BUILD_HARDWARE_STACK)
     # Phase 0 contract targets (built in all profiles) do NOT receive this.
     include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 
-    find_package(CUDAToolkit REQUIRED)
+    # Preset assembly layer (public API factory functions).
+    add_subdirectory(presets)
+
+    # CUDA profile requires the CUDA Toolkit.  MUSA/MACA profiles supply
+    # their own SDK via cmake/accelerators/MUSA.cmake / MACA.cmake and do
+    # NOT need CUDAToolkit here (Metax may add an equivalent find_package
+    # in their cmake module).
+    if(TUTTI_ACCELERATOR STREQUAL "CUDA")
+        find_package(CUDAToolkit REQUIRED)
+    endif()
     find_package(Threads REQUIRED)
 
     # gRPC: optional; when found, nvmeservice (daemon NVMe multi-process path) is
@@ -233,22 +251,27 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- gRPC/yaml-cpp/libnvm skipped")
     endif()
 
-    message(STATUS "Tutti: Using CUDA ${CUDAToolkit_VERSION}")
-    message(STATUS "Tutti: Target architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    if(TUTTI_ACCELERATOR STREQUAL "CUDA")
+        message(STATUS "Tutti: Using CUDA ${CUDAToolkit_VERSION}")
+        message(STATUS "Tutti: Target architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
-    # CUDA 13.0+: CCCL headers (cuda/atomic, cuda/std/...) live under
-    # targets/<arch>/include/cccl/ which is NOT in CUDAToolkit_INCLUDE_DIRS.
-    # Add it for hardware stack targets (libnvm queue.cpp includes <cuda/atomic>).
-    # Only needed when local-NVMe (libnvm) is in the build.
-    if(TUTTI_FEATURE_LOCAL_NVME)
-        foreach(_tutti_inc_dir ${CUDAToolkit_INCLUDE_DIRS})
-            get_filename_component(_tutti_cuda_root "${_tutti_inc_dir}/.." ABSOLUTE)
-            file(GLOB _tutti_cccl_dirs "${_tutti_cuda_root}/targets/*/include/cccl")
-            if(_tutti_cccl_dirs)
-                include_directories(${_tutti_cccl_dirs})
-                message(STATUS "Tutti: CCCL include: ${_tutti_cccl_dirs}")
-            endif()
-        endforeach()
+        # CUDA 13.0+: CCCL headers (cuda/atomic, cuda/std/...) live under
+        # targets/<arch>/include/cccl/ which is NOT in CUDAToolkit_INCLUDE_DIRS.
+        # Add it for hardware stack targets (libnvm queue.cpp includes <cuda/atomic>).
+        # Only needed when local-NVMe (libnvm) is in the build.
+        if(TUTTI_FEATURE_LOCAL_NVME)
+            foreach(_tutti_inc_dir ${CUDAToolkit_INCLUDE_DIRS})
+                get_filename_component(_tutti_cuda_root "${_tutti_inc_dir}/.." ABSOLUTE)
+                file(GLOB _tutti_cccl_dirs "${_tutti_cuda_root}/targets/*/include/cccl")
+                if(_tutti_cccl_dirs)
+                    include_directories(${_tutti_cccl_dirs})
+                    message(STATUS "Tutti: CCCL include: ${_tutti_cccl_dirs}")
+                endif()
+            endforeach()
+        endif()
+    elseif(TUTTI_ACCELERATOR STREQUAL "MUSA" OR TUTTI_ACCELERATOR STREQUAL "MACA")
+        message(STATUS "Tutti: Using ${TUTTI_ACCELERATOR} profile "
+                       "(SDK paths configured via cmake/accelerators/${TUTTI_ACCELERATOR}.cmake)")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -270,6 +293,11 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         # device primitives) + the striped binding/resolver already defined
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
+
+        # Round 20 S1: application config loader (yaml → RuntimeComponents).
+        # Translates config/tutti_config.yaml into DataPath/Resolver
+        # construction via the public API.
+        add_subdirectory(config)
     else()
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping device_manager, data_paths/local_nvme")
     endif()
@@ -394,6 +422,15 @@ if(BUILD_TESTING)
     )
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
 
+    # Round 17 S1: MountManager host-side unit tests (hardware-free).
+    # Tests config parsing, /proc scanning, mount/unmount lifecycle
+    # with tmpfs, and force-exit flag.  No real NVMe devices needed.
+    add_subdirectory(
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/mount_manager_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_mount_manager_contract"
+    )
+    message(STATUS "Tutti: added tests/mount_manager_contract (host;mount_manager)")
+
     # ---- Hardware tests (gated by TUTTI_BUILD_HARDWARE_TESTS) ----
 
     if(TUTTI_BUILD_HARDWARE_TESTS)
@@ -434,12 +471,32 @@ if(BUILD_TESTING)
             )
             message(STATUS "Tutti: added tests/striped_local_nvme_contract (hardware;striped;runtime_e2e)")
 
-            # Layerwise KV-cache overlap simulator (hardware example).
-            # HY3-shaped 3-stream pipeline: read(L+1) || compute(L) || write(L-1).
-            # Uses ONLY public StorageRuntime API; links hardware stack for assembly.
+            # Round 19 S1: batch open performance microbenchmark.
+            # Not a ctest (perf number, not pass/fail); manually invoked.
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/examples/layerwise_kv_overlap"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/batch_open_perf"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_batch_open_perf"
+            )
+
+            # Round 20 S2: layerwise KV-cache overlap example (moved to root examples/).
+            # HY3-shaped 3-stream pipeline: read(L+1) || compute(L) || write(L-1).
+            # Uses ONLY public StorageRuntime API + preset factory.
+            add_subdirectory(
+                "${CMAKE_CURRENT_SOURCE_DIR}/../examples/layerwise_kv_overlap"
                 "${CMAKE_CURRENT_BINARY_DIR}/examples_layerwise_kv_overlap"
+            )
+
+            # Round 19 S3b: registration throughput microbenchmark.
+            # Not a ctest (perf number, not pass/fail); manually invoked.
+            add_subdirectory(
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/register_perf"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_register_perf"
+            )
+
+            # Round 20 S1: tutti_config loader unit test (ctest).
+            add_subdirectory(
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/config_loader"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_config_loader"
             )
         else()
             message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping local_nvme hardware tests")

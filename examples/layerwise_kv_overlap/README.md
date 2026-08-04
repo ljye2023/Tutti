@@ -1,0 +1,156 @@
+# examples/layerwise_kv_overlap
+
+## 这是什么
+
+`layerwise_kv_overlap` 是 Tutti 的标准 KV-cache 参考负载示例。它模拟 HY3-shaped 128K-context 请求（80 层，512 × 256-token chunks，90% prefix hit），采用 3-stream layerwise pipeline：
+
+```
+read(L+1) ∥ SGEMM compute(L) ∥ write(L-1)
+```
+
+每个 chunk 的 K/V tensor（512 KiB）独立注册到 DataPath，NVMe DMA 直接读写 GPU tensor——无 scratch buffer、无 D2D bounce。
+
+## 前置环境
+
+**严格顺序**：内核模块 → `tutti_daemon` → 挂载——块设备由 daemon bring-up 后才创建，先 mount 会找不到设备。
+
+### 1. 编译内核模块
+
+```bash
+cd /path/to/Tutti
+cmake -B build -S tutti \
+    -DTUTTI_ACCELERATOR=CUDA \
+    -DTUTTI_BUILD_HARDWARE_TESTS=ON \
+    -DCMAKE_TOOLCHAIN_FILE=../third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --target modules -j8
+```
+
+产物：`build/module/snvme.ko`、`build/module/snvme-core.ko`
+
+### 2. 加载内核模块
+
+```bash
+sudo insmod build/module/snvme-core.ko
+sudo insmod build/module/snvme.ko io_queue_depth=1024
+```
+
+> **注意**：必须先加载 `snvme-core.ko`（依赖模块），再加载 `snvme.ko`。`io_queue_depth=1024` 是必需的——默认 64 会导致 striped4 大规模 "wait failed"（见 [FAQ](../../doc/build_and_test.md#faq)）。
+
+### 3. 编译并启动 tutti_daemon
+
+```bash
+cmake --build build --target tutti_daemon -j8
+sudo ./build/bin/tutti_daemon --config sys_config.yaml &
+```
+
+daemon 启动后会：
+- bind 到 NVMe 控制器（`/dev/ssnvme0-3`）
+- 创建块设备 `/dev/snvme0n1` ~ `/dev/snvme3n1`
+- 按 `sys_config.yaml` 的 `auto_mount: true` 自动挂载到 `/mnt/nvme0-3`（ext4）
+
+### 4. 确认挂载
+
+```bash
+lsblk | grep snvme
+# 应看到 4 个 snvme 块设备挂载到 /mnt/nvme0-3
+```
+
+如果 daemon 没有自动挂载（`auto_mount: false` 或失败），手动挂载：
+
+```bash
+sudo mount /dev/snvme0n1 /mnt/nvme0
+sudo mount /dev/snvme1n1 /mnt/nvme1
+sudo mount /dev/snvme2n1 /mnt/nvme2
+sudo mount /dev/snvme3n1 /mnt/nvme3
+```
+
+### 5. 关闭
+
+```bash
+sudo killall tutti_daemon     # 或 kill <pid>
+sudo umount /mnt/nvme0-3
+sudo rmmod snvme snvme-core
+```
+
+详见 [`doc/build_and_test.md`](../../doc/build_and_test.md)。
+
+## 编译
+
+```bash
+cmake -B build -S tutti \
+    -DTUTTI_ACCELERATOR=CUDA \
+    -DBUILD_TESTING=ON \
+    -DTUTTI_BUILD_HARDWARE_TESTS=ON \
+    -DCMAKE_TOOLCHAIN_FILE=../third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+cmake --build build --target tutti_layerwise_kv_overlap -j8
+```
+
+产物：`build/bin/tutti_layerwise_kv_overlap`
+
+## 运行
+
+### 默认模式（4-disk striped）
+
+```bash
+sudo ./build/bin/tutti_layerwise_kv_overlap
+```
+
+### 单盘模式
+
+```bash
+sudo ./build/bin/tutti_layerwise_kv_overlap --single
+```
+
+### 可选参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--layers` | 80 | 层数 |
+| `--ctx-tokens` | 131072 | 上下文 token 数 |
+| `--chunk-tokens` | 256 | 每层 chunk 的 token 数 |
+| `--hit-pct` | 90 | prefix hit 百分比 |
+| `--tensor-kb` | 512 | 每 K/V tensor 大小（KiB） |
+| `--compute-us` | 0 | 每次 compute 模拟延迟（μs） |
+| `--gemm-n` | 1024 | SGEMM 矩阵维度 |
+| `--data-dir` | /mnt/nvme0/GPU0 | 单盘模式数据目录 |
+| `--striped4` | (default) | 使用 4-disk striped 模式 |
+| `--single` | | 使用单盘模式 |
+| `--no-verify` | | 跳过逐字节校验 |
+
+## 预期输出
+
+```
+[ OK ] cudaSetDevice(0)
+[ OK ] StorageRuntime created (StripedDataPath, N=4)
+[ OK ] Phase A (striped4): 512 targets x 4 shards (X.X GB) in X.XXs
+[ OK ] Phase B: 461 hit + 51 miss chunks, 1024 tensors registered
+[ OK ] Phase C: opened 512 targets (striped4)
+[INFO] Layer  0: read   X.XX ms (XXXX MB/s)  write  X.XX ms (XXXX MB/s)
+[INFO] Layer  1: read   X.XX ms (XXXX MB/s)  write  X.XX ms (XXXX MB/s)
+...
+[INFO] Phase G: READ  XX.XX ms total, XXXX.X GB/s avg
+[INFO] Phase G: WRITE XX.XX ms total, XXXX.X GB/s avg
+[ OK ] Phase H: 26/26 tensors verified
+```
+
+**参考带宽**：4-disk striped 模式 ~25 GB/s（READ）。
+
+## 作为 ctest 运行
+
+```bash
+ctest -R tutti_layerwise_kv_overlap
+```
+
+Labels: `hardware;local_nvme;layerwise_overlap`
+
+## 公共 API
+
+此示例只使用公共 API：
+- `<tutti/storage_runtime.h>` — StorageRuntime
+- `<tutti/io_types.h>` — IoRequest, IoDirection 等
+- `<tutti/memory_types.h>` — MemoryView, MemoryHandle 等
+- `<tutti/presets/local_nvme.h>` — preset 工厂函数（make_local_nvme_runtime / make_striped_nvme_runtime）
+- `<tutti/cuda_like.h>` — CUDA 运行时抽象
+
+不引用任何私有 DataPath 或 resolver 头文件。

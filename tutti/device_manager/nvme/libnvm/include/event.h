@@ -5,7 +5,7 @@
 // #define __host__
 // #endif
 
-#include "cuda.h"
+#include <tutti/cuda_like.h>
 #include <string>
 #include <stdexcept>
 

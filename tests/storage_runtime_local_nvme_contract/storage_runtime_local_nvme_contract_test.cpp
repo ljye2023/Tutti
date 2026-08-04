@@ -30,7 +30,7 @@
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
 #include <tutti/resolvers/local_file/resolver.h>
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <atomic>
 #include <chrono>
@@ -67,7 +67,7 @@ constexpr std::uint32_t kNumQueues = 16;
 constexpr std::uint32_t kNsId = 1;
 constexpr std::uint32_t kBlockSize = 4096;
 constexpr const char* kDataPathKey = "local-nvme-ext4";
-constexpr const char* kDir = "/mnt/nvme1/GPU0/resolver_test";
+constexpr const char* kDir = "/mnt/nvme0/GPU0/resolver_test";  // R17 path scheme: device 0 -> /mnt/nvme0
 
 int g_pass = 0;
 int g_fail = 0;
@@ -893,6 +893,107 @@ int main() {
         CHECK(rt->shutdown(1000).ok(), "shutdown default-capacity runtime");
         cudaFree(raw);
         ::unlink(path.c_str());
+    }
+
+    // =====================================================================
+    // 10. Round 19 S1: batch open — mixed scenarios + byte verification
+    //    Verifies:
+    //    (a) all-OK batch returns N ok results, each target IO + verify
+    //    (b) mixed batch (non-existent file + bad scheme + valid file):
+    //        per-item fail-closed status, valid items still work
+    // =====================================================================
+    printf("--- 10. batch open: mixed scenarios + byte verify ---\n");
+    {
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        auto resolver = make_resolver();
+        auto rt = make_runtime(dp, resolver);
+        CHECK(rt != nullptr, "create runtime for batch open");
+
+        // (a) all-OK batch: 3 valid files, distinct patterns.
+        std::vector<std::string> ok_paths;
+        for (int i = 0; i < 3; ++i) {
+            std::string p = std::string(kDir) + "/rt_batch_ok_" +
+                            std::to_string(i) + ".bin";
+            CHECK(create_file(p, kBlockSize, (unsigned char)(0xA0 + i)),
+                  "create batch_ok file");
+            ok_paths.push_back(p);
+        }
+        std::vector<std::string> uris_a;
+        for (const auto& p : ok_paths)
+            uris_a.push_back(std::string("file://") + p);
+
+        auto batch_a = rt->open_batch(uris_a, OpenOptions{"file"});
+        CHECK(batch_a.size() == 3, "batch_a size == 3");
+        bool all_ok_a = true;
+        for (std::size_t i = 0; i < batch_a.size(); ++i) {
+            if (!batch_a[i].ok()) { all_ok_a = false; break; }
+        }
+        CHECK(all_ok_a, "batch_a all 3 ok");
+
+        // IO + byte verify on each target.
+        if (all_ok_a) {
+            void* raw = nullptr; void* buf = alloc_gpu(65536, &raw);
+            auto m = rt->register_memory(MemoryView{buf, 65536, MemoryKind::DEVICE,
+                                                     MemoryOwnership::CALLER_OWNED,
+                                                     (std::int32_t)kCudaDev, ""});
+            CHECK(m.ok(), "register_memory batch_a");
+            cudaStream_t s; cudaStreamCreate(&s);
+            bool io_ok = true;
+            for (int i = 0; i < 3 && io_ok; ++i) {
+                if (!public_read_verify(*rt, m.value(), batch_a[i].value(),
+                                        buf, 0, 0, kBlockSize, s,
+                                        (unsigned char)(0xA0 + i)))
+                    io_ok = false;
+            }
+            CHECK(io_ok, "batch_a 3 targets IO + byte verify");
+            cudaStreamDestroy(s);
+            for (auto& r : batch_a) if (r.ok()) rt->close(r.value());
+            rt->unregister_memory(m.value());
+            cudaFree(raw);
+        }
+        for (const auto& p : ok_paths) ::unlink(p.c_str());
+
+        // (b) mixed batch: valid + non-existent + bad-scheme + valid.
+        std::string p_v0 = std::string(kDir) + "/rt_batch_v0.bin";
+        std::string p_v1 = std::string(kDir) + "/rt_batch_v1.bin";
+        CHECK(create_file(p_v0, kBlockSize, 0xB0), "create v0");
+        CHECK(create_file(p_v1, kBlockSize, 0xB1), "create v1");
+
+        std::vector<std::string> uris_b = {
+            std::string("file://") + p_v0,
+            std::string("file://") + kDir + "/nonexistent_file_xyz.bin",
+            std::string("badscheme://") + p_v1,
+            std::string("file://") + p_v1,
+        };
+        auto batch_b = rt->open_batch(uris_b, OpenOptions{"file"});
+        CHECK(batch_b.size() == 4, "batch_b size == 4");
+        CHECK(batch_b[0].ok(), "batch_b[0] valid file ok");
+        CHECK(!batch_b[1].ok(), "batch_b[1] non-existent fail-closed");
+        CHECK(!batch_b[2].ok(), "batch_b[2] bad scheme fail-closed");
+        CHECK(batch_b[3].ok(), "batch_b[3] valid file ok");
+
+        // IO + verify on the two valid items.
+        if (batch_b[0].ok() && batch_b[3].ok()) {
+            void* raw = nullptr; void* buf = alloc_gpu(65536, &raw);
+            auto m = rt->register_memory(MemoryView{buf, 65536, MemoryKind::DEVICE,
+                                                     MemoryOwnership::CALLER_OWNED,
+                                                     (std::int32_t)kCudaDev, ""});
+            CHECK(m.ok(), "register_memory batch_b");
+            cudaStream_t s; cudaStreamCreate(&s);
+            CHECK(public_read_verify(*rt, m.value(), batch_b[0].value(),
+                                     buf, 0, 0, kBlockSize, s, 0xB0),
+                  "batch_b[0] IO + byte verify");
+            CHECK(public_read_verify(*rt, m.value(), batch_b[3].value(),
+                                     buf, 0, 0, kBlockSize, s, 0xB1),
+                  "batch_b[3] IO + byte verify");
+            cudaStreamDestroy(s);
+            for (auto& r : batch_b) if (r.ok()) rt->close(r.value());
+            rt->unregister_memory(m.value());
+            cudaFree(raw);
+        }
+
+        ::unlink(p_v0.c_str()); ::unlink(p_v1.c_str());
+        CHECK(rt->shutdown(1000).ok(), "shutdown batch-open runtime");
     }
 
     printf("\n=== Summary ===\n  passed: %d\n  failed: %d\n", g_pass, g_fail);

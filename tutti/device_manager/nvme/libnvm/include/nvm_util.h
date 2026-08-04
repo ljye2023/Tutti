@@ -8,8 +8,7 @@
 #include <nvm_types.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 
 

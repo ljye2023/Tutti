@@ -72,7 +72,7 @@
  *   2  -- a smoke step failed; see stderr for which one.
  */
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <cerrno>
 #include <cinttypes>

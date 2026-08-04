@@ -31,8 +31,7 @@
  * usable for binary-layout consumers (size, offset, ioctl pointers).
  */
 #if defined(__CUDACC__)
-  #include <cuda/atomic>
-  #include <cuda_runtime.h>
+  #include <tutti/cuda_like.h>
   typedef cuda::atomic<uint32_t, cuda::thread_scope_device> nvm_atomic_u32_dev_t;
   typedef cuda::atomic<uint32_t, cuda::thread_scope_system> nvm_atomic_u32_sys_t;
 #else

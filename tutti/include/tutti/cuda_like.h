@@ -4,7 +4,7 @@
 //
 // Exactly one of TUTTI_USE_CUDA / TUTTI_USE_HOST must be defined by the
 // build profile (via tutti_cuda_like interface library).
-// CUDA:  includes NVIDIA CUDA driver + runtime headers.
+// CUDA:  includes NVIDIA CUDA driver + runtime headers + libcu++ <cuda/atomic>.
 // HOST:  includes the header-only HOST shim for contract tests.
 
 #if defined(TUTTI_USE_CUDA) && defined(TUTTI_USE_HOST)
@@ -23,15 +23,16 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 
 #elif defined(TUTTI_USE_HOST)
 
 #include <tutti/gpu_vendor/host.h>
 
 #elif defined(TUTTI_USE_MACA)
-#error "TUTTI_USE_MACA profile is declared but its shim is not implemented"
+#include <tutti/gpu_vendor/maca.h>
 
 #elif defined(TUTTI_USE_MUSA)
-#error "TUTTI_USE_MUSA profile is declared but its shim is not implemented"
+#include <tutti/gpu_vendor/musa.h>
 
 #endif

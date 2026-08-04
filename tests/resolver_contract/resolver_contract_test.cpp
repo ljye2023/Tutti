@@ -58,7 +58,7 @@ namespace resolver_ns = tutti::resolvers::local_file;
 static std::string test_dir() {
     const char* env = std::getenv("TUTTI_RESOLVER_TEST_DIR");
     if (env && env[0]) return env;
-    return "/mnt/nvme1/GPU0/resolver_test";
+    return "/mnt/nvme0/GPU0/resolver_test";
 }
 
 static bool dir_writable(const std::string& dir) {

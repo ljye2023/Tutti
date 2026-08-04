@@ -17,7 +17,7 @@ target_link_libraries(nvmeservice_daemon_example PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
     Threads::Threads
-    CUDA::cudart
+    ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
 
 set_target_properties(nvmeservice_daemon_example PROPERTIES
@@ -38,10 +38,13 @@ add_executable(nvmeservice_client_example
 target_link_libraries(nvmeservice_client_example PRIVATE
     nvmeservice
     libnvm
+    # nvmeservice_client_io.cu includes <tutti/cuda_like.h> (R18) — the
+    # tutti_cuda_like INTERFACE carries TUTTI_USE_CUDA=1 + tutti/include.
+    tutti_cuda_like
     gRPC::grpc++
     protobuf::libprotobuf
     Threads::Threads
-    CUDA::cudart
+    ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
 
 set_target_properties(nvmeservice_client_example PROPERTIES
@@ -65,7 +68,7 @@ target_link_libraries(tutti_daemon PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
     Threads::Threads
-    CUDA::cudart
+    ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
 set_target_properties(tutti_daemon PROPERTIES
     BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"

@@ -173,7 +173,6 @@
 #include "map.h"
 #include "ioctl.h"
 #include "peer_memory.h"
-#include "nvfs-pci.h"
 
 /*
  * DRIVER_NAME identifies the snvme control/char-device subsystem in log

@@ -113,7 +113,7 @@ target_link_libraries(nvmeservice
         protobuf::libprotobuf
     PRIVATE
         libnvm
-        CUDA::cudart
+        ${TUTTI_ACCEL_RUNTIME_LIBS}
         Threads::Threads
         ${TUTTI_YAML_CPP_TARGET}
 )

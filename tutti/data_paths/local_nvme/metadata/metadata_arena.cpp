@@ -2,7 +2,7 @@
 
 #include "tutti/data_paths/local_nvme/metadata/metadata_arena.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 #include <nvm_types.h>
 #include <nvm_dma.h>
 

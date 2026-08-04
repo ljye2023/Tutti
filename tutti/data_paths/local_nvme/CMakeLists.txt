@@ -9,7 +9,7 @@
 #   - tutti_local_file_binding + tutti_local_file_resolver (PUBLIC: header deps)
 #   - tutti_spi (transitively via binding/resolver)
 #
-# CUDA::cudart is PRIVATE: only .cpp/.cu sources need it; the header
+# ${TUTTI_ACCEL_RUNTIME_LIBS} is PRIVATE: only .cpp/.cu sources need it; the header
 # uses void* for CUDA types.
 #
 # Does NOT propagate to tutti_api / tutti_spi / install public headers.
@@ -18,6 +18,8 @@ add_library(tutti_local_nvme_datapath
     local_nvme_data_path.cpp
     metadata/metadata_arena.cpp
     metadata/prp_page_cache.cpp
+    metadata/desc_pool.cpp
+    metadata/prp_buf_pool.cpp
     io/nvme_queue_group.cu
     io/device_target.cu
     io/submit_one.cu
@@ -47,5 +49,5 @@ target_link_libraries(tutti_local_nvme_datapath
         tutti_local_file_resolver
         libnvm
     PRIVATE
-        CUDA::cudart
+        ${TUTTI_ACCEL_RUNTIME_LIBS}
 )

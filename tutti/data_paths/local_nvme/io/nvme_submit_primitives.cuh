@@ -22,6 +22,8 @@
 
 #include <cstdint>
 
+#include "tutti/data_paths/local_nvme/io/tutti_gpu_primitives.cuh"
+
 namespace tutti::data_paths::local_nvme {
 
 // -------------------------------------------------------------------------
@@ -64,15 +66,15 @@ namespace tutti::data_paths::local_nvme {
 
 class QueueAcquireHelper {
 public:
-    __device__ __forceinline__
+    TUTTI_DEVICE TUTTI_FORCEINLINE
     static std::uint32_t acquire_queue(std::uint32_t num_queues) {
-        return (blockDim.x * 32u + threadIdx.x) % num_queues;
+        return (TUTTI_BLOCK_DIM_X * 32u + TUTTI_THREAD_IDX_X) % num_queues;
     }
 
-    __device__ __forceinline__
+    TUTTI_DEVICE TUTTI_FORCEINLINE
     static void release_queue(std::uint32_t /*queue_idx*/) {}
 
-    __device__ __forceinline__
+    TUTTI_DEVICE TUTTI_FORCEINLINE
     static void issue_nvme_cmd(QueuePair* qp,
                                std::uint64_t  prp1,
                                std::uint64_t  prp2,
@@ -116,7 +118,7 @@ public:
 // multiple extents.
 // -------------------------------------------------------------------------
 
-__device__ __forceinline__
+TUTTI_DEVICE TUTTI_FORCEINLINE
 bool try_lba_extent(const DeviceLbaExtent& ext,
                     std::uint64_t          ext_start,
                     std::uint64_t          want_blk_first,
@@ -135,7 +137,7 @@ bool try_lba_extent(const DeviceLbaExtent& ext,
     return false;
 }
 
-__device__ __forceinline__
+TUTTI_DEVICE TUTTI_FORCEINLINE
 bool resolve_lba(const DeviceTargetHandle* h,
                  std::uint64_t             logical_off,
                  std::uint64_t             nbytes,
@@ -193,7 +195,7 @@ bool resolve_lba(const DeviceTargetHandle* h,
 // issue SQE + bounded CQ poll.  Writes EntryCompletionStatus.
 // -------------------------------------------------------------------------
 
-__device__ __forceinline__
+TUTTI_DEVICE TUTTI_FORCEINLINE
 void submit_read_one(const DeviceTargetHandle* h,
                      std::uint64_t              prp1,
                      std::uint64_t              prp2,
@@ -235,7 +237,7 @@ void submit_read_one(const DeviceTargetHandle* h,
     if (status) { status->nvme_status_dword3 = status_dword3; }
 }
 
-__device__ __forceinline__
+TUTTI_DEVICE TUTTI_FORCEINLINE
 void submit_write_one(const DeviceTargetHandle* h,
                       std::uint64_t              prp1,
                       std::uint64_t              prp2,

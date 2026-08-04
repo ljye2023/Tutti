@@ -71,7 +71,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include "tutti/data_paths/local_nvme/metadata/gpu_slot_pool.h"
 #include "tutti/data_paths/local_nvme/metadata/host_slot_pool.h"

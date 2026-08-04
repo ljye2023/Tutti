@@ -104,7 +104,7 @@ using tutti::data_paths::local_nvme::AddressDescriptor;
 // to multiple devices' doorbells concurrently (warp-level parallelism).
 // Completion is a single kernel exit = single event = single stream fence.
 // -------------------------------------------------------------------------
-__global__
+TUTTI_GLOBAL
 void fused_submit_kernel(const StripedDeviceSubmitEntry* entries,
                          EntryCompletionStatus*          status,
                          const DeviceTargetHandle* const* dev_table,
@@ -113,7 +113,7 @@ void fused_submit_kernel(const StripedDeviceSubmitEntry* entries,
                          std::uint32_t                   cq_poll_budget,
                          std::uint32_t                   inject_flag)
 {
-    const std::uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const std::uint32_t tid = TUTTI_THREAD_IDX_X + TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X;
     if (tid >= count) return;
 
     const StripedDeviceSubmitEntry e = entries[tid];

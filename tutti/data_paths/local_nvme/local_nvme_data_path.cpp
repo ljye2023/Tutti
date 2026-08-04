@@ -8,7 +8,7 @@
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 #include <nvm_types.h>
 
 #include <algorithm>
@@ -304,6 +304,9 @@ Status LocalNvmeDataPath::initialize(const DataPathConfig& config,
             // PRP-list page capacity: max data pages expressable in one PRP-list page.
             const std::uint64_t page_size = static_cast<std::uint64_t>(ctrl_->page_size);
             prp_list_page_capacity_ = page_size / sizeof(std::uint64_t) + 1;
+
+            // R19 S3b: initialize the host-pinned PRP buffer pool.
+            prp_buf_pool_.init(ctrl_, page_size);
 
             std::uint64_t mdts_pages = effective_mdts_bytes_ / page_size;
             if (mdts_pages > prp_list_page_capacity_) {
@@ -906,34 +909,52 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
     }
     const bool needs_prp_list = pages_per_io > 2;
 
+    // R19 S3b REQUIRED 2: fail-closed for MDTS > 128KiB.
+    // h_prp_slot has 32 entries (256B / 8B). pages_per_io - 1 entries
+    // are needed; if > 32, the slot overflows.
+    if (needs_prp_list && pages_per_io - 1 > 32) {
+        status_msg = "MDTS > 128KiB: pages_per_io=" +
+                     std::to_string(pages_per_io) +
+                     " exceeds 256B sub-page packing capacity (max 33 pages)";
+        return false;
+    }
+
     // Stage 3: validate alignment (already checked 64KiB in register_memory)
     // Skip — alignment is validated upstream.
 
-    // Stage 4: allocate PRP-list buf if needed (legacy stage 5)
-    nvm_dma_t* prp_list_dma = nullptr;
-    void* d_prp_pages = nullptr;
+    // Stage 4: allocate PRP-list pages from the host-pinned pool (R19 S3b).
+    //
+    // R19 S3 REQUIRED 1: Instead of one 4KiB page per slice, pack 16
+    // slices' PRP lists into each 4KiB page at 256B granularity.
+    // R19 S3b REQUIRED 1: Instead of per-registration nvm_dma_map_data_host,
+    // sub-allocate from a DataPath-level pool (one big nvm_dma_map per segment).
+    //
+    // PRP2 for slice s = pool_segment->ioaddrs[base_page + s / SLOTS_PER_PAGE]
+    //                     + (s % SLOTS_PER_PAGE) * PRP_SLOT_BYTES
+    // The NVMe controller reads from this IOVA via PCIe DMA.
+    //
+    // SLOTS_PER_PAGE and SLOT_BYTES are now dynamic (page_size-aware).
+    const std::uint64_t PRP_SLOT_BYTES = 256;
+    const std::uint64_t PRP_SLOTS_PER_PAGE = page_size / PRP_SLOT_BYTES;  // 16 for 4KiB
+    PrpBufRef prp_buf_ref;
     std::uint64_t num_prp_pages = 0;
     if (needs_prp_list) {
-        num_prp_pages = num_slices;  // one PRP-list page per slice
-        const std::uint64_t prp_buf_size = num_prp_pages * page_size;
-        int rc = nvm_dma_map_data_host(&prp_list_dma, ctrl_,
-                                       nullptr,  // let libnvm allocate
-                                       static_cast<size_t>(prp_buf_size));
-        if (rc != 0 || !prp_list_dma) {
-            status_msg = "nvm_dma_map_data_host for PRP-list failed: rc " +
-                         std::to_string(rc);
+        num_prp_pages = (num_slices + PRP_SLOTS_PER_PAGE - 1) / PRP_SLOTS_PER_PAGE;
+        prp_buf_ref = prp_buf_pool_.alloc_pages(num_prp_pages);
+        if (!prp_buf_ref.valid) {
+            status_msg = "PrpBufPool::alloc_pages failed (nvm_dma_map_data_host"
+                         " segment growth failed?)";
             return false;
         }
-        d_prp_pages = prp_list_dma->vaddr;
     }
 
-    // Stage 5-6: fill address descriptors + PRP-list pages
+    // Stage 5-6: fill address descriptors + PRP-list pages (sub-page packed)
     const std::uint64_t total_descs = num_slices;  // 1 desc per slice (1 sub-IO per slice)
     // Actually: ios_per_slice = 1 (each slice = one sub-IO of bytes_per_slice)
     // because granularity = min(io_granularity, MDTS) → each sub-IO ≤ MDTS.
     // So total_descs = num_slices, 1:1.
     std::vector<AddressDescriptor> h_descs(total_descs);
-    std::vector<std::uint64_t> h_prp_page(page_size / sizeof(std::uint64_t), 0);
+    std::vector<std::uint64_t> h_prp_slot(PRP_SLOT_BYTES / sizeof(std::uint64_t), 0);
 
     for (std::uint64_t s = 0; s < num_slices; ++s) {
         const std::uint64_t start_page = s * pages_per_io;
@@ -946,112 +967,67 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
         } else if (pages_per_io == 2) {
             d.prp2 = reg.dma->ioaddrs[start_page + 1];
         } else {
-            // PRP LIST: fill page with ioaddrs[start_page+1 .. +pages_per_io-1]
+            // PRP LIST: fill slot with ioaddrs[start_page+1 .. +pages_per_io-1]
+            std::fill(h_prp_slot.begin(), h_prp_slot.end(), 0);
             for (std::uint64_t p = 0; p < pages_per_io - 1; ++p)
-                h_prp_page[p] = reg.dma->ioaddrs[start_page + 1 + p];
-            // prp2 = IOVA of the PRP-list page for this slice
-            d.prp2 = prp_list_dma->ioaddrs[s];
-            // Copy page content to the PRP-list buffer
-            std::memcpy(static_cast<char*>(d_prp_pages) + s * page_size,
-                        h_prp_page.data(), page_size);
+                h_prp_slot[p] = reg.dma->ioaddrs[start_page + 1 + p];
+            // prp2 = IOVA of this slice's sub-page slot within the packed page.
+            // Slice s uses page (base_page + s / SLOTS_PER_PAGE) at byte
+            // offset (s % SLOTS_PER_PAGE) * PRP_SLOT_BYTES within the pool segment.
+            d.prp2 = prp_buf_ref.segment->ioaddrs[prp_buf_ref.base_page + s / PRP_SLOTS_PER_PAGE] +
+                     (s % PRP_SLOTS_PER_PAGE) * PRP_SLOT_BYTES;
+            // Copy slot content to the PRP-list DMA buffer (pool segment's vaddr)
+            std::memcpy(static_cast<char*>(prp_buf_ref.segment->vaddr) +
+                            (prp_buf_ref.base_page + s / PRP_SLOTS_PER_PAGE) * page_size +
+                            (s % PRP_SLOTS_PER_PAGE) * PRP_SLOT_BYTES,
+                        h_prp_slot.data(), PRP_SLOT_BYTES);
         }
     }
 
-    // Stage 7: upload descriptors to GPU
-    void* d_descs = nullptr;
-    cudaError_t ce = cudaMalloc(&d_descs, total_descs * sizeof(AddressDescriptor));
-    if (ce != cudaSuccess) {
-        status_msg = std::string("cudaMalloc d_descs failed: ") + cudaGetErrorString(ce);
-        if (prp_list_dma) nvm_dma_unmap(prp_list_dma);
+    // Stage 7: allocate descriptors from the GPU pool (R19 S3 REQUIRED 3).
+    // Previously: per-registration cudaMalloc — at 1.47M registrations this
+    // caused minute-level latency. Now: sub-allocate from a DataPath-level
+    // bump pool (segments grow as needed, freed on DataPath shutdown).
+    void* d_descs = desc_pool_.alloc(total_descs * sizeof(AddressDescriptor));
+    if (!d_descs) {
+        status_msg = "DescPool::alloc failed (cudaMalloc segment growth failed?)";
+        // prp_buf_ref is pool-managed — no per-registration free needed.
         return false;
     }
-    ce = cudaMemcpy(d_descs, h_descs.data(),
+    cudaError_t ce = cudaMemcpy(d_descs, h_descs.data(),
                     total_descs * sizeof(AddressDescriptor),
                     cudaMemcpyHostToDevice);
     if (ce != cudaSuccess) {
         status_msg = std::string("cudaMemcpy d_descs failed: ") + cudaGetErrorString(ce);
-        cudaFree(d_descs);
-        if (prp_list_dma) nvm_dma_unmap(prp_list_dma);
+        // d_descs and prp_buf_ref are pool-managed — no per-registration free.
         return false;
     }
 
-    // Stage 8: upload PRP-list pages to GPU (if needed)
-    void* d_prp_gpu = nullptr;
-    if (needs_prp_list) {
-        ce = cudaMalloc(&d_prp_gpu, num_prp_pages * page_size);
-        if (ce != cudaSuccess) {
-            status_msg = std::string("cudaMalloc d_prp_pages failed: ") + cudaGetErrorString(ce);
-            cudaFree(d_descs);
-            nvm_dma_unmap(prp_list_dma);
-            return false;
-        }
-        ce = cudaMemcpy(d_prp_gpu, d_prp_pages,
-                        num_prp_pages * page_size, cudaMemcpyHostToDevice);
-        if (ce != cudaSuccess) {
-            status_msg = std::string("cudaMemcpy d_prp_pages failed: ") + cudaGetErrorString(ce);
-            cudaFree(d_prp_gpu);
-            cudaFree(d_descs);
-            nvm_dma_unmap(prp_list_dma);
-            return false;
-        }
-        // d_prp_pages from nvm_dma_map_data_host is host visible; we've
-        // copied to d_prp_gpu (device). But prp2 in the descriptor points
-        // to prp_list_dma->ioaddrs[s] (the host buffer's IOVA), not d_prp_gpu.
-        // In legacy, the PRP-list page lives in the nvm_dma buffer and the
-        // GPU accesses it via P2P. So we keep prp_list_dma and don't need
-        // d_prp_gpu separately — the data is already accessible via the
-        // nvm_dma's IOVA. But we need the content in the nvm_dma buffer,
-        // which we already wrote above.
-        // Actually: the GPU reads PRP-list pages via the controller's DMA
-        // engine (PCIe), not via GPU global memory. So the pages must be
-        // in the nvm_dma buffer (host-pinned or GPU), and prp2 points to
-        // the IOVA of that buffer. We already wrote content to d_prp_pages
-        // (the nvm_dma vaddr). So we can free d_prp_gpu.
-        cudaFree(d_prp_gpu);
-        d_prp_gpu = d_prp_pages;  // point to nvm_dma buffer (accessible via IOVA)
-    }
+    // Stage 8 (R19 S3 REQUIRED 2): d_prp_gpu removed.
+    // Previously: cudaMalloc'd a GPU copy of PRP pages, cudaMemcpy'd,
+    // then cudaFree'd — all wasted work. The NVMe controller reads PRP
+    // lists from the host-pinned nvm_dma buffer's IOVA (via PCIe DMA),
+    // not from GPU global memory. prp2 points to the IOVA, the controller
+    // fetches entries directly. No GPU-side PRP page copy needed.
 
-    // Stage 9: build slice views (host-side index, stored in MemReg::prebuilt)
+    // Stage 9: store in MemReg::prebuilt
     reg.prebuilt.d_descs = d_descs;
     reg.prebuilt.num_descs = total_descs;
     reg.prebuilt.bytes_per_slice = bytes_per_slice;
     reg.prebuilt.ios_per_slice = 1;  // 1 sub-IO per slice
-    reg.prebuilt.d_prp_pages = d_prp_pages;
+    reg.prebuilt.prp_buf_ref = prp_buf_ref;  // pool-managed; freed on shutdown
     reg.prebuilt.num_prp_pages = num_prp_pages;
     reg.prebuilt.valid = true;
-
-    // Keep prp_list_dma alive — we need its ioaddrs for the lifetime of
-    // the registration.  Store it in the MemReg (we reuse d_prp_pages field
-    // which already points to prp_list_dma->vaddr).
-    // Note: we intentionally leak prp_list_dma's ownership into the MemReg;
-    // destroy_prebuilt_descriptors_ will unmap it.
-    // (We store the raw pointer in a side field — but MemReg doesn't have
-    // one.  For now, since d_prp_pages == prp_list_dma->vaddr, and we
-    // need the dma for unmap, store it in the unused num_prp_pages field
-    // as a pointer cast.  This is a hack — TODO: add prp_list_dma field.)
-    // Actually, let's just add the field to MemReg::PrebuiltDesc.
-    // But that requires editing the header again.  For now, since the
-    // PRP-list DMA is owned by the nvm_dma buffer and we need to unmap
-    // it later, we'll track it via a static map.  This is acceptable
-    // for a first implementation.
-    // → Better: just store it in the existing MemReg by casting.
-    // For simplicity, let's just not free prp_list_dma on unregister
-    // for now — it's a host buffer that gets cleaned up on process exit.
-    // TODO: proper cleanup in destroy_prebuilt_descriptors_.
-
-    (void)prp_list_dma;  // keep alive; cleanup TODO
     return true;
 }
 
 void LocalNvmeDataPath::destroy_prebuilt_descriptors_(MemReg& reg) {
-    if (reg.prebuilt.d_descs) {
-        cudaFree(reg.prebuilt.d_descs);
-        reg.prebuilt.d_descs = nullptr;
-    }
-    // Note: d_prp_pages points to nvm_dma buffer vaddr; it's not cudaMalloc'd.
-    // The nvm_dma is not separately tracked here (TODO: add field).
-    // For now, the PRP-list DMA leaks on unregister — acceptable for
-    // process-lifetime testing.  Production would need a prp_list_dma field.
+    // R19 S3 REQUIRED 3: d_descs is pool-managed — do NOT cudaFree.
+    // R19 S3b REQUIRED 1: prp_buf_ref is pool-managed — do NOT nvm_dma_unmap.
+    // Both pools reclaim memory on DataPath shutdown.
+    // Setting to nullptr/false prevents accidental use after unregister.
+    reg.prebuilt.d_descs = nullptr;
+    reg.prebuilt.prp_buf_ref = {};
     reg.prebuilt.valid = false;
 }
 

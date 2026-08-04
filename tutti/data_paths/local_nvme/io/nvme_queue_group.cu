@@ -11,7 +11,7 @@
 #include <nvm_error.h>        // nvm_strerror
 #include <ioctl.h>            // nvm_ioctl_add_user_queue, NVM_MAX_QUEUES_PER_GROUP
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <algorithm>
 #include <cmath>

@@ -15,7 +15,7 @@
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
 #include "tutti/resolvers/local_file/resolver.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 #include <nvm_types.h>
 
 #include <cstdio>
@@ -46,14 +46,32 @@ static int g_fail = 0;
 static tutti::resolvers::local_file::BackingDeviceConfig
 resolver_backing_config() {
     const char* configured = std::getenv("TUTTI_RESOLVER_BACKING_DEVICE");
-    return tutti::resolvers::local_file::BackingDeviceConfig{
-        configured && configured[0] ? configured : "/dev/snvme0n1", 0};
+    if (configured && configured[0]) {
+        return tutti::resolvers::local_file::BackingDeviceConfig{configured, 0};
+    }
+    // Round 20 S1: backing device follows TUTTI_TEST_GPU.
+    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
+    int g = gpu_env ? std::atoi(gpu_env) : 0;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "/dev/snvme%dn1", g);
+    return tutti::resolvers::local_file::BackingDeviceConfig{buf, 0};
+}
+
+// Round 20 S1: PCI address follows TUTTI_TEST_GPU (GPU i ↔ NVMe i BDF).
+static const char* pci_addr_for_test_gpu() {
+    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
+    int g = gpu_env ? std::atoi(gpu_env) : 0;
+    static const char* kAddrs[4] = {
+        "0000:08:00.0", "0000:4b:00.0", "0000:57:00.0", "0000:63:00.0"
+    };
+    if (g < 0 || g > 3) g = 0;
+    return kAddrs[g];
 }
 
 static tutti::resolvers::local_file::LocalFileResolver
 make_local_file_resolver() {
     return tutti::resolvers::local_file::LocalFileResolver(
-        "0000:08:00.0", 1, 4096, resolver_backing_config());
+        pci_addr_for_test_gpu(), 1, 4096, resolver_backing_config());
 }
 
 // Helper: allocate a 64 KiB-aligned GPU buffer.
@@ -101,7 +119,13 @@ static ResolvedFile make_resolved_file(const char* name,
                                         uint64_t size_bytes,
                                         unsigned char fill = 0xAB)
 {
-    static const char* kDir = "/mnt/nvme1/GPU0/resolver_test";
+    // Round 20 S1: mount path follows TUTTI_TEST_GPU (GPU i ↔ /mnt/nvme{i}).
+    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
+    int test_gpu = gpu_env ? std::atoi(gpu_env) : 0;
+    static char kDirBuf[64];
+    std::snprintf(kDirBuf, sizeof(kDirBuf),
+                  "/mnt/nvme%d/GPU%d/resolver_test", test_gpu, test_gpu);
+    const char* kDir = kDirBuf;
     ::mkdir(kDir, 0755);
     std::string path = std::string(kDir) + "/" + name;
 
@@ -145,10 +169,10 @@ static ResolvedFile make_resolved_file(const char* name,
 // -------------------------------------------------------------------------
 
 // Round 16 S3: Check how many NVMe devices are available (1..4).
-// /mnt/nvme1 always required; /mnt/nvme{2,3,4} optional.
+// /mnt/nvme0 always required; /mnt/nvme{1,2,3} optional.
 static int count_available_devices() {
-    int n = 1;  // /mnt/nvme1 is the primary, always required
-    for (int i = 2; i <= 4; ++i) {
+    int n = 1;  // /mnt/nvme0 is the primary, always required
+    for (int i = 1; i <= 3; ++i) {
         char path[32];
         std::snprintf(path, sizeof(path), "/mnt/nvme%d", i);
         struct stat st{};
@@ -291,36 +315,36 @@ private:
     std::vector<ResolvedTarget> inner_results_;  // keep payloads alive
 };
 
-// Helper: create a real file on device 0 (/mnt/nvme1).
+// Helper: create a real file on device 0 (/mnt/nvme0).
 static ResolvedFileOnDevice make_resolved_file_dev0(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0xAB)
 {
     return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme1", "0000:08:00.0", "/dev/snvme0n1");
+        name, size_bytes, fill, "/mnt/nvme0", "0000:08:00.0", "/dev/snvme0n1");
 }
 
-// Helper: create a real file on device 1 (/mnt/nvme2).
+// Helper: create a real file on device 1 (/mnt/nvme1).
 static ResolvedFileOnDevice make_resolved_file_dev1(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0xCD)
 {
     return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme2", "0000:4b:00.0", "/dev/snvme1n1");
+        name, size_bytes, fill, "/mnt/nvme1", "0000:4b:00.0", "/dev/snvme1n1");
 }
 
-// Round 16 S3: Helper: create a real file on device 2 (/mnt/nvme3).
+// Round 16 S3: Helper: create a real file on device 2 (/mnt/nvme2).
 static ResolvedFileOnDevice make_resolved_file_dev2(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0xEF)
 {
     return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme3", "0000:57:00.0", "/dev/snvme2n1");
+        name, size_bytes, fill, "/mnt/nvme2", "0000:57:00.0", "/dev/snvme2n1");
 }
 
-// Round 16 S3: Helper: create a real file on device 3 (/mnt/nvme4).
+// Round 16 S3: Helper: create a real file on device 3 (/mnt/nvme3).
 static ResolvedFileOnDevice make_resolved_file_dev3(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0x55)
 {
     return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme4", "0000:63:00.0", "/dev/snvme3n1");
+        name, size_bytes, fill, "/mnt/nvme3", "0000:63:00.0", "/dev/snvme3n1");
 }
 //
 // WARNING: extents use device_offset = 0 => start_lba = 0, which is the
@@ -746,10 +770,15 @@ int main() {
     if (test_gpu < 0 || test_gpu >= cuda_dev_count) test_gpu = 0;
     cudaSetDevice(test_gpu);
 
-    // Constants for the real device tests.
-    // bar0_size: from daemon's ListDevices (nvmeservice_daemon prints it).
-    // On this system, /dev/ssnvme0's BAR0 is 16384 bytes (0x4000).
-    const char* kSnvmeDevPath = "/dev/ssnvme0";
+    // Round 20 S1: ssnvme device + mount path follow TUTTI_TEST_GPU
+    // (GPU i ↔ NVMe i ↔ /dev/ssnvme{i} ↔ /mnt/nvme{i}).
+    char snvme_path[32];
+    std::snprintf(snvme_path, sizeof(snvme_path),
+                  "/dev/ssnvme%d", test_gpu);
+    const char* kSnvmeDevPath = snvme_path;
+    char mount_dir[64];
+    std::snprintf(mount_dir, sizeof(mount_dir),
+                  "/mnt/nvme%d/GPU%d/resolver_test", test_gpu, test_gpu);
     const std::uint32_t kBar0Size = 16384;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
 
@@ -1335,8 +1364,8 @@ int main() {
     // =====================================================================
     TEST_CASE("26. E2E 4KiB write/read/verify");
     {
-        const char* kMountDir = "/mnt/nvme1/GPU0/resolver_test";
-        const char* kTestFile = "/mnt/nvme1/GPU0/resolver_test/round8_e2e.bin";
+        const char* kMountDir = "/mnt/nvme0/GPU0/resolver_test";
+        const char* kTestFile = "/mnt/nvme0/GPU0/resolver_test/round8_e2e.bin";
 
         // Create test directory + file.
         ::mkdir(kMountDir, 0755);
@@ -1773,8 +1802,8 @@ int main() {
         // Resolve a real file instead so the write lands inside the
         // file's own extent.
         const char* kInflightFile =
-            "/mnt/nvme1/GPU0/resolver_test/round8_inflight.bin";
-        ::mkdir("/mnt/nvme1/GPU0/resolver_test", 0755);
+            "/mnt/nvme0/GPU0/resolver_test/round8_inflight.bin";
+        ::mkdir("/mnt/nvme0/GPU0/resolver_test", 0755);
         {
             int fd = ::open(kInflightFile, O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
             if (fd >= 0) {
@@ -3433,7 +3462,7 @@ int main() {
         LocalNvmeDataPath dp = make_qg_dp();
         CHECK(init_dp(dp).ok(), "initialize");
 
-        const std::string dir = "/mnt/nvme1/GPU0/resolver_test";
+        const std::string dir = "/mnt/nvme0/GPU0/resolver_test";
         const std::string pathA = dir + "/round8_t48A.bin";
         const std::string pathB = dir + "/round8_t48B.bin";
         ::mkdir(dir.c_str(), 0755);
@@ -6514,7 +6543,7 @@ int main() {
     // N LocalNvmeDataPath instances (snvme0..snvme{N-1}) through one
     // StorageRuntime with device-specific DataPath keys.
     //
-    // Round 16 S3: 设备数从 2 扩展为 up-to-4（/mnt/nvme1-4）。
+    // Round 16 S3: 设备数从 2 扩展为 up-to-4（/mnt/nvme0-3）。
     // 78 uses 2 devices, 79 covers 4 devices, 80 >=2 devices, 81 >=3.
     // =====================================================================
 
@@ -6522,7 +6551,7 @@ int main() {
     if (num_avail < 2) {
         printf("--- 78-81. Multi-device (SKIP: <2 NVMe devices) ---\n");
         printf("  SKIP: only %d device(s) available\n", num_avail);
-        printf("  To enable: mount /dev/snvme{1,2,3}n1 at /mnt/nvme{2,3,4}\n");
+        printf("  To enable: mount /dev/snvme{1,2,3}n1 at /mnt/nvme{1,2,3}\n");
         goto next_multi_device;
     }
     printf("--- 78-81. Multi-device (%d devices available) ---\n", num_avail);
@@ -7160,14 +7189,14 @@ int main() {
         runtime->shutdown(1);
 
         // Clean up all test files on both devices.
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t72_dev0.bin");
-        ::unlink("/mnt/nvme2/GPU0/resolver_test/round15_t72_dev1.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t73_dev0.bin");
-        ::unlink("/mnt/nvme2/GPU0/resolver_test/round15_t73_dev1.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t74_dev0.bin");
-        ::unlink("/mnt/nvme2/GPU0/resolver_test/round15_t74_dev1.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t75_dev0.bin");
-        ::unlink("/mnt/nvme2/GPU0/resolver_test/round15_t75_dev1.bin");
+        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t72_dev0.bin");
+        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t72_dev1.bin");
+        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t73_dev0.bin");
+        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t73_dev1.bin");
+        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t74_dev0.bin");
+        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t74_dev1.bin");
+        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t75_dev0.bin");
+        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t75_dev1.bin");
     }
 
     // =====================================================================

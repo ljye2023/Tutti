@@ -60,7 +60,8 @@ target_include_directories(libnvm
 
 target_link_libraries(libnvm
     PUBLIC
-        CUDA::cudart
+        tutti_cuda_like
+        ${TUTTI_ACCEL_RUNTIME_LIBS}
         Threads::Threads
 )
 

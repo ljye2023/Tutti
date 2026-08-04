@@ -95,7 +95,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 namespace tutti::data_paths::local_nvme {
 

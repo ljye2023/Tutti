@@ -13,7 +13,6 @@ add_executable(tutti_local_nvme_datapath_contract_test
 
 target_link_libraries(tutti_local_nvme_datapath_contract_test PRIVATE
     tutti_local_nvme_datapath
-    CUDA::cudart
 )
 
 set_target_properties(tutti_local_nvme_datapath_contract_test PROPERTIES

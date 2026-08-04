@@ -209,6 +209,18 @@ public:
                        std::to_string(ns_.block_size) + ")"));
         }
 
+        // 5.5 Pre-stat: reject non-regular files with INVALID_ARGUMENT before
+        // the O_DIRECT open. (open(dir, O_DIRECT) fails EINVAL on ext4, which
+        // would surface as DEVICE_ERROR and mask the intended semantics.)
+        {
+            struct stat pre_st{};
+            if (::stat(path.data(), &pre_st) == 0 && !S_ISREG(pre_st.st_mode)) {
+                return Result<ResolvedTarget>::Failure(
+                    Status(StatusCode::INVALID_ARGUMENT,
+                           "not a regular file: " + std::string(path)));
+            }
+        }
+
         // 6. Open the file read-only. Project policy: ALL file opens carry
         // O_DIRECT (no page-cache pollution; harmless for FIEMAP-only use).
         int fd = ::open(std::string(path).c_str(), O_RDONLY | O_DIRECT);

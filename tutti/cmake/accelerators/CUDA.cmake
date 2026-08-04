@@ -31,3 +31,11 @@ function(tutti_configure_cuda_like target_name)
         CUDA::cuda_driver
     )
 endfunction()
+
+# Per-vendor runtime/driver libraries that downstream CMakeLists link via
+# ${TUTTI_ACCEL_RUNTIME_LIBS} / ${TUTTI_ACCEL_DRIVER_LIBS}.  This decouples
+# downstream targets from the vendor-specific target name (CUDA::cudart,
+# MUSA equivalent, etc.) and lets MUSA/MACA profiles fill in their own libs
+# without touching every CMakeLists.txt.
+set(TUTTI_ACCEL_RUNTIME_LIBS "CUDA::cudart" CACHE INTERNAL "Vendor runtime lib")
+set(TUTTI_ACCEL_DRIVER_LIBS  "CUDA::cuda_driver" CACHE INTERNAL "Vendor driver lib")

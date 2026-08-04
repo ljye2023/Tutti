@@ -1,0 +1,97 @@
+# ============================================================================
+# tutti_config.yaml -- application-level user configuration
+#
+# This file is consumed by the tutti_config loader (tutti/config/), which
+# translates it into a RuntimeComponents struct passed to
+# StorageRuntime::create().  The loader is a thin adapter — it does NOT
+# create DataPaths directly; it constructs them via the same public API
+# that programmatic callers use, so there is a single source of truth.
+#
+# Priority (highest wins):
+#   1. Programmatic injection (RuntimeComponents passed to StorageRuntime::create)
+#   2. This config file (via load_tutti_config)
+#   3. Built-in defaults in DataPath constructors
+#
+# The TUTTI_HANDLE_CACHE_CAP / TUTTI_PRP_CACHE_CAP environment variables are
+# TEST-ONLY backdoors.  When the loader is given an explicit value (or the
+# config file sets one), the env var does NOT take effect.  Env vars only
+# apply when the config file omits the key AND no programmatic override is
+# provided.
+#
+# queue_depth is NOT a key here — ring depth is kernel-authoritative
+# (kernel module parameter io_queue_depth; see sys_config.yaml docs).
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# GPU vendor (determines which accelerator profile to activate).
+#   nvidia  — CUDA profile (default)
+#   amd     — ROCm/HIP profile (placeholder, not yet implemented)
+# ---------------------------------------------------------------------------
+gpu:
+  vendor: nvidia
+
+# ---------------------------------------------------------------------------
+# Storage backend selection.
+#   local-nvme  — direct NVMe via libnvm + snvme kernel module (default)
+#   rdma        — RDMA transport (placeholder, reports unimplemented)
+#
+# Default stripe unit for striped-local-nvme DataPath (bytes).
+#   0  = use DataPath default (512 KiB)
+#   N  = custom stripe unit (must be multiple of block_size and MDTS)
+# ---------------------------------------------------------------------------
+storage:
+  backend: local-nvme
+  default_stripe_unit: 524288   # 512 KiB
+
+# ---------------------------------------------------------------------------
+# Local NVMe DataPath tuning knobs.
+#
+#   handle_cache_capacity    L1 (GPU-resident) handle cache slots.
+#                            0 = OFF (default; every open rebuilds the
+#                            DeviceTargetHandle from scratch).
+#                            KV-cache workloads should set this to the
+#                            number of concurrently-open files per GPU.
+#
+#   prp_cache_capacity       L1 PRP page cache slots (content-addressed).
+#                            0 = OFF (default; PRP lists rebuilt per IO).
+#                            KV-cache workloads should set this to the
+#                            number of distinct PRP-list shapes.
+#
+#   handle_cache_l2_capacity L2 (host-pinned) handle cache slots.
+#                            0 = 4×L1 when L1 is enabled (default).
+#                            Set explicitly to control the L2 tier.
+#
+#   max_in_flight_operations Max concurrent IO operations in flight per
+#                            DataPath.  0 = default (16).
+#
+#   max_batch_entries        Max entries per batch submit.  0 = default (256).
+#
+#   num_user_queues          User queue pairs per NVMe device.  0 = default (16).
+#                            Capped by kernel module's max_queues_per_group
+#                            (currently 16).
+#
+#   io_granularity           IO granularity hint for registration-time PRP
+#                            pre-build.  0 = dynamic (default;
+#                            PRP built per-IO).  >0 = pre-build at
+#                            register_memory when granularity matches.
+#                            KV-cache workloads: set to tensor/chunk size
+#                            (e.g. 524288 for 512 KiB).
+# ---------------------------------------------------------------------------
+local_nvme:
+  handle_cache_capacity: 0
+  prp_cache_capacity: 0
+  handle_cache_l2_capacity: 0
+  max_in_flight_operations: 0
+  max_batch_entries: 0
+  num_user_queues: 0
+  io_granularity: 0
+
+# ---------------------------------------------------------------------------
+# Link to the local-NVMe deployment fact file (topology single source of
+# truth, shared with the daemon).  The loader derives the CUDA device ↔
+# ssnvme device map from its nvmes[] entries (array order = device_id =
+# ssnvme minor; allowed_gpus picks the CUDA device).  Resolved relative to
+# THIS file's directory.  When the key is absent or the file missing, the
+# loader falls back to a single-device default (/dev/ssnvme0, CUDA device 0).
+# ---------------------------------------------------------------------------
+local_nvme_config: local_nvme_config.yaml

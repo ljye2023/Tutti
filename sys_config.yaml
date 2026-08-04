@@ -73,25 +73,29 @@ gpus:
 # ---------------------------------------------------------------------------
 nvmes:
   - pci_addr: "0000:08:00.0"      # NVMe #0 -> daemon device_id=0
+    mount_path: "/mnt/nvme0"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_gpus: [0]
+    auto_mount: true              # R17 S1: daemon mounts at startup, umounts at shutdown
+  - pci_addr: "0000:4b:00.0"      # NVMe #1 -> daemon device_id=1
     mount_path: "/mnt/nvme1"
     namespace_id: 1
     kernel_ioq_cap: 32
     allowed_gpus: [0]
-  - pci_addr: "0000:4b:00.0"      # NVMe #1 -> daemon device_id=1
+    auto_mount: true
+  - pci_addr: "0000:57:00.0"      # NVMe #2 -> daemon device_id=2
     mount_path: "/mnt/nvme2"
     namespace_id: 1
     kernel_ioq_cap: 32
     allowed_gpus: [0]
-  - pci_addr: "0000:57:00.0"      # NVMe #2 -> daemon device_id=2
+    auto_mount: true
+  - pci_addr: "0000:63:00.0"      # NVMe #3 -> daemon device_id=3
     mount_path: "/mnt/nvme3"
     namespace_id: 1
     kernel_ioq_cap: 32
     allowed_gpus: [0]
-  - pci_addr: "0000:63:00.0"      # NVMe #3 -> daemon device_id=3
-    mount_path: "/mnt/nvme4"
-    namespace_id: 1
-    kernel_ioq_cap: 32
-    allowed_gpus: [0]
+    auto_mount: true
 # ---------------------------------------------------------------------------
 # Per-client allocation policy (daemon-side guidance, NOT a kernel ledger).
 #
@@ -120,3 +124,16 @@ queue_pool:
 lease:
   heartbeat_interval_sec: 10
   timeout_sec: 30
+
+# ---------------------------------------------------------------------------
+# Round 17 S1: auto-unmount retry policy.
+#
+# When the daemon receives SIGTERM/SIGINT and a mount returns EBUSY
+# (a process is still holding files open), it scans /proc to report
+# the holders (PID + comm + fd/maps/cwd), then retries after
+# interval_ms up to max times.  A second signal during the retry
+# loop forces an immediate exit (mounts left in place, reported).
+# ---------------------------------------------------------------------------
+unmount_retry:
+  interval_ms: 1000
+  max: 30

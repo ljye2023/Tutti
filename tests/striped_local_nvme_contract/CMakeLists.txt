@@ -18,7 +18,6 @@ target_link_libraries(tutti_striped_local_nvme_contract_test PRIVATE
     tutti_local_file_binding
     tutti_spi
     libnvm
-    CUDA::cudart
     Threads::Threads
 )
 

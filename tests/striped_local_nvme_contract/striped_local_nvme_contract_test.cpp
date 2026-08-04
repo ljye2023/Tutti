@@ -36,7 +36,7 @@
 #include "tutti/resolvers/local_file/resolver.h"
 #include "tutti/bindings/striped_local_nvme/binding.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <chrono>
 #include <cstdint>
@@ -82,7 +82,7 @@ static bool hw_available() {
         struct stat st{};
         if (::stat(dev, &st) != 0) return false;
         char mnt[32];
-        std::snprintf(mnt, sizeof(mnt), "/mnt/nvme%d", i + 1);
+        std::snprintf(mnt, sizeof(mnt), "/mnt/nvme%d", i);
         if (::stat(mnt, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
     }
     int dc = 0;
@@ -268,7 +268,7 @@ static std::unique_ptr<StripedEnv> make_env(std::uint32_t num_devices = 2) {
 // device mount list matching devs= query param for N devices.
 // Round 16 S3: extended for N=3,4.
 static std::string devs_param(std::uint32_t n) {
-    static const char* kMounts[] = {"/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme3", "/mnt/nvme4"};
+    static const char* kMounts[] = {"/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme3"};
     std::string s;
     for (std::uint32_t i = 0; i < n; ++i) {
         if (i) s += ",";
@@ -285,8 +285,8 @@ static int test_82_roundtrip(StripedEnv* env) {
     TEST_CASE("82. roundtrip (single-shard + cross-shard, position-dependent pattern)");
 
     const std::uint64_t shard_size = kStripeUnit * 16;  // 1 MiB/shard, 2 MiB total
-    std::string p0 = "/mnt/nvme1/striped/t82.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t82.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t82.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t82.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -377,8 +377,8 @@ static int test_83_single_launch(StripedEnv* env2, StripedEnv* env1) {
     auto run_for = [](StripedEnv* env, std::uint32_t n, const char* tag) -> bool {
         const std::uint64_t shard_size = kStripeUnit * 4;
         std::string name = std::string("t83_") + tag;
-        std::string p0 = "/mnt/nvme1/striped/" + name + ".shard0";
-        std::string p1 = "/mnt/nvme2/striped/" + name + ".shard1";
+        std::string p0 = "/mnt/nvme0/striped/" + name + ".shard0";
+        std::string p1 = "/mnt/nvme1/striped/" + name + ".shard1";
         if (!create_backing_file(p0, shard_size)) return false;
         if (n == 2 && !create_backing_file(p1, shard_size)) return false;
 
@@ -444,8 +444,8 @@ static int test_84_speedup(StripedEnv* env2, StripedEnv* env1) {
                     TargetHandle& target_out, void** raw_out, void** buf_out,
                     MemoryHandle& mem_out, std::string& p0_out, std::string& p1_out) -> bool {
         std::string name = std::string("t84_") + tag;
-        p0_out = "/mnt/nvme1/striped/" + name + ".shard0";
-        p1_out = "/mnt/nvme2/striped/" + name + ".shard1";
+        p0_out = "/mnt/nvme0/striped/" + name + ".shard0";
+        p1_out = "/mnt/nvme1/striped/" + name + ".shard1";
         if (!create_backing_file(p0_out, shard_size)) return false;
         if (n == 2 && !create_backing_file(p1_out, shard_size)) return false;
 
@@ -548,8 +548,8 @@ static int test_85_distribution(StripedEnv* env) {
     TEST_CASE("85. stripe distribution (round-robin verified in backing files)");
 
     const std::uint64_t shard_size = kStripeUnit * 8;
-    std::string p0 = "/mnt/nvme1/striped/t85.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t85.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t85.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t85.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -617,8 +617,8 @@ static int test_86_lifecycle(StripedEnv* env) {
     TEST_CASE("86. lifecycle (in-flight close BUSY, drain, clean teardown)");
 
     const std::uint64_t shard_size = kStripeUnit * 32;  // bigger, to keep IO in-flight briefly
-    std::string p0 = "/mnt/nvme1/striped/t86.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t86.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t86.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t86.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -691,8 +691,8 @@ static int test_87_full_public_path(StripedEnv* env) {
     TEST_CASE("87. full public path (zero striped-awareness at the call site)");
 
     const std::uint64_t shard_size = kStripeUnit * 4;
-    std::string p0 = "/mnt/nvme1/striped/t87.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t87.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t87.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t87.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -766,8 +766,8 @@ static int test_88_block_addressing(StripedEnv* env) {
     constexpr std::uint32_t kNumBlocks = 8;
     const std::uint64_t shard_size = kBlockSize * kNumBlocks / 2;  // per shard
 
-    std::string p0 = "/mnt/nvme1/striped/t88.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t88.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t88.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t88.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -850,8 +850,8 @@ static int test_89_restart_persistence() {
     TEST_CASE("89. restart persistence (new Runtime+Resolver+DataPath re-opens same URI)");
 
     const std::uint64_t shard_size = kStripeUnit * 8;
-    std::string p0 = "/mnt/nvme1/striped/t89.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t89.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t89.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t89.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -973,8 +973,8 @@ static int test_90_fault_partial_commit(StripedEnv* env) {
     TEST_CASE("90. fault semantics (illegal request rejected, others complete: partial commit)");
 
     const std::uint64_t shard_size = kStripeUnit * 4;
-    std::string p0 = "/mnt/nvme1/striped/t90.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t90.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t90.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t90.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -1081,8 +1081,8 @@ static int test_91_striped_unregister_inflight(StripedEnv* env) {
     TEST_CASE("91. striped op in-flight: unregister_memory returns BUSY");
 
     const std::uint64_t shard_size = kStripeUnit * 32;
-    std::string p0 = "/mnt/nvme1/striped/t91.shard0";
-    std::string p1 = "/mnt/nvme2/striped/t91.shard1";
+    std::string p0 = "/mnt/nvme0/striped/t91.shard0";
+    std::string p1 = "/mnt/nvme1/striped/t91.shard1";
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -1153,7 +1153,7 @@ static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     std::string paths[4];
     for (std::uint32_t i = 0; i < n; ++i) {
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t92.shard%d", i + 1, i);
+        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t92.shard%d", i, i);
         paths[i] = buf;
         if (!create_backing_file(paths[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(paths[j].c_str());
@@ -1223,7 +1223,7 @@ static int test_93_n4_distribution(StripedEnv* env4) {
     std::string paths[4];
     for (std::uint32_t i = 0; i < n; ++i) {
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t93.shard%d", i + 1, i);
+        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t93.shard%d", i, i);
         paths[i] = buf;
         if (!create_backing_file(paths[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(paths[j].c_str());
@@ -1277,7 +1277,7 @@ static int test_94_n4_speedup(StripedEnv* env4) {
     std::string p4[4];
     for (std::uint32_t i = 0; i < n4; ++i) {
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t94.shard%d", i + 1, i);
+        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t94.shard%d", i, i);
         p4[i] = buf;
         if (!create_backing_file(p4[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p4[j].c_str());
@@ -1361,7 +1361,7 @@ static int test_95_multi_target_batch(StripedEnv* env4) {
     // Target A: t95a
     std::string pa[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t95a.shard%d", i+1, i);
+        char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t95a.shard%d", i, i);
         pa[i] = buf;
         if (!create_backing_file(pa[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(pa[j].c_str());
@@ -1371,7 +1371,7 @@ static int test_95_multi_target_batch(StripedEnv* env4) {
     // Target B: t95b (different URI, different backing files)
     std::string pb[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t95b.shard%d", i+1, i);
+        char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t95b.shard%d", i, i);
         pb[i] = buf;
         if (!create_backing_file(pb[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(pb[j].c_str());
@@ -1491,7 +1491,7 @@ static int test_96_many_targets_batch(StripedEnv* env4) {
     for (std::uint32_t t = 0; t < n_targets && setup_ok; ++t) {
         std::string ps[4];
         for (std::uint32_t i = 0; i < n; ++i) {
-            char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t96_%u.shard%d", i+1, t, i);
+            char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t96_%u.shard%d", i, t, i);
             ps[i] = buf;
             if (!create_backing_file(ps[i], shard_size)) { setup_ok = false; break; }
         }
@@ -1609,13 +1609,13 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     std::string p0[4], p1[4];
     for (std::uint32_t i = 0; i < n; ++i) {
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t97a.shard%d", i+1, i);
+        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t97a.shard%d", i, i);
         p0[i] = buf;
         if (!create_backing_file(p0[i], shard_size * 4)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p0[j].c_str());
             CHECK(false, "create t97a"); return 1;
         }
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t97b.shard%d", i+1, i);
+        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t97b.shard%d", i, i);
         p1[i] = buf;
         if (!create_backing_file(p1[i], shard_size * 4)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p1[j].c_str());
@@ -1693,7 +1693,7 @@ int main() {
 
     if (!hw_available()) {
         std::printf("SKIP: hardware not available "
-                    "(need /mnt/nvme1-4 mounted + /dev/ssnvme0-3 + CUDA device)\n");
+                    "(need /mnt/nvme0-3 mounted + /dev/ssnvme0-3 + CUDA device)\n");
         return 77;
     }
     cudaSetDevice(test_gpu_id());
@@ -1758,10 +1758,10 @@ int main() {
     // test are not muddied by a still-live sibling instance in this process.
     rc |= test_89_restart_persistence();
 
+    rmdir("/mnt/nvme0/striped");
     rmdir("/mnt/nvme1/striped");
     rmdir("/mnt/nvme2/striped");
     rmdir("/mnt/nvme3/striped");
-    rmdir("/mnt/nvme4/striped");
 
     std::printf("\n=== Summary: %d passed, %d failed ===\n", g_pass, g_fail);
     if (rc != 0 || g_fail > 0) {

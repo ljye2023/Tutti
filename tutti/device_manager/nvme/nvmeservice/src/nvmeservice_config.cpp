@@ -39,6 +39,7 @@ void parse_nvmes(const YAML::Node& root, std::vector<NvmeEntry>& out) {
         e.mount_path     = get_or<std::string>(node, "mount_path",     "");
         e.namespace_id   = get_or<uint32_t>   (node, "namespace_id",   1u);
         e.kernel_ioq_cap = get_or<uint32_t>   (node, "kernel_ioq_cap", 0u);
+        e.auto_mount     = get_or<bool>        (node, "auto_mount",     true);  // Round 17 S1
 
         if (node["allowed_gpus"]) {
             for (const auto& g : node["allowed_gpus"]) {
@@ -66,6 +67,14 @@ void parse_lease(const YAML::Node& root, LeaseConfig& out) {
         get_or<uint32_t>(l, "timeout_sec", out.timeout_sec);
 }
 
+// Round 17 S1
+void parse_unmount_retry(const YAML::Node& root, UnmountRetryConfig& out) {
+    if (!root["unmount_retry"]) return;
+    const auto& u = root["unmount_retry"];
+    out.interval_ms = get_or<uint32_t>(u, "interval_ms", out.interval_ms);
+    out.max         = get_or<uint32_t>(u, "max",         out.max);
+}
+
 } // namespace
 
 std::optional<ServiceConfig> parse_config_file(const std::string& path,
@@ -79,6 +88,7 @@ std::optional<ServiceConfig> parse_config_file(const std::string& path,
         parse_nvmes(root, cfg.nvmes);
         parse_pool (root, cfg.queue_pool);
         parse_lease(root, cfg.lease);
+        parse_unmount_retry(root, cfg.unmount_retry);  // Round 17 S1
 
         if (std::string verr; !validate_config(cfg, &verr)) {
             if (error) *error = "validation failed: " + verr;
@@ -173,6 +183,11 @@ bool validate_config(const ServiceConfig& cfg, std::string* error) {
         cfg.lease.timeout_sec            == 0 ||
         cfg.lease.heartbeat_interval_sec >= cfg.lease.timeout_sec) {
         return emit("lease: heartbeat_interval_sec must be in (0, timeout_sec)");
+    }
+
+    // Round 17 S1: unmount_retry sanity.
+    if (cfg.unmount_retry.interval_ms == 0 || cfg.unmount_retry.max == 0) {
+        return emit("unmount_retry: interval_ms and max must both be > 0");
     }
 
     return true;

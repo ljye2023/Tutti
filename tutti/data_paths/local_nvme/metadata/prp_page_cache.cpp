@@ -4,7 +4,7 @@
 
 #include "tutti/data_paths/local_nvme/metadata/prp_page_cache.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 #include <nvm_dma.h>
 
 #include <cstdio>

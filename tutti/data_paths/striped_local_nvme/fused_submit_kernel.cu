@@ -6,7 +6,7 @@
 #include "tutti/data_paths/striped_local_nvme/fused_submit_kernel.cuh"
 
 #include <cstdlib>
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 namespace tutti::data_paths::striped_local_nvme {
 

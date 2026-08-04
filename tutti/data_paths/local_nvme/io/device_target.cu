@@ -5,7 +5,7 @@
 
 #include "tutti/data_paths/local_nvme/io/device_target.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 #include <cstdio>
 #include <cstring>

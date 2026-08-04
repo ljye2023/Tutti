@@ -13,7 +13,7 @@
 
 
 
-#include "cuda.h"
+#include <tutti/cuda_like.h>
 #include "nvm_util.h"
 #include "host_util.h"
 //#include <ctype>

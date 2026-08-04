@@ -9,7 +9,7 @@
 #include <cstdint>
 #include "buffer.h"
 #include "ctrl.h"
-#include "cuda.h"
+#include <tutti/cuda_like.h>
 #include "nvm_types.h"
 #include "nvm_util.h"
 #include "nvm_error.h"

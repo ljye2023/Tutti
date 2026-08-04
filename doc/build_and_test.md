@@ -131,6 +131,10 @@ sudo bash scripts/reset_snvme.sh            # unbind + rmmod + insmod
 # SIGKILL processes holding /dev/snvm*: scripts/reset_snvme.sh --force-cleanup
 ```
 
+> **`io_queue_depth`（生产必读）**：内核内置默认 64 是防呆值；**生产/性能测试必须用 1024**。`make insmod` 已默认携带 `io_queue_depth=1024`（可用 `make insmod IO_QDEPTH=64` 覆盖）。手动加载：
+> `sudo insmod snvme-core.ko && sudo insmod snvme.ko io_queue_depth=1024`。
+> 该参数在 probe 时定型（`q_depth = min(MQES+1, io_queue_depth)`），sysfs 写对已加载设备**无效**，必须 rmmod+insmod 才生效。验证：`cat /sys/module/snvme/parameters/io_queue_depth`。64 深度下 4 盘 striped 大 batch 会因 SQ 槽位不足出现 wait 超时。
+
 ---
 
 ## Step 3 — Build the test binaries

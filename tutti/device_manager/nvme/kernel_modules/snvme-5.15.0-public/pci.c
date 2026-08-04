@@ -36,7 +36,6 @@
 #include "map.h"
 #include "ioctl.h"
 #include "nvme.h"
-#include "nvfs-pci.h"
 #include "list.h"
 #include "ctrl.h"
 #include "peer_memory.h"

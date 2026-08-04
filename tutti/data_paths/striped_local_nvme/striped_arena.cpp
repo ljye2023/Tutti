@@ -2,7 +2,7 @@
 
 #include "tutti/data_paths/striped_local_nvme/striped_arena.h"
 
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 #include <nvm_types.h>
 #include <nvm_dma.h>
 

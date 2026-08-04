@@ -38,5 +38,5 @@ target_link_libraries(tutti_striped_local_nvme_datapath
         tutti_striped_file_resolver
         libnvm
     PRIVATE
-        CUDA::cudart
+        ${TUTTI_ACCEL_RUNTIME_LIBS}
 )

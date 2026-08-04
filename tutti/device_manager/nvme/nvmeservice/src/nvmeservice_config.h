@@ -87,6 +87,13 @@ struct NvmeEntry {
     // symlink installed.  Validator cross-checks each id against
     // gpus[].
     std::vector<int>    allowed_gpus;
+
+    // Round 17 S1: auto-mount this NVMe block device at mount_path on
+    // daemon startup (ext4, using mount(2)).  When true the daemon
+    // records that it owns the mount and will umount on shutdown.
+    // When false the daemon assumes the operator pre-mounted the
+    // device and never tries to umount.  Default true.
+    bool                auto_mount = true;
 };
 
 struct QueuePoolConfig {
@@ -99,12 +106,24 @@ struct LeaseConfig {
     uint32_t timeout_sec            = 30;
 };
 
+// Round 17 S1: auto-unmount retry policy on daemon shutdown.
+// When umount(2) returns EBUSY (a process is still holding files
+// open on the mount), the daemon scans /proc to report the holders,
+// then retries after interval_ms up to max times.  Receiving a
+// second SIGTERM/SIGINT during the retry loop forces an immediate
+// exit (mounts left in place, reported to the operator).
+struct UnmountRetryConfig {
+    uint32_t interval_ms = 1000;
+    uint32_t max          = 30;
+};
+
 struct ServiceConfig {
     GrpcConfig             grpc;
     std::vector<GpuEntry>  gpus;
     std::vector<NvmeEntry> nvmes;
     QueuePoolConfig        queue_pool;
     LeaseConfig            lease;
+    UnmountRetryConfig     unmount_retry;   // Round 17 S1
 };
 
 /**

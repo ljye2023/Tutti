@@ -1,6 +1,6 @@
 // fill_helper.cu — GPU kernel for DMA-visible buffer fills
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 __global__ void fill_pattern_kernel(unsigned char* buf, unsigned char val,
                                     std::uint64_t n) {

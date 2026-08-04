@@ -107,14 +107,14 @@ namespace tutti::data_paths::local_nvme {
 // has completed for every entry.
 // -------------------------------------------------------------------------
 
-__global__
+TUTTI_GLOBAL
 void submit_one_kernel(const DeviceSubmitEntry* entries,
                        EntryCompletionStatus*   status,
                        std::uint32_t            count,
                        std::uint32_t            cq_poll_budget,
                        std::uint32_t            inject_flag)
 {
-    const std::uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const std::uint32_t tid = TUTTI_THREAD_IDX_X + TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X;
     if (tid >= count) return;
 
     const DeviceSubmitEntry e = entries[tid];

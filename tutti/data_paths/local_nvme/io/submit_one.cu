@@ -8,7 +8,7 @@
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
 
 #include <cstdlib>
-#include <cuda_runtime.h>
+#include <tutti/cuda_like.h>
 
 namespace tutti::data_paths::local_nvme {
 
@@ -42,10 +42,10 @@ cudaError_t launch_submit_one(
 }
 
 // Fill kernel: writes val to the first n bytes of buf.
-__global__
+TUTTI_GLOBAL
 void fill_pattern_kernel(unsigned char* buf, unsigned char val, std::uint64_t n)
 {
-    std::uint64_t tid = threadIdx.x + (std::uint64_t)blockIdx.x * blockDim.x;
+    std::uint64_t tid = TUTTI_THREAD_IDX_X + (std::uint64_t)TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X;
     if (tid < n) buf[tid] = val;
 }
 

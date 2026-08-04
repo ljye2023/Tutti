@@ -491,11 +491,17 @@ public:
                        "no DataPath registered for target key: " + path_key));
         }
         DataPath* data_path = path_it->second;
-        auto private_target = data_path->open(resolved.value());
+        auto private_target = [&]() -> Result<DataPathTarget> {
+            std::lock_guard<std::mutex> dp_lock(datapath_open_mutex_);
+            return data_path->open(resolved.value());
+        }();
         if (!private_target.ok()) {
             return Result<TargetHandle>::Failure(private_target.status());
         }
-        auto domain = data_path->registration_domain(private_target.value());
+        auto domain = [&]() -> Result<RegistrationDomainKey> {
+            std::lock_guard<std::mutex> dp_lock(datapath_open_mutex_);
+            return data_path->registration_domain(private_target.value());
+        }();
         if (!domain.ok()) {
             (void)data_path->close(private_target.value());
             return Result<TargetHandle>::Failure(domain.status());
@@ -514,6 +520,197 @@ public:
         entry.registration_domain = std::move(domain).value();
         entry.resolved_target.emplace(std::move(resolved).value());
         return TargetHandle(runtime_id_, slot, gen);
+    }
+
+    // Round 19 S1: batch open — opens N targets concurrently.
+    //
+    // The hot path of a single open is resolver.resolve() (FIEMAP, host
+    // IO-bound) followed by data_path->open() (GPU workspace build) and
+    // a brief critical section that allocates a target slot.  In a
+    // batch of N, the FIEMAP calls run concurrently (the resolver is
+    // thread-safe — it only reads immutable config and issues syscalls),
+    // overlapping host IO across files.  data_path->open() is serialized
+    // by datapath_open_mutex_ because DataPath internals (targets_ map,
+    // handle cache) are not thread-safe; the serial section is cheap
+    // relative to FIEMAP.  The final slot allocation + entry write is
+    // serialized under registry_mutex_ as in open().
+    //
+    // fail-closed per item: a single failing URI (NOT_FOUND, bad scheme,
+    // DataPath error, ...) does NOT abort the batch — the corresponding
+    // Result<TargetHandle> carries the failure status, other items
+    // proceed normally.  This matches the per-request semantics of
+    // submit().
+    //
+    // Mixed schemes work: each URI is routed by its scheme (file://,
+    // striped://, ...), so a batch may span multiple resolvers and
+    // DataPaths.  Handle-cache dedup (when cache is ON) happens inside
+    // data_path->open() as usual; concurrent opens of the same extent
+    // signature are serialized by datapath_open_mutex_ so the cache's
+    // get_or_build stays race-free.
+    std::vector<Result<TargetHandle>> open_batch(
+        const std::vector<std::string>& uris,
+        const OpenOptions& options) {
+
+        std::vector<Result<TargetHandle>> results;
+        results.reserve(uris.size());
+        for (std::size_t i = 0; i < uris.size(); ++i) {
+            results.emplace_back(Result<TargetHandle>::Failure(
+                Status(StatusCode::INTERNAL, "uninitialized")));
+        }
+        if (uris.empty()) return results;
+
+        // Phase 0: state check (serial, brief).
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex_);
+            if (state_.load() != RuntimeState::RUNNING) {
+                Status s(StatusCode::NOT_READY,
+                         "runtime is not in RUNNING state");
+                for (auto& r : results) r = Result<TargetHandle>::Failure(s);
+                return results;
+            }
+        }
+
+        // Stub mode: mirror open()'s stub behavior (no components).
+        if (!components_enabled_) {
+            std::lock_guard<std::mutex> lock(registry_mutex_);
+            for (std::size_t i = 0; i < uris.size(); ++i) {
+                std::uint32_t slot = find_free_target_slot_();
+                std::uint64_t gen = ++target_gen_counter_;
+                TargetEntry& entry = target_entries_[slot];
+                entry.active = true;
+                entry.generation = gen;
+                entry.uri = uris[i];
+                entry.logical_size = 1ULL << 30;
+                entry.inflight_count = 0;
+                results[i] = TargetHandle(runtime_id_, slot, gen);
+            }
+            return results;
+        }
+
+        // Phase 1: parallel resolve (FIEMAP, host IO-bound).
+        // Each worker resolves one URI to a ResolvedTarget.  Failures
+        // are recorded per-item; failed items skip Phase 2.
+        struct ResolvedItem {
+            Result<ResolvedTarget> resolved = Result<ResolvedTarget>::Failure(
+                Status(StatusCode::INTERNAL, "uninitialized"));
+            StorageTargetResolver* resolver = nullptr;
+            std::string recommended_data_path_key;
+        };
+        std::vector<ResolvedItem> items;
+        items.reserve(uris.size());
+        for (std::size_t i = 0; i < uris.size(); ++i) items.push_back(ResolvedItem{});
+
+        auto resolve_one = [&](std::size_t i) {
+            const std::string& uri = uris[i];
+            std::string scheme = scheme_for_(uri, options);
+            if (scheme.empty()) {
+                items[i].resolved = Result<ResolvedTarget>::Failure(
+                    Status(StatusCode::INVALID_ARGUMENT,
+                           "URI scheme is required: " + uri));
+                return;
+            }
+            // resolver lookup is read-only on resolvers_ (immutable
+            // after create()), so no lock needed here.
+            auto it = resolvers_.find(scheme);
+            if (it == resolvers_.end()) {
+                items[i].resolved = Result<ResolvedTarget>::Failure(
+                    Status(StatusCode::NOT_FOUND,
+                           "no resolver for scheme: " + scheme));
+                return;
+            }
+            ResolveOptions opts;
+            opts.scheme = scheme;
+            items[i].resolver = it->second;
+            items[i].resolved = it->second->resolve(uri, opts);
+            if (items[i].resolved.ok()) {
+                items[i].recommended_data_path_key =
+                    items[i].resolved.value().recommended_data_path_key();
+            }
+        };
+
+        // Use a simple worker pool: spawn min(N, hardware_concurrency)
+        // threads, each pulling indices from an atomic counter.
+        std::atomic<std::size_t> next_idx{0};
+        std::size_t n_workers = std::min<std::size_t>(
+            uris.size(),
+            std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+        std::vector<std::thread> workers;
+        workers.reserve(n_workers);
+        for (std::size_t w = 0; w < n_workers; ++w) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    std::size_t i = next_idx.fetch_add(1,
+                        std::memory_order_relaxed);
+                    if (i >= uris.size()) break;
+                    resolve_one(i);
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+
+        // Phase 2: serial data_path->open() + registration_domain.
+        // DataPath internals are not thread-safe; datapath_open_mutex_
+        // serializes across concurrent open_batch calls AND the single
+        // open() path (open() also acquires it).
+        for (std::size_t i = 0; i < uris.size(); ++i) {
+            if (!items[i].resolved.ok()) {
+                results[i] = Result<TargetHandle>::Failure(
+                    items[i].resolved.status());
+                continue;
+            }
+            const auto& rt = items[i].resolved.value();
+            if (!rt.valid()) {
+                results[i] = Result<TargetHandle>::Failure(
+                    Status(StatusCode::INTERNAL,
+                           "resolver returned invalid target: " + uris[i]));
+                continue;
+            }
+            auto path_it = data_paths_.find(items[i].recommended_data_path_key);
+            if (path_it == data_paths_.end()) {
+                results[i] = Result<TargetHandle>::Failure(
+                    Status(StatusCode::NOT_FOUND,
+                           "no DataPath for key: " +
+                           items[i].recommended_data_path_key));
+                continue;
+            }
+            DataPath* data_path = path_it->second;
+
+            DataPathTarget private_target;
+            RegistrationDomainKey domain;
+            {
+                std::lock_guard<std::mutex> dp_lock(datapath_open_mutex_);
+                auto pt = data_path->open(rt);
+                if (!pt.ok()) {
+                    results[i] = Result<TargetHandle>::Failure(pt.status());
+                    continue;
+                }
+                private_target = pt.value();
+                auto dom = data_path->registration_domain(private_target);
+                if (!dom.ok()) {
+                    (void)data_path->close(private_target);
+                    results[i] = Result<TargetHandle>::Failure(dom.status());
+                    continue;
+                }
+                domain = std::move(dom).value();
+            }
+
+            // Phase 3: serial slot allocation + entry write.
+            std::lock_guard<std::mutex> lock(registry_mutex_);
+            std::uint32_t slot = find_free_target_slot_();
+            std::uint64_t gen = ++target_gen_counter_;
+            TargetEntry& entry = target_entries_[slot];
+            entry.active = true;
+            entry.generation = gen;
+            entry.uri = uris[i];
+            entry.logical_size = rt.logical_size();
+            entry.inflight_count = 0;
+            entry.data_path = data_path;
+            entry.data_path_target = private_target;
+            entry.registration_domain = std::move(domain);
+            entry.resolved_target.emplace(std::move(items[i].resolved).value());
+            results[i] = TargetHandle(runtime_id_, slot, gen);
+        }
+        return results;
     }
 
     Status close(const TargetHandle& handle) {
@@ -1552,6 +1749,10 @@ private:
     std::unordered_map<DataPath*, std::unique_ptr<std::mutex>> progress_gates_;
 
     bool components_enabled_ = false;
+    // Round 19 S1: serializes DataPath::open/registration_domain across
+    // concurrent open_batch and open() calls — DataPath internals
+    // (targets_ map, handle cache) are not thread-safe.
+    std::mutex datapath_open_mutex_;
     ResourceProvider default_resources_;
     ResourceProvider* resources_ = &default_resources_;
     std::unordered_map<std::string, StorageTargetResolver*> resolvers_;

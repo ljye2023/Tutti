@@ -21,23 +21,33 @@ obj-m += snvme-core.o
 obj-m += snvme.o
 
 
-ccflags-y += @module_ccflags@
+ccflags-y += @module_ccflags@ -I$(src)/peer_memory
 
 snvme-core-y				:= core.o
 snvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
 
-# snvme.ko object list.  The auxiliary helpers (nvfs-pci/peer_memory/
-# compat/list/ctrl/map) are kernel-version-agnostic and copied verbatim
-# from snvme-5.15.0; pci.c is the file that carries the 5.4-specific
-# port.
-snvme-objs := nvfs-pci.o peer_memory.o compat.o list.o ctrl.o map.o pci.o
+# snvme.ko object list.
+#
+# peer_memory/ contains one .c per GPU P2P backend:
+#   nvidia.c  (default, -DTUTTI_P2P_BACKEND_NVIDIA)
+#   metax.c   (-DTUTTI_P2P_BACKEND_METAX)
+#
+# Select at build time:  make TUTTI_P2P_BACKEND=nvidia (or metax)
+# Default: nvidia
+TUTTI_P2P_BACKEND ?= nvidia
+snvme-objs := peer_memory/$(TUTTI_P2P_BACKEND).o compat.o list.o ctrl.o map.o pci.o
 
 KERNEL_SRC := /lib/modules/$(shell uname -r)/build
 
 all:
+	@mkdir -p @module_output@/peer_memory
 	$(MAKE) -C $(KERNEL_SRC) M=@module_output@ modules
+# io_queue_depth: kernel default 64 is the conservative built-in; production
+# deployments use 1024 (maintainer 2026-08-04). Override: make insmod IO_QDEPTH=64
+IO_QDEPTH ?= 1024
+
 insmod:
-	sudo insmod snvme-core.ko && sudo insmod snvme.ko
+	sudo insmod snvme-core.ko && sudo insmod snvme.ko io_queue_depth=$(IO_QDEPTH)
 rmmod:
 	sudo rmmod snvme && sudo rmmod snvme_core
 clean:
