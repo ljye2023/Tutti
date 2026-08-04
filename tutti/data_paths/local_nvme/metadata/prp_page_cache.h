@@ -88,7 +88,8 @@ public:
         void* devptr = nullptr;       // GPU pointer to the page (within pool)
         std::uint64_t ioaddr = 0;     // DMA IOVA of the page
         std::uint32_t pin_count = 0;
-        bool in_use = false;  // true while checked out (protected from eviction)
+        std::uint32_t checkout_refcount = 0;  // P0-1: >0 while checked out by submit
+        bool in_use = false;  // deprecated: superseded by checkout_refcount
     };
 
     PrpPageCache() = default;
@@ -116,9 +117,12 @@ public:
         auto it = index_.find(key);
         if (it != index_.end()) {
             std::uint32_t slot = it->second;
-            touch_lru_(slot);
+            Entry& hit = entries_[slot];
+            ++hit.checkout_refcount;  // P0-1: re-checkout increments refcount
+            hit.in_use = true;        // backward compat
+            remove_from_lru_(slot);   // checked-out entries are not evictable
             ++stats_.hits;
-            return &entries_[slot];
+            return &hit;
         }
 
         ++stats_.misses;
@@ -129,7 +133,8 @@ public:
         Entry& e = entries_[slot];
         e.key = key;
         e.pin_count = 0;
-        e.in_use = true;  // checked out, protected from eviction
+        e.checkout_refcount = 1;  // P0-1: new entry starts with one checkout
+        e.in_use = true;  // backward compat
         e.devptr = static_cast<char*>(pool_aligned_) +
                    static_cast<std::size_t>(slot) * cfg_.page_size;
         e.ioaddr = pool_dma_->ioaddrs[slot];
@@ -151,6 +156,9 @@ public:
     void pin(Entry* e) {
         if (!e) return;
         std::lock_guard<std::mutex> lock(mtx_);
+        // P0-1: decrement checkout_refcount (the submit path checked it out,
+        // now it's being pinned for the op's lifetime).
+        if (e->checkout_refcount > 0) --e->checkout_refcount;
         e->in_use = false;  // no longer just "checked out" — now pinned
         ++e->pin_count;
         ++stats_.pinned;
@@ -168,7 +176,7 @@ public:
             --e->pin_count;
             --stats_.pinned;
         }
-        if (e->pin_count == 0 && !e->in_use) {
+        if (e->pin_count == 0 && e->checkout_refcount == 0) {
             std::uint32_t slot = static_cast<std::uint32_t>(e - entries_.data());
             if (index_.count(e->key) && !lru_pos_.count(slot)) {
                 lru_.push_front(slot);
@@ -183,7 +191,8 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         std::vector<Key> to_erase;
         for (auto& [k, slot] : index_) {
-            if (k.memory_token == memory_token && entries_[slot].pin_count == 0) {
+            if (k.memory_token == memory_token && entries_[slot].pin_count == 0 &&
+                entries_[slot].checkout_refcount == 0) {
                 to_erase.push_back(k);
             }
         }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "tutti/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor
+
 // tutti/data_paths/striped_local_nvme/fused_submit_kernel.cuh
 //
 // Fused submit kernel: a SINGLE cudaLaunchKernel that dispatches IO entries
@@ -47,12 +49,12 @@ using tutti::data_paths::local_nvme::EntryCompletionStatus;
 //     the logical offset via the stripe formula on the host).
 // -------------------------------------------------------------------------
 struct StripedDeviceSubmitEntry {
-    std::uint32_t dev_idx;          // index into the device table [0, N)
+    std::uint32_t dev_idx;          // index into the device table [0, M*N)
     std::uint32_t direction;        // 0 = read, 1 = write
-    std::uint64_t prp1;             // controller DMA address of first PRP page
-    std::uint64_t prp2;             // controller DMA address of second PRP page or PRP list
     std::uint64_t shard_offset;     // byte offset within this shard's target
-    std::uint64_t length;           // bytes
+    // Round 16 S6 (REQUIRED 0): ALWAYS non-null — points to a GPU-resident
+    // AddressDescriptor (pre-built or arena descriptor pool).
+    const tutti::data_paths::local_nvme::AddressDescriptor* prp_entry = nullptr;
 };
 
 // Host launcher: launches the fused kernel on the given CUDA stream.
@@ -86,6 +88,7 @@ namespace tutti::data_paths::striped_local_nvme {
 
 using tutti::data_paths::local_nvme::submit_read_one;
 using tutti::data_paths::local_nvme::submit_write_one;
+using tutti::data_paths::local_nvme::AddressDescriptor;
 
 // -------------------------------------------------------------------------
 // fused_submit_kernel — one thread per entry, single launch across N devices.
@@ -124,11 +127,14 @@ void fused_submit_kernel(const StripedDeviceSubmitEntry* entries,
 
     const DeviceTargetHandle* h = dev_table[e.dev_idx];
 
+    // Round 16 S6 (REQUIRED 0): kernel single-path — ALWAYS read
+    // prp1/prp2/data_length from the GPU-resident AddressDescriptor.
+    const AddressDescriptor* desc = e.prp_entry;
     if (e.direction == 0) {
-        submit_read_one(h, e.prp1, e.prp2, e.shard_offset, e.length,
+        submit_read_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
                         s, cq_poll_budget, inject_flag);
     } else {
-        submit_write_one(h, e.prp1, e.prp2, e.shard_offset, e.length,
+        submit_write_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
                          s, cq_poll_budget, inject_flag);
     }
 }

@@ -559,6 +559,17 @@ public:
     // other valid requests from being accepted. If at least one request
     // is accepted, an IoHandle is returned even if the overall status is
     // non-OK (partial failure).
+    //
+    // PARTIAL-COMMIT CONTRACT (P0-3, Round 16):
+    //   The returned IoHandle covers ONLY the requests that were ACCEPTED
+    //   in this call.  The caller MUST inspect every entry of
+    //   initial_states[] and re-submit any REJECTED requests (e.g.
+    //   RESOURCE_EXHAUSTED back-pressure) in a subsequent windowed call.
+    //   Failing to re-submit rejected requests causes SILENT DATA LOSS:
+    //   wait(handle) returns success but the rejected IO never happened.
+    //   See R14 S4 incident: 512-request batch, 16 accepted, 496 rejected
+    //   by LocalNvmeDataPath in-flight cap — data was lost until the
+    //   caller was fixed to window on initial_states.
     IoSubmitOutcome submit(const IoRequest* requests,
                            std::size_t count,
                            const HostSubmitContext& context) {

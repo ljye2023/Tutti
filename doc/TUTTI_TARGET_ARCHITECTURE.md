@@ -64,7 +64,8 @@ StorageTargetResolver   CUDA-like API/profile
 2. `StorageRuntime` 不理解任何具体 storage descriptor 或 DataPath kernel；
 3. 新增仓内 `DataPath`、CUDA-like profile/shim 或 `StorageTargetResolver` 时，不修改公共 storage 请求模型；
 4. metadata pool、GPU kernel 和 completion strategy 可以独立优化，不改变公共 API；
-5. file/KV-cache 路径能够从公开 API 走完内存注册、提交、完成和资源释放。
+5. file/KV-cache 路径能够从公开 API 走完内存注册、提交、完成和资源释放；
+6. **R15 成果（已验收）**：跨设备 fused 单 kernel 提交（`StripedDataPath`，一次 `cudaLaunchKernel` 跨 N 台 NVMe 设备）、重启持久化（WRITE→完整 teardown→全新 Runtime 重开同 URI→READ 逐字节校验）、按 DataPath 分组合并提交（一次 `rt->submit` 跨多 target 合并为一次 `DataPath::submit`/一次 kernel launch，R15 S3 起）。
 
 ---
 
@@ -74,9 +75,10 @@ StorageTargetResolver   CUDA-like API/profile
 
 1. **稳定 host control plane 与可扩展提交面**
    - `StorageRuntime` 统一负责 host 侧内存 registration、target open、资源准备、host submission、query/wait 和 teardown；
-   - 当前主线实现 host-initiated/host-executed 与 host-initiated/device-executed 两条路径；
+   - 当前主线仅实现 host-initiated/device-executed（`DEVICE_EXECUTION`）一条生产路径；`supports_host_execution=false`；
+   - host-executed（`HOST_EXECUTION`）列为 future，本轮不实现（见 §2.1 偏差消解 D8）；
    - 架构必须为未来 device-initiated/device-executed IO 保留位置，但本轮不冻结、不实现通用 device API；
-   - host API 统一暴露 `tutti/cuda_like.h` 的 CUDA 风格类型；NVIDIA 直接使用 CUDA，兼容厂商由编译期 shim 映射；未来 device API 按 profile/DataPath 组合。
+   - host API 统一暴露 `tutti/cuda_like.h` 的 CUDA 风格类型；当前 CUDA/HOST 两档实测；兼容厂商走 Mooncake 模式 vendor shim 框架（R18 立项），合作伙伴沐曦负责 MUSA 实现；MACA/MUSA 当前为 `#error` 占位；未来 device API 按 profile/DataPath 组合。
 
 2. **完整数据面 SPI**
    - `DataPath` 同时覆盖 target、data-path memory registration、submit、progress 和 completion；
@@ -112,7 +114,7 @@ StorageTargetResolver   CUDA-like API/profile
 - public `raw_device` API；
 - `cancel()`；
 - `dlopen` 动态插件、运行时卸载或稳定第三方 binary ABI；
-- WAL、striping、通用 create/remove/list 文件服务；
+- WAL、通用 create/remove/list 文件服务；（striping 已实现，见 §4.1 与 §13.7；WAL 仍不实现）
 - priority、failover、notification、自动重试 policy；
 - CUDA 与 ROCm 在同一 build/profile 中混用；
 - cooperative host/device submit；
@@ -214,14 +216,16 @@ Tutti 的真实依赖是一个 DAG：
 
 ```text
 ┌───────────────────────────────────────────────────────────────┐
-│ Applications / Framework Adapters                             │
+│ Applications / Framework Adapters（future，maintainer 暂缓）  │
 │ C++ app | VllmAdapter | LmCacheAdapter | future adapters      │
+│ prompts 存 doc/history/chat/round12/deferred-adapter/         │
 └──────────────┬────────────────────────────────┬───────────────┘
                │ storage API                    │ CUDA-like API
 ┌──────────────▼──────────────────┐  ┌──────────▼───────────────┐
 │ StorageRuntime                  │  │ tutti/cuda_like.h         │
-│ Memory/Target/Io registries     │◄─┤ CUDA | MACA | MUSA shim  │
-│ routing/backpressure/completion │  │ memory/stream/event       │
+│ Memory/Target/Io registries     │◄─┤ CUDA | HOST 实测          │
+│ routing/backpressure/completion │  │ MACA/MUSA #error 占位     │
+│ 按 DataPath 分组合并提交(R15S3)  │  │ memory/stream/event       │
 └──────────────┬──────────────────┘  └──────────┬───────────────┘
                │                                │
        ┌───────▼──────────┐              device interop
@@ -231,7 +235,7 @@ Tutti 的真实依赖是一个 DAG：
                └──────────────┬─────────────────┘
                               ▼
                         DataPath
-                   LocalNvmeDataPath / future
+            LocalNvmeDataPath | StripedDataPath (R15)
 ```
 
 未来 device-initiated 路径不是第二套 control plane：
@@ -260,24 +264,26 @@ LocalNvmeDataPath
 │   ├── submit
 │   └── completion / progress
 ├── metadata
-│   ├── MetadataArena
+│   ├── MetadataArena          # entries/status/PRP-list 一次性预分配池
 │   ├── descriptor / SQE / status leases
-│   ├── TieredHandleCache
-│   └── DMA-correct PrpPageCache
-├── control
-│   ├── DirectNvmeResourceProvider
-│   └── NvmeServiceResourceProvider
-├── interop
-│   └── cuda_like
-│       ├── queue/device views
-│       ├── submit kernels
-│       ├── completion strategy
-│       └── minimal profile overrides
+│   ├── HandleWorkspaceCache   # 单层 GPU LRU + open_refcount + pin（非旧 L1/L2 迁移，重新设计）
+│   └── PrpPageCache           # DMA-correct PRP-list page cache
+├── interop/cuda_like          # 实现于 include/tutti/cuda_like.h + gpu_vendor/（公共层，非 local_nvme 私有）
+│   ├── queue/device views
+│   ├── submit kernels
+│   ├── completion strategy
+│   └── minimal profile overrides
 ├── userspace/libnvm
 ├── service/nvmeservice
 ├── include/uapi/tutti_snvme.h
 └── kmod/snvme
 ```
+
+> **偏差消解 D2**：原 `control/`（`DirectNvmeResourceProvider` / `NvmeServiceResourceProvider`）已删除（2026-08-03 死代码清理）。DataPath 直用 libnvm（`nvm_ctrl_attach_client`）+ nvmeservice daemon（gRPC 队列分配），无中间 driver 抽象。
+>
+> **偏差消解 D3**：`TieredHandleCache` 已替换为 `HandleWorkspaceCache`（单层 GPU LRU + `open_refcount` + `pin`）+ `PrpPageCache` + `MetadataArena`。旧两层 L1/L2 未迁移——这是重新设计的缓存模型，语义不等价。
+>
+> **偏差消解 D7**：`interop/cuda_like` 标注实现于 `include/tutti/cuda_like.h` + `gpu_vendor/`（公共层，非 local_nvme 私有子层）。
 
 ### 4.3 进程与内核边界
 
@@ -776,11 +782,12 @@ Runtime 只按通用 identity 分组：
 
 ```text
 DataPath instance
-+ target / registration domain
 + ExecutionDomain
 + profile/device
 + compatible HostSubmitContext
 ```
+
+> **偏差消解 D6**（R15 S3 起）：分组 key 从 `(DataPath, target)` 改为仅 `DataPath`。一次 `rt->submit` 跨多个 target（同一 DataPath 内）合并为**一次** `DataPath::submit()` 调用、一次 kernel launch。每个 `DataPathRequest` 仍携带自己的 `target`，per-request 路由语义不变——只是"何时开新分组"的判据从 `(data_path, target)` 放宽为 `data_path`。per-request 错误隔离、partial-commit、结果聚合、`release_io` 语义均不变。
 
 Runtime 不按 MDTS、extent、PRP、queue pair 或 warp 分组。这些都是 DataPath 内部 lowering。
 
@@ -889,7 +896,7 @@ DataPath registration 只返回私有 handle；Runtime 不解释其内容。
 | Memory identity、range lookup | `memory/MemoryRegistry` |
 | `GpuSlotPool<T>` | 基于 CUDA-like API 的私有 allocation/fence 原语 |
 | `HostSlotPool<T>` | 基于 CUDA-like API 的私有 pinned-host 原语 |
-| `TieredHandleCache<T>` | `LocalNvmeDataPath/metadata/`，先保持具体实现 |
+| `HandleWorkspaceCache` | `LocalNvmeDataPath/metadata/`，单层 GPU LRU + open_refcount + pin（重新设计，非旧 L1/L2 迁移） |
 | `PrpListPool`、`PrpPageCache` | `LocalNvmeDataPath/metadata/prp/` |
 | `AddressDescriptor`、IO slice table | local-NVMe data-path registration |
 
@@ -921,6 +928,8 @@ IoHandle
 - cache eviction 不得销毁仍有 operation lease 的条目。
 
 ### 9.7 分层 metadata cache
+
+> **偏差消解 D3**：当前实现为单层 `HandleWorkspaceCache`（GPU LRU + `open_refcount` + `pin`），**非**旧两层 L1/L2 迁移。以下描述保留为目标设计参考；实际组件名与语义以 §4.2 为准。
 
 对于大量 file/KV target，默认成本模型为：
 
@@ -1319,25 +1328,19 @@ local NVMe 的以下部分共同决定可用性，不能横切到多个“通用
 
 ### 13.2 Bootstrap 与资源授予
 
-local-NVMe 私有 `NvmeResourceProvider` 可有两个实现：
+> **偏差消解 D2**：原 `control/`（`DirectNvmeResourceProvider` / `NvmeServiceResourceProvider`）已删除。DataPath 直用 libnvm（`nvm_ctrl_attach_client`）+ nvmeservice daemon（gRPC 队列分配），无中间 driver 抽象。以下描述保留为历史参考，实际装配以 §4.2 为准。
+
+local-NVMe 控制面直链（无中间 provider 抽象）：
 
 ```text
-DirectNvmeResourceProvider
-  process owns controller/queue initialization
-
-NvmeServiceResourceProvider
-  service owns shared resources
-  process receives resource grant and attach metadata
+LocalNvmeDataPath::initialize()
+  → nvm_ctrl_attach_client(&ctrl, /dev/ssnvme<N>, bar0_size)   # libnvm 直连
+  → ioctl_get_dev_info(ctrl, &dev_info)                         # 硬件 MDTS/page_size
+  → NvmeQueueGroup(ctrl, disk_info, ns_id, cuda_dev,
+                    num_user_queues, queue_depth)              # daemon 已分配队列
 ```
 
-二者返回同一种私有 `NvmeResourceGrant`：
-
-- controller/namespace identity；
-- queue set 和 ownership；
-- registration domain；
-- block geometry/MDTS；
-- submission capabilities；
-- grant lifetime。
+nvmeservice daemon 负责：设备 bring-up + 队列分配（gRPC）。DataPath 不经中间 `ResourceProvider` 抽象，直接 attach controller 并创建 queue group。
 
 全局 Runtime 不提供抽象的 `VDevice`，也不要求其他 DataPath 实现 queue quota 模型。
 
@@ -1419,6 +1422,26 @@ GPU scheduler
 
 如果某项优化采用 split submit/completion、queue-owner warp 或 persistent kernel，也必须在 caller stream 上留下等价 completion fence；不能让 IO kernel提早返回后，后续 compute 在 storage read/write 尚未完成时继续执行。
 
+### 13.6 StripedDataPath（R15 新增，偏差消解 D1）
+
+`StripedDataPath` 是与 `LocalNvmeDataPath` 平级的第二个生产 DataPath，实现跨 N 台本地 NVMe 设备的单 kernel 融合提交。
+
+**组件定义：**
+
+- **URI**：`striped://<name>?devs=<mount1,mount2,...>&unit=<bytes>`
+- **Resolver**：`StripedResolver`（`resolvers/striped_file/`）将 URI 解析为 N 个 `LocalFileResolver` 子目标，打包成 pair-private `StripedLocalNvmePayload`
+- **Binding**：`striped_local_nvme`（`bindings/striped_local_nvme/binding.h`）定义 stripe 偏移映射公式：`shard=(off/unit)%N`、`shard_off=(off/(unit*N))*unit+(off%unit)`
+- **DataPath**：`StripedDataPath`（`data_paths/striped_local_nvme/`），单次 `cudaLaunchKernel` 跨 N 设备：
+  - host 侧按 stripe 公式切分 entries（带 `dev_idx`）；
+  - device table（GPU 可见数组）持 N 个 `DeviceTargetHandle*`；
+  - 融合 kernel 内 thread 按 `dev_idx` 取 handle → `resolve_lba` → acquire_queue → issue（写该设备 doorbell）→ CQ poll；
+  - 复用 `nvme_submit_primitives.cuh` 共享原语（从 `submit_one.cuh` 抽离，逐字节不变）；
+  - 单 kernel = 单 event = caller stream 单 fence。
+
+**M×N device table 演进方向**：当前 device table 容量固定为 N（一个 striped target 的完整 shard 集合）。未来若需支持单 op 跨多个 striped target，需将 device table 扩展为 M×N（M = target 数），当前以 `RESOURCE_EXHAUSTED` partial-commit 方式处理超容量请求。
+
+**零核心改动**：`StripedDataPath` 与 `LocalNvmeDataPath` 一样经 public `StorageRuntime` API 暴露，调用方零 striped 感知（`rt.open("striped://...")` 返回普通 `TargetHandle`）。
+
 ---
 
 ## 14. snvme 内核边界
@@ -1485,6 +1508,8 @@ common mapping 流程不直接散落 `nvidia_p2p_*` 或其他项目 symbol。
 ## 15. Framework Adapter
 
 ### 15.1 边界
+
+> **偏差消解 D4**：`FrameworkAdapter` 当前**未实现**（maintainer 暂缓）。设计 prompts 存 `doc/history/chat/round12/deferred-adapter/`。当前调用链顶层 = C++ 应用直用 `StorageRuntime`（见 `tutti/examples/layerwise_kv_overlap/`）。以下描述保留为目标设计。
 
 Framework Adapter 负责：
 
@@ -1655,8 +1680,7 @@ tutti/
 │   └── local_nvme/
 │       ├── io/
 │       ├── metadata/
-│       ├── control/
-│       ├── interop/cuda_like/
+│       ├── interop/cuda_like/   # 实现于 include/tutti/cuda_like.h + gpu_vendor/（公共层）
 │       │   ├── host_launch/    # 当前 host-initiated device execution
 │       │   ├── device_api/     # 未来 device-initiated sidecar
 │       │   └── profile_overrides/
@@ -1664,10 +1688,16 @@ tutti/
 │       ├── service/nvmeservice/
 │       ├── include/uapi/
 │       └── kmod/snvme/
+│   └── striped_local_nvme/      # R15 新增：跨设备 fused DataPath（单 launch 融合提交）
+│       ├── striped_data_path.{h,cpp}
+│       ├── striped_arena.{h,cpp}
+│       └── fused_submit_kernel.{cuh,cu}
 ├── target_resolvers/
-│   └── ext4_fiemap/
+│   ├── ext4_fiemap/
+│   └── striped_file/            # R15：striped:// → N 个 LocalFileResolver 组合
 ├── bindings/
-│   └── ext4_local_nvme/        # pair-private payload contract
+│   ├── ext4_local_nvme/        # pair-private payload contract
+│   └── striped_local_nvme/      # R15：striped 逻辑目标 ↔ N 子目标 bundle
 └── tests/
 
 adapters/
@@ -1775,7 +1805,7 @@ local-NVMe 至少提供：
 - NVMe status；
 - MDTS/extent fan-out；
 - descriptor/PRP pool occupancy；
-- L1/L2 metadata hit/promotion/eviction；
+- HandleWorkspaceCache hit/promotion/eviction（单层 GPU LRU + open_refcount + pin）；
 - metadata H2D bytes；
 - GPU kernel time、active warps/SM、residency；
 - controller BW/IOPS；
@@ -2055,7 +2085,7 @@ Linux kernel / peer-memory API drift
 
 - CUDA allocation、stream/event、copy 调用；
 - GPU/pinned-host metadata pool；
-- tiered handle cache；
+- HandleWorkspaceCache（单层 GPU LRU + open_refcount + pin）；
 - FIEMAP 和 extent 处理思路；
 - libnvm、queue、PRP、SQE、CQ 和 GPU submit kernel；
 - NVMeService 的资源授予模型；
@@ -2152,7 +2182,7 @@ adapters/kv_cache                         raw_device/（未构建）
 ├── controller DMA mapping
 ├── AddressDescriptor / IoSliceTable
 ├── GpuSlotPool / HostSlotPool
-├── TieredHandleCache
+├── HandleWorkspaceCache
 └── PrpListPool / PrpPageCache
 
 拆成：
@@ -2174,7 +2204,7 @@ LocalNvmeDataPath
 ├── memory registration / IOVA
 ├── IO slice / AddressDescriptor
 ├── MetadataArena
-├── TieredHandleCache
+├── HandleWorkspaceCache
 └── DMA-correct PRP pool/cache
 ```
 
@@ -2186,7 +2216,7 @@ LocalNvmeDataPath
 | `IMemorySubsystem::allocate/register` | Runtime + CUDA-like API | allocation/ownership 语义可保留 | 不再全局 bind controllers；一个 memory 对多个 registration domain。 |
 | `GpuSlotPool<T>` | local-NVMe metadata 使用的 CUDA-like primitive | 池算法可保留 | slot 改为 operation lease；多 stream event/fence；结构化 exhaustion。 |
 | `HostSlotPool<T>` | pinned-host metadata/staging | 大体可保留 | 使用 CUDA-like host API、补 ownership/stats。 |
-| `TieredHandleCache<T>` | `LocalNvmeDataPath/metadata` | L1 GPU + L2 pinned-host 思路应保留 | cache entry 必须被 operation pin；不能在 batch/IO 中途驱逐。 |
+| `HandleWorkspaceCache` | `LocalNvmeDataPath/metadata` | 单层 GPU LRU + open_refcount + pin（重新设计，非旧 L1/L2 迁移） | cache entry 必须被 operation pin；不能在 batch/IO 中途驱逐。 |
 | `PrpPageCache`/`PrpListPool` | `LocalNvmeDataPath/metadata/prp` | policy 可参考 | PRP page 必须独立 DMA-map；`prp2` 写 IOVA，不写 CUDA virtual address。 |
 | `IoSliceTable`/`AddressDescriptor` | local-NVMe registration | 预计算思路可保留 | 按 registration domain 保存；不进入 Runtime/public API。 |
 
@@ -2245,12 +2275,9 @@ LocalNvmeDataPath
 ├── metadata/
 │   ├── MetadataArena
 │   ├── descriptor/SQE/status pools
-│   ├── TieredHandleCache
+│   ├── HandleWorkspaceCache
 │   └── PrpPageCache
-├── control/
-│   ├── DirectNvmeResourceProvider
-│   └── NvmeServiceResourceProvider
-├── interop/cuda_like/
+├── interop/cuda_like/          # 实现于 include/tutti/cuda_like.h + gpu_vendor/（公共层）
 │   ├── host_launch
 │   ├── device_api             # future
 │   └── profile_overrides/     # MACA/MUSA 仅在 shim 不足时增加
@@ -2260,13 +2287,14 @@ LocalNvmeDataPath
 └── kmod/snvme/
 ```
 
+> **偏差消解 D2**：`control/` 已删除——DataPath 直用 libnvm + nvmeservice daemon，无中间 driver 抽象。
+
 来源选择：
 
 | 目标子目录 | 首选迁移来源 | 补充来源 |
 |---|---|---|
 | `io/` | `tutti/backends/nvme` | 根 `nvme_storage` 中已验证的 queue/file 算法 |
 | `metadata/` | 根 `memory` | `tutti/backends/nvme/prp_page_cache` 作为问题样例 |
-| `control/` | `tutti/device_manager/nvme` | 根 `device_manager` 的 bring-up 行为 |
 | `interop/cuda_like` | `tutti/backends/nvme/device` | 根 `io_engine/local_nvme` 与 `nvme_storage` kernel；兼容 profile 复用 |
 | `userspace/service/kmod` | 从新旧两树审计合并 | 不能直接假设某一整棵树完整更新 |
 
@@ -2480,3 +2508,23 @@ R13	搬首个真实 KV FrameworkAdapter，只调用 StorageRuntime；跑 layerwi
 R14	收敛 local-NVMe control/kernel 边界、libnvm/NVMeService/snvme 唯一事实源、UAPI/compat
 R15	Mock/扩展 contract kit、HOST/CUDA feature matrix、无 SDK 污染验证
 R16（可能）	删除旧 memory/、io_engine/、nvme_storage/、重复 backend，实现与性能基线最终验收
+
+---
+
+## 25. 变更记录
+
+### 2026-08-03（Round 16 Session 2：偏差消解 D1-D8 + §1 验收条件补充）
+
+对照 `doc/architecture/current-structure.md` §3 的 8 项偏差，逐项修订本文使其与实现一致：
+
+| 偏差 | 修订位置 | 摘要 |
+|------|---------|------|
+| **D1 striping** | §2.2、§4.1 组件图、§13.6（新增）、§17 目标目录 | "不主动实现 striping" → "striping 已实现（R15）"；组件图补 `StripedDataPath`（与 `LocalNvmeDataPath` 平级）；新增 §13.6 striped 组件定义（`striped://` URI、pair-private payload、单 kernel 融合提交、M×N device table 演进方向）；目标目录补 `data_paths/striped_local_nvme/`、`resolvers/striped_file/`、`bindings/striped_local_nvme/` |
+| **D2 control 层** | §4.2、§13.2、§17 目标目录、§24.6 | 移除 `control/`（`DirectNvmeResourceProvider`/`NvmeServiceResourceProvider`）→ DataPath 直用 libnvm（`nvm_ctrl_attach_client`）+ nvmeservice daemon（gRPC 队列分配），无中间 driver 抽象 |
+| **D3 metadata 组件名** | §4.2、§9.5、§9.7、§24.4、§24.6 | `TieredHandleCache` → `HandleWorkspaceCache`（单层 GPU LRU + `open_refcount` + `pin`）+ `PrpPageCache` + `MetadataArena`；注明与旧两层 L1/L2 语义不等价（重新设计，非迁移） |
+| **D4 FrameworkAdapter** | §4.1 组件图、§15.1 | 标注 future（maintainer 暂缓，prompts 存 `doc/history/chat/round12/deferred-adapter/`） |
+| **D5 GPU 可移植性** | §2.1、§4.1 组件图 | MACA/MUSA → 明确路线：Mooncake 模式 vendor shim 框架（R18 立项），当前 CUDA/HOST 两档实测；合作伙伴沐曦负责 MUSA 实现；MACA/MUSA 当前为 `#error` 占位 |
+| **D6 分组** | §8.3 | Routing/grouping 更新为按 DataPath 分组（一次 submit 可跨 target、一次 kernel launch；R15 S3 起） |
+| **D7 interop 位置** | §4.2、§17 目标目录、§24.6 | `interop/cuda_like` 标注实现于 `include/tutti/cuda_like.h` + `gpu_vendor/`（公共层，非 local_nvme 私有） |
+| **D8 执行路径** | §2.1 | 双路径 → 当前仅 device-executed（`DEVICE_EXECUTION`）一条生产路径，`supports_host_execution=false`；host-executed 列 future |
+| **§1 验收条件** | §1 | 补充第 6 条：R15 成果（跨设备 fused 单 kernel、重启持久化、按 DataPath 分组合并提交） |

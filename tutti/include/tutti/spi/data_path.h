@@ -138,6 +138,9 @@ struct DataPathMemoryView {
     std::uint64_t size_bytes = 0;
     std::int32_t device_id = -1;  // -1 for host-only memory
     DataPathMemoryKind kind = DataPathMemoryKind::HOST;
+    // Round 16 S5 (V3): io_granularity > 0 enables registration-time PRP
+    // pre-build (legacy build_io_slice_table 9-stage path).  0 = dynamic.
+    std::uint64_t io_granularity = 0;
 };
 
 // Minimal configuration handed to initialize().

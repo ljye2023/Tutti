@@ -128,6 +128,10 @@ public:
         std::uint64_t parsed_unit = 0;
         bool found_devs = false;
         bool found_unit = false;
+        // Round 16 S7: optional 'rot' param -- per-target shard rotation
+        // (legacy shard_placement equivalent).  Absent => 0 (no rotation,
+        // identical to pre-S7 behavior).
+        std::uint32_t parsed_rot = 0;
 
         std::string_view q = query;
         while (!q.empty()) {
@@ -177,6 +181,16 @@ public:
                                "unit param not a valid integer: " + val));
                 }
                 parsed_unit = static_cast<std::uint64_t>(u);
+            } else if (key == "rot") {
+                // Round 16 S7: per-target shard rotation.
+                char* end = nullptr;
+                unsigned long long r = std::strtoull(val.c_str(), &end, 10);
+                if (end == val.c_str() || *end != '\0') {
+                    return Result<ResolvedTarget>::Failure(
+                        Status(StatusCode::INVALID_ARGUMENT,
+                               "rot param not a valid integer: " + val));
+                }
+                parsed_rot = static_cast<std::uint32_t>(r);
             } else {
                 return Result<ResolvedTarget>::Failure(
                     Status(StatusCode::INVALID_ARGUMENT,
@@ -267,7 +281,7 @@ public:
         // 9. Create the immutable payload.
         auto payload_result = binding::striped_local_nvme::
             StripedLocalNvmePayload::create(
-                N, stripe_unit_, std::move(shards));
+                N, stripe_unit_, std::move(shards), parsed_rot);
 
         if (!payload_result.ok()) {
             return Result<ResolvedTarget>::Failure(

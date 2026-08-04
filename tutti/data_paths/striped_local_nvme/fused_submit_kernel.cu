@@ -5,9 +5,21 @@
 
 #include "tutti/data_paths/striped_local_nvme/fused_submit_kernel.cuh"
 
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 namespace tutti::data_paths::striped_local_nvme {
+
+// Round 16 S5: threads_per_block aligned to legacy (32).  Override via
+// TUTTI_TPB env for A/B comparison.
+static std::uint32_t get_tpb() {
+    static std::uint32_t tpb = []() -> std::uint32_t {
+        const char* e = std::getenv("TUTTI_TPB");
+        if (e) { int v = std::atoi(e); if (v > 0) return (std::uint32_t)v; }
+        return 32;  // legacy default
+    }();
+    return tpb;
+}
 
 cudaError_t launch_fused_submit(
     const StripedDeviceSubmitEntry* d_entries,
@@ -20,7 +32,7 @@ cudaError_t launch_fused_submit(
     void*                           stream)
 {
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    std::uint32_t threads = 256;
+    std::uint32_t threads = get_tpb();
     std::uint32_t blocks = (count + threads - 1) / threads;
     if (blocks == 0) blocks = 1;
     fused_submit_kernel<<<blocks, threads, 0, s>>>(

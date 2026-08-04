@@ -1145,7 +1145,9 @@ static irqreturn_t nvme_irq(int irq, void *data)
 
 	if (nvme_process_cq(nvmeq))
 		return IRQ_HANDLED;
-	return IRQ_NONE;
+	/* Round 16 S4: return IRQ_HANDLED instead of IRQ_NONE to prevent
+	 * "nobody cared" IRQ storm when GPU P2P has already consumed CQEs. */
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t nvme_irq_check(int irq, void *data)

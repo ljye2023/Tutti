@@ -37,6 +37,7 @@
 #include <tutti/io_types.h>
 #include "tutti/bindings/striped_local_nvme/binding.h"
 #include "tutti/data_paths/striped_local_nvme/striped_arena.h"
+#include "tutti/data_paths/local_nvme/metadata/prp_page_cache.h"  // Round 16 S5
 
 #include <nvm_ctrl.h>
 #include <nvm_types.h>
@@ -90,7 +91,8 @@ struct DeviceDescriptor {
     std::uint32_t namespace_id = 1;
     std::uint32_t cuda_device = 0;
     std::uint32_t num_user_queues = 1;
-    std::uint32_t queue_depth = 1024;
+    // (no queue_depth field: ring depth is fixed by the kernel module's
+    //  io_queue_depth and obtained via NVM_GET_DEV_INFO at initialize())
     std::uint32_t block_size = 4096;
 };
 
@@ -107,12 +109,17 @@ public:
     // mdts_override: 0 = use hardware min(); else min(override, hardware min()).
     // max_batch_entries: max fan-out entries per op (bounds StripedArena sizing).
     // max_in_flight_operations: cap on concurrent IN_FLIGHT ops.
+    // handle_cache_capacity: 0 = OFF (default); >0 = GPU LRU handle cache slots.
+    // prp_cache_capacity: 0 = OFF (default); >0 = PRP LIST page cache slots.
+    //   (Round 16 S5: aligned to LocalNvmeDataPath's prp_cache_capacity.)
     StripedDataPath(std::vector<DeviceDescriptor> devices,
                     std::uint32_t cuda_device = 0,
                     std::uint64_t mdts_override = 0,
                     std::uint32_t cq_poll_budget = 2000000,
                     std::uint32_t max_batch_entries = 256,
-                    std::uint32_t max_in_flight_operations = 16);
+                    std::uint32_t max_in_flight_operations = 16,
+                    std::uint32_t handle_cache_capacity = 0,
+                    std::uint32_t prp_cache_capacity = 0);
     ~StripedDataPath() override;
 
     StripedDataPath(const StripedDataPath&) = delete;
@@ -184,6 +191,9 @@ private:
     struct StripedTarget {
         std::uint32_t num_shards = 0;
         std::uint64_t stripe_unit = 0;
+        // Round 16 S7: per-target shard rotation, mirrored from the
+        // payload (legacy shard_placement equivalent).  0 = no rotation.
+        std::uint32_t shard_rotation = 0;
         std::uint64_t logical_size = 0;
         // N DeviceTargetHandle* (GPU pointers), one per shard.
         std::vector<tutti::data_paths::local_nvme::DeviceTargetHandle*> dev_handles;
@@ -202,6 +212,18 @@ private:
         // the SAME GPU buffer.
         std::vector<nvm_dma_t*> dmas;
         std::uint64_t generation = 0;
+
+        // Round 16 S5 (V3): per-device pre-built AddressDescriptor[].
+        // Populated when io_granularity > 0 at registration time.
+        // d_descs[d] = GPU-resident AddressDescriptor[] for device d.
+        // Each descriptor covers one sub-IO of bytes_per_slice.
+        struct Prebuilt {
+            std::vector<void*> d_descs_per_dev;   // N GPU pointers
+            std::uint64_t bytes_per_slice = 0;
+            std::uint64_t num_descs = 0;           // same per device (same IOVA layout)
+            bool valid = false;
+        };
+        Prebuilt prebuilt;
     };
 
     struct OpEntry {
@@ -214,6 +236,9 @@ private:
         StripedDeviceSubmitEntry* d_entries = nullptr;
         local_nvme::EntryCompletionStatus* d_status = nullptr;
         std::uint32_t entry_count = 0;
+        // Round 16 S6 (REQUIRED 0): entry lengths (was inline in
+        // StripedDeviceSubmitEntry::length; now in descriptor on GPU).
+        std::vector<std::uint64_t> entry_lengths;
         void* event = nullptr;   // cudaEvent_t
         void* stream = nullptr;  // borrowed cudaStream_t
 
@@ -225,7 +250,10 @@ private:
         bool has_timeout = false;
 
         std::uint64_t target_token = 0;
-        std::uint64_t memory_token = 0;
+        // P0-2 fix: collect ALL accepted requests' memory tokens so
+        // memory_has_inflight_ops_() correctly prevents unregister during
+        // in-flight ops.  A batch may span multiple memory registrations.
+        std::vector<std::uint64_t> memory_tokens;
 
         std::uint64_t op_token = 0;
         std::uint64_t op_generation = 0;
@@ -258,6 +286,9 @@ private:
     std::uint32_t cq_poll_budget_ = 0;
     std::uint32_t max_batch_entries_ = 0;
     std::uint64_t max_in_flight_operations_ = 0;
+    // Round 16 S5: cache capacities (default OFF, aligned to LocalNvme).
+    std::uint32_t handle_cache_capacity_ = 0;
+    std::uint32_t prp_cache_capacity_ = 0;
     std::uint32_t block_size_ = 0;         // uniform across all shards
     std::uint64_t max_request_bytes_ = 0;  // max_batch_entries_ * effective_mdts_bytes_
     bool initialized_ = false;
@@ -266,12 +297,21 @@ private:
 
     StripedArena arena_;
 
+    // Round 16 S5: per-device PRP page cache (one per controller).
+    std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpPageCache>> prp_caches_;
+
     std::uint64_t next_target_ = 1;
     std::uint64_t next_memory_ = 1;
     std::uint64_t next_op_token_ = 1;
     std::unordered_map<std::uint64_t, StripedTarget> targets_;
     std::unordered_map<std::uint64_t, StripedMemory> memory_regs_;
     std::unordered_map<std::uint64_t, OpEntry> ops_;
+
+    // Round 16 S5 (V3): registration-time pre-build for striped.
+    bool build_striped_prebuilt_(StripedMemory& mem,
+                                  std::uint64_t io_granularity,
+                                  std::string& status_msg);
+    void destroy_striped_prebuilt_(StripedMemory& mem);
 
     std::uint64_t test_submit_call_count_ = 0;
     std::uint64_t test_kernel_launch_count_ = 0;

@@ -73,6 +73,13 @@ struct MemoryView {
     MemoryOwnership ownership;
     std::int32_t    expected_device_id;  // < 0 = unspecified
     std::string     expected_profile;    // empty = unspecified
+    // Round 16 S5 (V3): io_granularity > 0 enables registration-time PRP
+    // pre-build (legacy build_io_slice_table 9-stage path).  0 = dynamic
+    // path (current behavior, retains generality).  When > 0, the DataPath
+    // pre-builds AddressDescriptor[] at register_memory time and submit
+    // uses pointer arithmetic (e.prp_entry = d_descs + sub) instead of
+    // per-submit PRP computation + H2D.
+    std::uint64_t   io_granularity = 0;
 };
 
 } // namespace tutti

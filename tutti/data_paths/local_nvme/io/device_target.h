@@ -59,4 +59,33 @@ void free_device_target(
     void* overflow_dev,
     uint32_t cuda_device);
 
+// Round 16 S6b: L2 downgrade/restore support (tiered handle cache).
+//
+// Snapshot: copy the GPU-resident handle struct + overflow CONTENT into
+// caller-supplied host (pinned) buffers — the L2 record image.  Two
+// synchronous D2H memcpys.  out_handle_image must point to at least
+// sizeof(DeviceTargetHandle) bytes; out_overflow_image to at least
+// overflow_bytes bytes (may be nullptr when overflow_bytes == 0).
+bool snapshot_device_target(
+    const DeviceTargetHandle* gpu_handle,
+    const void* gpu_overflow,
+    uint64_t overflow_bytes,
+    uint32_t cuda_device,
+    DeviceTargetHandle* out_handle_image,
+    void* out_overflow_image);
+
+// Restore: allocate a fresh GPU handle + overflow buffer and fill them
+// from an L2 record image — memcpy restore, NOT a rebuild (no FIEMAP,
+// no host template).  The restored handle's extents_overflow pointer is
+// patched to the fresh overflow allocation (the image carries the old,
+// now-freed pointer value).  d_qps is restored by value — queue
+// structures never move for the lifetime of the queue group.
+bool restore_device_target(
+    const DeviceTargetHandle* handle_image,
+    const void* overflow_image,
+    uint64_t overflow_bytes,
+    uint32_t cuda_device,
+    DeviceTargetHandle** out_handle,
+    void** out_overflow_dev);
+
 } // namespace tutti::data_paths::local_nvme

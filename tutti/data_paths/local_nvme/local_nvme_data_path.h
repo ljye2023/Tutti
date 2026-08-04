@@ -27,6 +27,7 @@
 #include "tutti/data_paths/local_nvme/metadata/metadata_arena.h"
 #include "tutti/data_paths/local_nvme/metadata/handle_workspace_cache.h"
 #include "tutti/data_paths/local_nvme/metadata/prp_page_cache.h"
+#include "tutti/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor (Round 16 S6 test accessor)
 
 #include <nvm_ctrl.h>
 #include <nvm_dma.h>
@@ -104,7 +105,10 @@ public:
     // bar0_size: BAR0 size in bytes
     // cuda_device: primary GPU for d_qps + per-queue rings
     // num_user_queues: count of user QPs to create
-    // queue_depth: SQ/CQ ring depth
+    // (SQ/CQ ring depth is NOT a parameter: it is fixed by the kernel
+    //  module's io_queue_depth and obtained via NVM_GET_DEV_INFO at
+    //  bring-up — the kernel sizes user IOQ rings with dev->q_depth
+    //  unconditionally, so a userspace-specified value can only desync)
     // namespace_id: NVMe namespace ID
     // block_size: NVMe block size (typ. 4096)
     // mdts_bytes: maximum data transfer size per NVMe command (0 = default 128KiB)
@@ -138,7 +142,6 @@ public:
                       std::uint32_t bar0_size,
                       std::uint32_t cuda_device,
                       std::uint32_t num_user_queues,
-                      std::uint32_t queue_depth,
                       std::uint32_t namespace_id,
                       std::uint32_t block_size,
                       std::uint64_t mdts_bytes = 0,
@@ -148,7 +151,10 @@ public:
                       std::uint32_t prp_cache_capacity = 0,
                       std::uint64_t max_in_flight_operations = 0,
                       std::uint64_t max_batch_requests = 0,
-                      std::uint64_t max_request_bytes_override = 0);
+                      std::uint64_t max_request_bytes_override = 0,
+                      // Round 16 S6b: L2 (host-pinned content) tier for the
+                      // handle cache.  0 = default 4×L1 when L1 enabled.
+                      std::uint32_t handle_cache_l2_capacity = 0);
 
     ~LocalNvmeDataPath() override;
 
@@ -230,7 +236,12 @@ public:
     // D2H-copy entry[index] of the op's device entry array into `out`.
     // Returns false if op not found, index out of range, or D2H failed.
     bool test_copy_entry(DataPathOp op, std::uint32_t index,
-                         DeviceSubmitEntry& out) const;
+                        DeviceSubmitEntry& out) const;
+    // Round 16 S6 (REQUIRED 0): copy a single entry's AddressDescriptor
+    // (prp1/prp2/data_length) from GPU to host for test observability.
+    // The entry itself no longer carries these fields inline.
+    bool test_copy_entry_desc(DataPathOp op, std::uint32_t index,
+                              AddressDescriptor& out) const;
 
     // True if this op owns a PRP-list DMA (i.e. at least one LIST sub-IO).
     bool test_op_has_prp_list_dma(DataPathOp op) const;
@@ -336,11 +347,34 @@ private:
         std::int32_t device_id = -1;
         std::uint64_t generation = 0;
         bool unregistered = false;
+
+        // Round 16 S5 (V3): registration-time pre-built descriptors
+        // (legacy build_io_slice_table 9-stage path).  When io_granularity
+        // > 0 at register_memory time, these are populated and submit uses
+        // pointer arithmetic (e.prp_entry = d_descs + sub) instead of
+        // per-submit PRP computation + H2D.
+        struct PrebuiltDesc {
+            // GPU-resident AddressDescriptor[] (24 bytes each: prp1, prp2, data_length)
+            void* d_descs = nullptr;       // cudaMalloc'd
+            std::uint64_t num_descs = 0;   // total sub-IO descriptors
+            std::uint64_t bytes_per_slice = 0;  // granularity used (= min(io_granularity, MDTS))
+            std::uint64_t ios_per_slice = 0;    // sub-IOs per slice
+            // PRP-list pages (GPU-resident, for LIST path)
+            void* d_prp_pages = nullptr;   // cudaMalloc'd
+            std::uint64_t num_prp_pages = 0;
+            bool valid = false;
+        };
+        PrebuiltDesc prebuilt;
     };
     const MemReg* find_mem_(DataPathMemory memory) const;
     MemReg* find_mem_(DataPathMemory memory);
 
-    // ---- Op table (per-operation owner) ----
+    // Round 16 S5 (V3): registration-time pre-build (legacy 9-stage).
+    // Returns true on success, false on failure (error in status_msg).
+    bool build_prebuilt_descriptors_(MemReg& reg,
+                                     std::uint64_t io_granularity,
+                                     std::string& status_msg);
+    void destroy_prebuilt_descriptors_(MemReg& reg);
     // Each submitted op leases workspace from the MetadataArena (event,
     // d_entries, d_status, PRP-list pages).  The op holds references to
     // target and memory identities; close and unregister must reject if
@@ -366,6 +400,10 @@ private:
         DeviceSubmitEntry* d_entries = nullptr;  // arena slot's entry array
         EntryCompletionStatus* d_status = nullptr; // arena slot's status array
         std::uint32_t entry_count = 0;
+        // Round 16 S6 (REQUIRED 0): entry lengths (was inline in
+        // DeviceSubmitEntry::length; now in descriptor on GPU, but
+        // aggregate_completion_status_ needs them host-side).
+        std::vector<std::uint64_t> entry_lengths;
         void* event = nullptr;          // arena slot's pre-created cudaEvent_t
         void* stream = nullptr;         // borrowed cudaStream_t
         CompletionMode completion_mode = CompletionMode::EVENT;
@@ -474,6 +512,7 @@ private:
     // Capacity 0 = disabled (open/close build/free per call, current behavior).
     HandleWorkspaceCache handle_cache_;
     std::uint32_t handle_cache_capacity_ = 0;
+    std::uint32_t handle_cache_l2_capacity_ = 0;  // Round 16 S6b: 0 = 4×L1
 
     // PrpPageCache: caches PRP-list pages by {memory_token, start_page, pages_in_io}.
     // Capacity 0 = disabled (arena PRP pool used per submit, current behavior).

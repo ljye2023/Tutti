@@ -75,7 +75,16 @@ static std::string join(const std::string& dir, const std::string& name) {
 }
 
 static int open_rw(const std::string& path) {
-    return ::open(path.c_str(), O_CREAT | O_RDWR, 0644);
+    // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution;
+    // also avoids stale-cache reads after GPU-side DMA writes).
+    return ::open(path.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
+}
+
+// O_DIRECT requires block-aligned buffers (4096 covers all block sizes here).
+static char* alloc_aligned(std::uint64_t size) {
+    void* p = nullptr;
+    if (::posix_memalign(&p, 4096, static_cast<size_t>(size)) != 0) return nullptr;
+    return static_cast<char*>(p);
 }
 
 static bool fallocate_file(int fd, std::uint64_t size) {
@@ -121,8 +130,11 @@ static bool create_written_file(const std::string& path, std::uint64_t sz,
     int fd = open_rw(path);
     if (fd < 0) return false;
     if (!fallocate_file(fd, sz)) { ::close(fd); return false; }
-    std::vector<char> data(sz, fill);
-    if (!pwrite_full(fd, data.data(), sz)) { ::close(fd); return false; }
+    char* data = alloc_aligned(sz);
+    if (!data) { ::close(fd); return false; }
+    std::memset(data, fill, static_cast<size_t>(sz));
+    if (!pwrite_full(fd, data, sz)) { std::free(data); ::close(fd); return false; }
+    std::free(data);
     fsync_file(fd);
     ::close(fd);
     return true;
@@ -394,8 +406,11 @@ static void test_sparse_file(const std::string& dir) {
     int fd = open_rw(path);
     if (fd < 0) { test_result("sparse_file", false); return; }
     ::ftruncate(fd, static_cast<off_t>(sz));
-    std::vector<char> data(1024 * 1024, 0x77);
-    ::pwrite(fd, data.data(), data.size(), static_cast<off_t>(1024 * 1024));
+    char* data = alloc_aligned(1024 * 1024);
+    if (!data) { ::close(fd); cleanup_file(path); test_result("sparse_file", false); return; }
+    std::memset(data, 0x77, 1024 * 1024);
+    ::pwrite(fd, data, 1024 * 1024, static_cast<off_t>(1024 * 1024));
+    std::free(data);
     fsync_file(fd);
     ::close(fd);
 
@@ -587,16 +602,24 @@ static void test_multi_round(const std::string& dir) {
     }
 
     {
-        std::vector<char> data_a(sz_8m, 0x88);
-        if (!pwrite_full(fd_a, data_a.data(), sz_8m)) {
+        char* data_a = alloc_aligned(sz_8m);
+        if (!data_a) { ::close(fd_a); ::close(fd_b); cleanup_file(path_a); cleanup_file(path_b); test_result("multi_round", false); return; }
+        std::memset(data_a, 0x88, static_cast<size_t>(sz_8m));
+        bool ok = pwrite_full(fd_a, data_a, sz_8m);
+        std::free(data_a);
+        if (!ok) {
             ::close(fd_a); ::close(fd_b);
             cleanup_file(path_a); cleanup_file(path_b);
             test_result("multi_round", false); return;
         }
     }
     {
-        std::vector<char> data_b(sz_4m, 0x99);
-        pwrite_full(fd_b, data_b.data(), sz_4m);
+        char* data_b = alloc_aligned(sz_4m);
+        if (data_b) {
+            std::memset(data_b, 0x99, static_cast<size_t>(sz_4m));
+            pwrite_full(fd_b, data_b, sz_4m);
+            std::free(data_b);
+        }
     }
     fsync_file(fd_a);
     fsync_file(fd_b);

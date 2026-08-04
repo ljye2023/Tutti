@@ -100,7 +100,8 @@ public:
     static Result<std::shared_ptr<StripedLocalNvmePayload>>
     create(std::uint32_t num_shards,
            std::uint64_t stripe_unit,
-           std::vector<ResolvedTarget> shards) {
+           std::vector<ResolvedTarget> shards,
+           std::uint32_t shard_rotation = 0) {
 
         if (num_shards == 0) {
             return Result<std::shared_ptr<StripedLocalNvmePayload>>::Failure(
@@ -142,7 +143,8 @@ public:
 
         auto ptr = std::shared_ptr<StripedLocalNvmePayload>(
             new StripedLocalNvmePayload(
-                num_shards, stripe_unit, std::move(shards), logical));
+                num_shards, stripe_unit, std::move(shards), logical,
+                shard_rotation % num_shards));
         return Result<std::shared_ptr<StripedLocalNvmePayload>>::Success(
             std::move(ptr));
     }
@@ -151,6 +153,10 @@ public:
     std::uint32_t num_shards() const noexcept { return num_shards_; }
     std::uint64_t stripe_unit() const noexcept { return stripe_unit_; }
     std::uint64_t logical_size() const noexcept { return logical_size_; }
+    // Round 16 S7: per-target shard rotation (legacy shard_placement
+    // equivalent, kv_cache_layerwise_overlap.cu:293).  0 = no rotation
+    // (default; identical to pre-S7 behavior).
+    std::uint32_t shard_rotation() const noexcept { return shard_rotation_; }
     const std::vector<ResolvedTarget>& shards() const noexcept {
         return shards_;
     }
@@ -162,8 +168,13 @@ public:
     // Returns OUT_OF_RANGE if offset >= logical_size.
     //
     // Formula:
-    //   shard      = (offset / unit) % N
-    //   shard_off  = (offset / (unit * N)) * unit + (offset % unit)
+    //   shard      = ((offset / unit) + rot) % N(rot = shard_rotation)
+    //   shard_off= (offset / (unit * N)) * unit + (offset % unit)
+    //
+    // The rotation is injective per target (it only permutes which shard
+    // holds a given logical unit), so read/write of the same offset always
+    // resolve to the same (shard, shard_offset) pair.  rot == 0 reproduces
+    // the pre-S7 formula exactly.
     // -------------------------------------------------------------------
     struct ShardLocation {
         std::uint32_t shard_index;
@@ -179,7 +190,7 @@ public:
         }
         ShardLocation loc;
         loc.shard_index = static_cast<std::uint32_t>(
-            (offset / stripe_unit_) % num_shards_);
+            ((offset / stripe_unit_) + shard_rotation_) % num_shards_);
         loc.shard_offset =
             (offset / (stripe_unit_ * num_shards_)) * stripe_unit_ +
             (offset % stripe_unit_);
@@ -190,16 +201,19 @@ private:
     StripedLocalNvmePayload(std::uint32_t num_shards,
                             std::uint64_t stripe_unit,
                             std::vector<ResolvedTarget> shards,
-                            std::uint64_t logical_size)
+                            std::uint64_t logical_size,
+                            std::uint32_t shard_rotation)
         : num_shards_(num_shards),
           stripe_unit_(stripe_unit),
           shards_(std::move(shards)),
-          logical_size_(logical_size) {}
+          logical_size_(logical_size),
+          shard_rotation_(shard_rotation) {}
 
     std::uint32_t num_shards_ = 0;
     std::uint64_t stripe_unit_ = 0;
     std::vector<ResolvedTarget> shards_;
     std::uint64_t logical_size_ = 0;
+    std::uint32_t shard_rotation_ = 0;
 };
 
 // -------------------------------------------------------------------------

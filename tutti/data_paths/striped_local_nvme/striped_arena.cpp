@@ -193,6 +193,38 @@ bool StripedArena::init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls
     }
     ++alloc_counts_.cuda_malloc;
 
+    // 6. Round 16 S6 (REQUIRED 0): descriptor pool for dynamic-path entries.
+    std::size_t desc_pool_bytes = static_cast<std::size_t>(cfg_.num_slots) *
+                                   cfg_.max_entries_per_slot *
+                                   sizeof(tutti::data_paths::local_nvme::AddressDescriptor);
+    ce = cudaMalloc(reinterpret_cast<void**>(const_cast<tutti::data_paths::local_nvme::AddressDescriptor**>(&d_desc_pool_)), desc_pool_bytes);
+    if (ce != cudaSuccess) {
+        cudaFree(d_dev_table_pool_);
+        d_dev_table_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        for (auto* dma : prp_dmas_) {
+            if (dma) { nvm_dma_unmap(dma); ++alloc_counts_.nvm_dma_unmap; }
+        }
+        prp_dmas_.clear();
+        cudaFree(prp_raw_);
+        prp_raw_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        cudaFree(d_status_pool_);
+        d_status_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        cudaFree(d_entries_pool_);
+        d_entries_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        for (auto& ev : events_) {
+            cudaEventDestroy(static_cast<cudaEvent_t>(ev));
+            ++alloc_counts_.cuda_event_destroy;
+        }
+        events_.clear();
+        cudaSetDevice(prev_dev);
+        return false;
+    }
+    ++alloc_counts_.cuda_malloc;
+
     cudaSetDevice(prev_dev);
 
     for (std::uint32_t i = 0; i < cfg_.num_slots; ++i) {
@@ -239,6 +271,11 @@ void StripedArena::shutdown(bool skip_prp) {
         d_dev_table_pool_ = nullptr;
         ++alloc_counts_.cuda_free;
     }
+    if (d_desc_pool_) {
+        cudaFree(const_cast<tutti::data_paths::local_nvme::AddressDescriptor*>(d_desc_pool_));
+        d_desc_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+    }
     for (auto& ev : events_) {
         if (ev) {
             cudaEventDestroy(static_cast<cudaEvent_t>(ev));
@@ -277,6 +314,8 @@ bool StripedArena::acquire(Lease& out) {
     out.d_dev_table = reinterpret_cast<const void**>(d_dev_table_pool_) +
                       static_cast<std::size_t>(slot) * cfg_.dev_table_capacity_per_slot;
     out.dev_table_capacity = cfg_.dev_table_capacity_per_slot;
+    out.d_desc_pool = d_desc_pool_ +
+                      static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
 
     return true;
 }

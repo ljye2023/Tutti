@@ -21,6 +21,8 @@ add_executable(tutti_layerwise_kv_overlap
 
 target_link_libraries(tutti_layerwise_kv_overlap PRIVATE
     tutti_local_nvme_datapath
+    tutti_striped_local_nvme_datapath
+    tutti_striped_file_resolver
     CUDA::cudart
 )
 

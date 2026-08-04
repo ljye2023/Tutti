@@ -152,6 +152,37 @@ bool MetadataArena::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     }
     ++alloc_counts_.nvm_dma_map;
 
+    // 5. Round 16 S6 (REQUIRED 0): allocate descriptor pool for dynamic-path
+    //    entries.  The kernel ALWAYS reads prp1/prp2/data_length from
+    //    e.prp_entry; for entries without a pre-built descriptor, the host
+    //    writes the computed descriptor into this pool + H2D before launch.
+    std::size_t desc_pool_bytes = static_cast<std::size_t>(cfg_.num_slots) *
+                                   cfg_.max_entries_per_slot *
+                                   sizeof(AddressDescriptor);
+    ce = cudaMalloc(reinterpret_cast<void**>(&d_desc_pool_), desc_pool_bytes);
+    if (ce != cudaSuccess) {
+        nvm_dma_unmap(prp_dma_);
+        prp_dma_ = nullptr;
+        ++alloc_counts_.nvm_dma_unmap;
+        cudaFree(prp_raw_);
+        prp_raw_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        cudaFree(d_status_pool_);
+        d_status_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        cudaFree(d_entries_pool_);
+        d_entries_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+        for (auto& ev : events_) {
+            cudaEventDestroy(static_cast<cudaEvent_t>(ev));
+            ++alloc_counts_.cuda_event_destroy;
+        }
+        events_.clear();
+        cudaSetDevice(prev_dev);
+        return false;
+    }
+    ++alloc_counts_.cuda_malloc;
+
     cudaSetDevice(prev_dev);
 
     // 5. Populate free-list: all slots available.
@@ -199,6 +230,11 @@ void MetadataArena::shutdown(bool skip_prp) {
         d_entries_pool_ = nullptr;
         ++alloc_counts_.cuda_free;
     }
+    if (d_desc_pool_) {
+        cudaFree(d_desc_pool_);
+        d_desc_pool_ = nullptr;
+        ++alloc_counts_.cuda_free;
+    }
     for (auto& ev : events_) {
         if (ev) {
             cudaEventDestroy(static_cast<cudaEvent_t>(ev));
@@ -237,6 +273,7 @@ bool MetadataArena::acquire(Lease& out) {
                            static_cast<std::size_t>(slot) * prp_pages_per_slot_ * cfg_.page_size;
     out.prp_ioaddrs_base = slot * prp_pages_per_slot_;
     out.prp_page_capacity = prp_pages_per_slot_;
+    out.d_desc_pool = d_desc_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
 
     return true;
 }

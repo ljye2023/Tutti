@@ -1,5 +1,7 @@
 #pragma once
 
+#include "tutti/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor
+
 // tutti/data_paths/local_nvme/io/submit_one.cuh
 //
 // Private device helpers for batched, block-aligned NVMe IO.
@@ -40,14 +42,23 @@ struct DeviceTargetHandle;
 // registration, and the caller must index by memory_offset / ctrl->page_size.
 // Registered buffers must be 64 KiB-aligned — see register_memory.
 // -------------------------------------------------------------------------
+
+// Round 16 S6 (REQUIRED 0): kernel single-path.  The inline prp1/prp2/length
+// fields have been REMOVED — the kernel ALWAYS reads them from the GPU-
+// resident AddressDescriptor pointed to by prp_entry (which is now always
+// non-null).  Dynamic-path entries get their descriptor written into the
+// arena's per-slot descriptor pool + H2D before launch; pre-built entries
+// point to the registration-time GPU-resident descriptor array.
+
 struct DeviceSubmitEntry {
     DeviceTargetHandle* target;     // GPU pointer to device target handle
-    std::uint64_t       prp1;       // controller DMA address of first PRP page
-    std::uint64_t       prp2;       // controller DMA address of second PRP page or PRP list
     std::uint64_t       target_offset;  // byte offset within target
-    std::uint64_t       length;     // bytes
     std::uint32_t       direction;  // 0 = read, 1 = write
     std::uint32_t       _pad = 0;
+    // ALWAYS non-null: points to a GPU-resident AddressDescriptor
+    // (either pre-built at registration time, or written into the arena's
+    // per-slot descriptor pool for the dynamic path).
+    const AddressDescriptor* prp_entry = nullptr;
 };
 
 // EntryCompletionStatus is defined in nvme_submit_primitives.cuh (shared
@@ -109,11 +120,17 @@ void submit_one_kernel(const DeviceSubmitEntry* entries,
     const DeviceSubmitEntry e = entries[tid];
     EntryCompletionStatus* s = status ? &status[tid] : nullptr;
 
+    // Round 16 S6 (REQUIRED 0): kernel single-path — ALWAYS read
+    // prp1/prp2/data_length from the GPU-resident AddressDescriptor.
+    // The dual-path `if (e.prp_entry != nullptr)` branch is gone.
+    const AddressDescriptor* desc = e.prp_entry;
     if (e.direction == 0) {
-        submit_read_one(e.target, e.prp1, e.prp2, e.target_offset, e.length,
+        submit_read_one(e.target, desc->prp1, desc->prp2,
+                        e.target_offset, desc->data_length,
                         s, cq_poll_budget, inject_flag);
     } else {
-        submit_write_one(e.target, e.prp1, e.prp2, e.target_offset, e.length,
+        submit_write_one(e.target, desc->prp1, desc->prp2,
+                         e.target_offset, desc->data_length,
                          s, cq_poll_budget, inject_flag);
     }
 }

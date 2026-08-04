@@ -209,8 +209,9 @@ public:
                        std::to_string(ns_.block_size) + ")"));
         }
 
-        // 6. Open the file read-only.
-        int fd = ::open(std::string(path).c_str(), O_RDONLY);
+        // 6. Open the file read-only. Project policy: ALL file opens carry
+        // O_DIRECT (no page-cache pollution; harmless for FIEMAP-only use).
+        int fd = ::open(std::string(path).c_str(), O_RDONLY | O_DIRECT);
         if (fd < 0) {
             int saved_errno = errno;
             if (saved_errno == ENOENT) {

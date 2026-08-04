@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -51,9 +52,18 @@ namespace {
 
 constexpr const char* kSnvme = "/dev/ssnvme0";
 constexpr std::uint32_t kBar0 = 16384;
-constexpr std::uint32_t kCudaDev = 0;
-constexpr std::uint32_t kNumQueues = 2;
-constexpr std::uint32_t kQueueDepth = 64;
+// Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
+// kCudaDev is initialized in main(); used as int32_t in MemoryView/HostSubmitContext.
+inline std::int32_t test_gpu_id() {
+    const char* e = std::getenv("TUTTI_TEST_GPU");
+    int v = e ? std::atoi(e) : 0;
+    int dc = 0;
+    if (cudaGetDeviceCount(&dc) != cudaSuccess || dc == 0) return 0;
+    return (v >= 0 && v < dc) ? v : 0;
+}
+static std::int32_t kCudaDev = 0;  // set in main() from test_gpu_id()
+// Round 16 S3: num_user_queues 2 -> 16.
+constexpr std::uint32_t kNumQueues = 16;
 constexpr std::uint32_t kNsId = 1;
 constexpr std::uint32_t kBlockSize = 4096;
 constexpr const char* kDataPathKey = "local-nvme-ext4";
@@ -87,11 +97,16 @@ std::unique_ptr<StorageRuntime> make_runtime(LocalNvmeDataPath& dp,
 }
 
 bool create_file(const std::string& path, std::uint64_t size, unsigned char fill) {
-    int f = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution).
+    int f = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
     if (f < 0) return false;
-    std::vector<char> buf((size_t)size, (char)fill);
-    ssize_t n = ::write(f, buf.data(), buf.size());
+    // O_DIRECT requires block-aligned host buffers.
+    void* abuf = nullptr;
+    if (::posix_memalign(&abuf, 4096, (size_t)size) != 0) { ::close(f); return false; }
+    std::memset(abuf, fill, (size_t)size);
+    ssize_t n = ::write(f, abuf, size);
     (void)n;
+    std::free(abuf);
     ::fsync(f);
     ::close(f);
     return true;
@@ -149,6 +164,9 @@ bool public_read_verify(StorageRuntime& rt, const MemoryHandle& mem, const Targe
 } // namespace
 
 int main() {
+    // Round 16 S3: GPU selection via env TUTTI_TEST_GPU.
+    kCudaDev = test_gpu_id();
+    cudaSetDevice(kCudaDev);
     ::mkdir(kDir, 0755);
 
     // =====================================================================
@@ -156,7 +174,7 @@ int main() {
     // =====================================================================
     printf("--- 1. assembly/open ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create component-backed runtime");
@@ -179,7 +197,7 @@ int main() {
         // DataPath key mismatch: resolver sets key "local-nvme-ext4"; inject a
         // runtime whose only DataPath has a different key → no route.
         {
-            LocalNvmeDataPath dp2(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+            LocalNvmeDataPath dp2(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
             auto resolver2 = make_resolver();
             RuntimeComponents comp;
             comp.resolvers.push_back({"file", &resolver2});
@@ -204,7 +222,7 @@ int main() {
     // =====================================================================
     printf("--- 2. memory / lazy registration ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -251,7 +269,7 @@ int main() {
     // =====================================================================
     printf("--- 3. real data SINGLE/DUAL/LIST/cross-segment ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -316,15 +334,20 @@ int main() {
             const std::string pa = std::string(kDir) + "/rt_crossA.bin";
             const std::string pb = std::string(kDir) + "/rt_crossB.bin";
             const uint64_t m4 = 4 * 1024 * 1024;
-            int fa = ::open(pa.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
-            int fb = ::open(pb.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+            int fa = ::open(pa.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
+            int fb = ::open(pb.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
             if (fa >= 0) { posix_fallocate(fa, 0, (off_t)m4); ::close(fa); }
             if (fb >= 0) { posix_fallocate(fb, 0, (off_t)m4); ::close(fb); }
-            fa = ::open(pa.c_str(), O_RDWR);
+            fa = ::open(pa.c_str(), O_RDWR | O_DIRECT);
             if (fa >= 0) {
                 ftruncate(fa, (off_t)(2 * m4));
-                std::vector<char> fill((size_t)(2 * m4), (char)0x44);
-                ssize_t nw = ::write(fa, fill.data(), fill.size()); (void)nw;
+                // O_DIRECT requires block-aligned host buffers.
+                void* afill = nullptr;
+                if (::posix_memalign(&afill, 4096, (size_t)(2 * m4)) == 0) {
+                    std::memset(afill, 0x44, (size_t)(2 * m4));
+                    ssize_t nw = ::write(fa, afill, 2 * m4); (void)nw;
+                    std::free(afill);
+                }
                 ::fsync(fa); ::close(fa);
             }
             auto t = rt->open(std::string("file://") + pa, OpenOptions{"file"});
@@ -353,7 +376,7 @@ int main() {
     // =====================================================================
     printf("--- 4. batch / mixed / partial commit ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -438,7 +461,7 @@ int main() {
     // =====================================================================
     printf("--- 5. order/concurrency ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -557,7 +580,7 @@ int main() {
     // =====================================================================
     printf("--- 6. failure/timeout ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -626,7 +649,7 @@ int main() {
     printf("--- 7. teardown / repeat lifecycle ---\n");
     {
         for (int round = 0; round < 2; ++round) {
-            LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+            LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
             auto resolver = make_resolver();
             auto rt = make_runtime(dp, resolver);
             CHECK(rt != nullptr, "teardown: create runtime");
@@ -674,7 +697,7 @@ int main() {
         // in-flight=8, batch_entries=4096 (both >= task minimums); the
         // other two new knobs (max_batch_requests, max_request_bytes_override)
         // are left at 0 (follow entries / entries*MDTS).
-        LocalNvmeDataPath dp_big(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth,
+        LocalNvmeDataPath dp_big(kSnvme, kBar0, kCudaDev, kNumQueues,
                                  kNsId, kBlockSize,
                                  /*mdts_bytes=*/0, /*max_batch_entries=*/4096,
                                  /*cq_poll_budget=*/0, /*handle_cache_capacity=*/0,
@@ -743,6 +766,7 @@ int main() {
                   "WRITE batch has >= 512 requests across >= 64 files");
 
             dp_big.test_reset_submit_counters();
+            auto t_w0 = std::chrono::steady_clock::now();
             auto wout = rt->submit(wreqs.data(), wreqs.size(), dev_ctx(stream));
             CHECK(wout.status.ok() && wout.io.has_value(),
                   "512-request WRITE batch accepted by single rt->submit() call");
@@ -754,6 +778,14 @@ int main() {
                 CHECK(wait_terminal(*rt, *wout.io, 30000) == IoState::COMPLETED,
                       "512-request WRITE batch terminal COMPLETED");
                 rt->release_io(*wout.io);
+            }
+            auto t_w1 = std::chrono::steady_clock::now();
+            {
+                double ms = std::chrono::duration<double, std::milli>(t_w1 - t_w0).count();
+                std::uint64_t total_bytes = (std::uint64_t)kNumFiles * kFileBytes;
+                printf("[perf] 8_512req_write %llu bytes %.3f ms %.2f GB/s\n",
+                       (unsigned long long)total_bytes, ms,
+                       (double)total_bytes / ms / 1e6);
             }
 
             // Poison all buffers, then READ back in one more single-launch batch.
@@ -771,6 +803,7 @@ int main() {
                 }
             }
             dp_big.test_reset_submit_counters();
+            auto t_r0 = std::chrono::steady_clock::now();
             auto rout = rt->submit(rreqs.data(), rreqs.size(), dev_ctx(stream));
             CHECK(rout.status.ok() && rout.io.has_value(),
                   "512-request READ batch accepted by single rt->submit() call");
@@ -782,6 +815,14 @@ int main() {
                 CHECK(wait_terminal(*rt, *rout.io, 30000) == IoState::COMPLETED,
                       "512-request READ batch terminal COMPLETED");
                 rt->release_io(*rout.io);
+            }
+            auto t_r1 = std::chrono::steady_clock::now();
+            {
+                double ms = std::chrono::duration<double, std::milli>(t_r1 - t_r0).count();
+                std::uint64_t total_bytes = (std::uint64_t)kNumFiles * kFileBytes;
+                printf("[perf] 8_512req_read %llu bytes %.3f ms %.2f GB/s\n",
+                       (unsigned long long)total_bytes, ms,
+                       (double)total_bytes / ms / 1e6);
             }
 
             total_mismatches = 0;
@@ -817,7 +858,7 @@ int main() {
     // =====================================================================
     printf("--- 9. default capacity regression: oversized batch fail-closed ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kQueueDepth, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create default-capacity runtime");

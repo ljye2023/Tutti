@@ -31,6 +31,7 @@
 namespace tutti::data_paths::local_nvme {
 struct DeviceTargetHandle;
 struct EntryCompletionStatus;  // defined in nvme_submit_primitives.cuh
+struct AddressDescriptor;       // defined in io/prp_builder.h (24 bytes)
 } // namespace tutti::data_paths::local_nvme
 
 namespace tutti::data_paths::striped_local_nvme {
@@ -78,6 +79,8 @@ public:
         // H2D-copies to d_dev_table, then the kernel indexes it by dev_idx.
         const void** d_dev_table = nullptr;  // GPU: this slot's device table base
         std::uint32_t dev_table_capacity = 0;
+        // Round 16 S6 (REQUIRED 0): per-slot descriptor pool for dynamic-path entries.
+        const tutti::data_paths::local_nvme::AddressDescriptor* d_desc_pool = nullptr;
     };
 
     struct AllocCounts {
@@ -136,6 +139,7 @@ private:
     StripedDeviceSubmitEntry* d_entries_pool_ = nullptr;
     EntryCompletionStatus* d_status_pool_ = nullptr;
     void* d_dev_table_pool_ = nullptr;  // GPU: const void*[num_slots * dev_table_capacity_per_slot]
+    const tutti::data_paths::local_nvme::AddressDescriptor* d_desc_pool_ = nullptr;  // Round 16 S6: dynamic-path descriptors
 
     // PRP-list pool: one contiguous GPU buffer, 64 KiB-aligned, DMA-mapped
     // ONCE PER DEVICE (prp_dmas_.size() == ctrls_.size()).

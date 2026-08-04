@@ -25,9 +25,10 @@
 
 namespace tutti::data_paths::local_nvme {
 
-// Forward declarations (defined in io/submit_one.cuh).
+// Forward declarations (defined in io/submit_one.cuh / nvme_submit_primitives.cuh).
 struct DeviceSubmitEntry;
 struct EntryCompletionStatus;
+struct AddressDescriptor;  // defined in io/prp_builder.h (24 bytes: prp1/prp2/data_length)
 
 class MetadataArena {
 public:
@@ -52,6 +53,13 @@ public:
         void* prp_pages_devptr = nullptr;             // GPU: this slot's PRP page base
         std::uint32_t prp_ioaddrs_base = 0;           // index into arena DMA ioaddrs[]
         std::uint32_t prp_page_capacity = 0;          // max PRP pages for this slot
+
+        // Round 16 S6 (REQUIRED 0): per-slot descriptor pool for the
+        // dynamic (non-pre-built) submit path.  The kernel ALWAYS reads
+        // prp1/prp2/data_length from e.prp_entry; for dynamic-path
+        // entries the host writes the computed descriptor here and
+        // H2D-copies it before launch.  Capacity = max_entries_per_slot.
+        AddressDescriptor* d_desc_pool = nullptr;    // GPU: this slot's descriptor base
     };
 
     // Allocation counters — test seam to prove zero hot-path allocation.
@@ -129,6 +137,10 @@ private:
 
     // Per-slot PRP page capacity (worst case = max_entries_per_slot).
     std::uint32_t prp_pages_per_slot_ = 0;
+
+    // Round 16 S6 (REQUIRED 0): descriptor pool for dynamic-path entries.
+    // One contiguous GPU buffer: num_slots * max_entries_per_slot * sizeof(AddressDescriptor).
+    AddressDescriptor* d_desc_pool_ = nullptr;
 
     // Free-list of available slots.
     std::deque<std::uint32_t> free_list_;

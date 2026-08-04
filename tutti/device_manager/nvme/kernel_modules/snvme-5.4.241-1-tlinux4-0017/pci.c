@@ -1425,7 +1425,13 @@ static inline int nvme_process_cq(struct nvme_queue *nvmeq, u16 *start,
 static irqreturn_t nvme_irq(int irq, void *data)
 {
 	struct nvme_queue *nvmeq = data;
-	irqreturn_t ret = IRQ_NONE;
+	/* Round 16 S4: default IRQ_HANDLED instead of IRQ_NONE.  When GPU
+	 * P2P polls user-queue CQs, the CQE is consumed before the kernel
+	 * handler runs, so nvme_process_cq finds nothing.  Returning IRQ_NONE
+	 * in that case triggers "nobody cared" → IRQ disable after ~100k
+	 * spurious hits.  Returning IRQ_HANDLED silences the storm without
+	 * skipping real CQE processing (nvme_process_cq still runs above). */
+	irqreturn_t ret = IRQ_HANDLED;
 	u16 start, end;
 
 	/*

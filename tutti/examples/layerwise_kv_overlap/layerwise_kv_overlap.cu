@@ -45,6 +45,10 @@
 #include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
 #include <tutti/resolvers/local_file/resolver.h>
 
+// Round 16 S4: striped 4-disk mode
+#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
+#include <tutti/resolvers/striped_file/resolver.h>
+
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 
@@ -55,6 +59,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -89,16 +94,50 @@ __global__ void sgemm_kernel(const float* A, const float* B, float* C, int n, in
 }
 
 bool create_file(const std::string& path, uint64_t size) {
-    int f=::open(path.c_str(),O_CREAT|O_RDWR|O_TRUNC,0644);
+    // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution).
+    int f=::open(path.c_str(),O_CREAT|O_RDWR|O_TRUNC|O_DIRECT,0644);
     if(f<0)return false;
-    std::vector<char> buf(1<<20,0);
-    while(size>0){size_t n=std::min((uint64_t)buf.size(),size);if(::write(f,buf.data(),n)!=(ssize_t)n){::close(f);return false;}size-=n;}
+    // O_DIRECT requires block-aligned buffers.
+    void* ap=nullptr; if(::posix_memalign(&ap,4096,1<<20)!=0){::close(f);return false;}
+    std::memset(ap,0,1<<20);
+    while(size>0){size_t n=std::min((uint64_t)(1<<20),size);if(::write(f,ap,n)!=(ssize_t)n){std::free(ap);::close(f);return false;}size-=n;}
+    std::free(ap);
     ::fsync(f);::close(f);return true;
 }
 
 constexpr const char* kSnvme="/dev/ssnvme0";
-constexpr uint32_t kBar0=16384, kCudaDev=0;
+constexpr uint32_t kBar0=16384;
+// Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
+inline int32_t test_gpu_id(){const char*e=std::getenv("TUTTI_TEST_GPU");int v=e?std::atoi(e):0;int dc=0;if(cudaGetDeviceCount(&dc)!=cudaSuccess||dc==0)return 0;return(v>=0&&v<dc)?v:0;}
 constexpr const char* kDPKey="local-nvme-ext4";
+
+// Round 16 S3: multi-GPU device→PCI BDF mapping table (seam only).
+// To actually run on GPU 1-3, sys_config allowed_gpus must be extended +
+// daemon restarted. This table is a placeholder for future multi-GPU testing.
+struct GpuNvmeMapping { int gpu_id; const char* pci_bdf; const char* nvme_dev; };
+static const GpuNvmeMapping kGpuNvmeMap[] = {
+    {0, "0000:08:00.0", "/dev/ssnvme0"},  // 06:00 ↔ 08:00
+    {1, "0000:4b:00.0", "/dev/ssnvme1"},  // 49:00 ↔ 4b:00
+    {2, "0000:57:00.0", "/dev/ssnvme2"},  // 56:00 ↔ 57:00
+    {3, "0000:63:00.0", "/dev/ssnvme3"},  // 62:00 ↔ 63:00
+};
+
+// ---------------------------------------------------------------------------
+// Round 16 S4: DpSeam — abstracts test-seam counters so windowed_submit_wait
+// works with both LocalNvmeDataPath and StripedDataPath.
+// ---------------------------------------------------------------------------
+struct DpSeam {
+    std::function<uint64_t()> submit_count;
+    std::function<uint64_t()> launch_count;
+    std::function<void()>     reset;
+};
+template <typename T> DpSeam make_dp_seam(T& dp) {
+    return DpSeam{
+        [&dp]() -> uint64_t { return dp.test_submit_call_count(); },
+        [&dp]() -> uint64_t { return dp.test_kernel_launch_count(); },
+        [&dp]() { dp.test_reset_submit_counters(); }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Windowed submit+wait: handles partial-commit by retrying rejected requests.
@@ -116,12 +155,14 @@ static uint64_t g_windowed_calls = 0;
 static uint64_t g_windowed_multi_round_calls = 0;
 static uint64_t g_windowed_rounds_total = 0;
 
+// Round 16 S4: uses DpSeam instead of template (works with both DataPath types).
 static WindowedIoResult windowed_submit_wait(
         StorageRuntime* rt,
-        LocalNvmeDataPath& dp,
+        DpSeam& dp,
         const IoRequest* all_reqs, size_t n_reqs,
         const HostSubmitContext& ctx,
-        cudaStream_t stream,
+        cudaStream_t /*stream*/,  // Round 16 S7: no longer synced here; the
+                                  // caller's event DAG expresses ordering.
         uint64_t bytes_per_req,
         const char* tag) {
     // Build a mutable copy of request indices that still need submission
@@ -139,8 +180,8 @@ static WindowedIoResult windowed_submit_wait(
         // over-capacity / partial-commit scenario.
         size_t submit_count = pending.size();
 
-        uint64_t dp_submit0 = dp.test_submit_call_count();
-        uint64_t dp_launch0 = dp.test_kernel_launch_count();
+        uint64_t dp_submit0 = dp.submit_count();
+        uint64_t dp_launch0 = dp.launch_count();
 
         auto t0 = std::chrono::steady_clock::now();
         auto o = rt->submit(pending.data(), submit_count, ctx);
@@ -148,10 +189,22 @@ static WindowedIoResult windowed_submit_wait(
         if (o.io.has_value()) {
             // Some accepted — wait for them
             auto wo = rt->wait(o.io.value(), 60000);
-            if (wo.observation_status.code() != StatusCode::OK)
+            if (wo.observation_status.code() != StatusCode::OK ||
+                !wo.result || wo.result->state != IoState::COMPLETED) {
                 STEP_FAIL("%s: wait failed (round %d)", tag, rounds);
+            }
             RT_STATUS(rt->release_io(o.io.value()));
-            CUDA_OK(cudaStreamSynchronize(stream));
+            // Round 16 S7: removed cudaStreamSynchronize(stream) here.
+            // rt->wait() already polls until the kernel (launched on
+            // `stream`) has completed -- the extra host sync was redundant
+            // and prevented GPU-side read/write overlap across layers.
+            // Cross-layer ordering is expressed via the event DAG
+            // (cudaStreamWaitEvent in Phase G), not host sync.
+            // rt->wait() already polls until the kernel (launched on
+            // `stream`) has completed — the extra host sync was redundant
+            // and prevented GPU-side read/write overlap across layers.
+            // Cross-layer ordering is expressed via the event DAG
+            // (cudaStreamWaitEvent in Phase G), not host sync.
 
             // Count accepted
             size_t accepted = 0;
@@ -176,8 +229,6 @@ static WindowedIoResult windowed_submit_wait(
             pending = std::move(next_round);
         } else {
             // All rejected — no handle, all in initial_states
-            // This shouldn't happen with our configured capacity, but handle
-            // gracefully (safety net).
             std::vector<IoRequest> next_round;
             for (size_t i = 0; i < submit_count; ++i)
                 next_round.push_back(pending[i]);
@@ -196,8 +247,8 @@ static WindowedIoResult windowed_submit_wait(
         // DataPath::submit() and, on the normal path, exactly one kernel
         // launch (see LocalNvmeDataPath::submit()'s early reject_all path
         // for the only case where a call is counted without a launch).
-        uint64_t dp_submit_delta = dp.test_submit_call_count() - dp_submit0;
-        uint64_t dp_launch_delta = dp.test_kernel_launch_count() - dp_launch0;
+        uint64_t dp_submit_delta = dp.submit_count() - dp_submit0;
+        uint64_t dp_launch_delta = dp.launch_count() - dp_launch0;
         if (dp_submit_delta != 1)
             STEP_FAIL("%s: round %d drove %lu DataPath::submit() calls (expected 1)",
                       tag, rounds, (unsigned long)dp_submit_delta);
@@ -218,6 +269,7 @@ int main(int argc,char**argv){
     uint64_t ctx_tokens=131072, compute_us=0;
     std::string data_dir="/mnt/nvme1/GPU0";
     bool verify=true;
+    bool striped4=true;  // Round 16 S7: 4-disk striped is the DEFAULT mode
     for(int i=1;i<argc;){
         const char*a=argv[i];
         if(!std::strcmp(a,"--layers")&&i+1<argc){n_layers=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
@@ -232,6 +284,8 @@ int main(int argc,char**argv){
         else if(!std::strcmp(a,"--data-dir")&&i+1<argc){data_dir=argv[++i];++i;}
         else if(!std::strcmp(a,"--verify")){verify=true;++i;}
         else if(!std::strcmp(a,"--no-verify")){verify=false;++i;}
+        else if(!std::strcmp(a,"--striped4")){striped4=true;++i;}  // explicit (default)
+        else if(!std::strcmp(a,"--single")){striped4=false;++i;}  // Round 16 S7: opt out of striped
         else{std::fprintf(stderr,"unknown: %s\n",a);return 1;}
     }
     const uint64_t ts=(uint64_t)tensor_kb*1024;
@@ -241,8 +295,10 @@ int main(int argc,char**argv){
     if(!n_chunks||!n_hit||!n_miss)STEP_FAIL("bad geometry");
 
     CUDA_OK(cudaFree(0));
-    CUDA_OK(cudaSetDevice(kCudaDev));
-    STEP_OK("cudaSetDevice(%d)",kCudaDev);
+    int32_t gpu=test_gpu_id();
+    (void)kGpuNvmeMap;  // Round 16 S3: multi-GPU seam (suppress unused warning)
+    CUDA_OK(cudaSetDevice(gpu));
+    STEP_OK("cudaSetDevice(%d)",gpu);
 
     // ---- Runtime ----
     // Round 15 S4: explicit large capacity (in-flight=4, batch_entries=4096)
@@ -250,32 +306,116 @@ int main(int argc,char**argv){
     // fanned out over MDTS) fits in a single DataPath::submit()/kernel
     // launch. max_batch_requests / max_request_bytes_override left at 0
     // (follow entries / entries*MDTS defaults).
-    LocalNvmeDataPath dp(kSnvme,kBar0,kCudaDev,2,64,1,4096,
-                         /*mdts_bytes=*/0, /*max_batch_entries=*/4096,
-                         /*cq_poll_budget=*/0, /*handle_cache_capacity=*/4096,
-                         /*prp_cache_capacity=*/4096,
-                         /*max_in_flight_operations=*/4,
-                         /*max_batch_requests=*/0,
-                         /*max_request_bytes_override=*/0);
-    LocalFileResolver resolver("0000:08:00.0",1,4096,BackingDeviceConfig{"/dev/snvme0n1",0});
-    RuntimeComponents comps;
-    comps.resolvers.push_back({"file",&resolver});
-    comps.data_paths.push_back({kDPKey,&dp,DataPathConfig{"local_nvme"}});
-    auto created=StorageRuntime::create({},std::move(comps));
-    if(!created.ok())STEP_FAIL("create: %s",created.status().message().c_str());
-    auto rt=std::move(created).value();
-    STEP_OK("StorageRuntime created");
+    // Round 16 S3: num_user_queues 2 -> 16; cuda_device from env.
+    // Round 16 S4: --striped4 mode uses StripedDataPath + StripedResolver.
+    DpSeam seam;
+    std::unique_ptr<StorageRuntime> rt;
+
+    if (striped4) {
+        // ---- Striped 4-disk mode ----
+        constexpr int kNDevs = 4;
+        static const char* kSnvmeDevs[kNDevs] = {
+            "/dev/ssnvme0","/dev/ssnvme1","/dev/ssnvme2","/dev/ssnvme3"};
+        static const char* kPciBdfs[kNDevs] = {
+            "0000:08:00.0","0000:4b:00.0","0000:57:00.0","0000:63:00.0"};
+        static const char* kBackingDevs[kNDevs] = {
+            "/dev/snvme0n1","/dev/snvme1n1","/dev/snvme2n1","/dev/snvme3n1"};
+        static const char* kMounts[kNDevs] = {
+            "/mnt/nvme1","/mnt/nvme2","/mnt/nvme3","/mnt/nvme4"};
+
+        std::vector<tutti::data_paths::striped_local_nvme::DeviceDescriptor> sdevs;
+        for (int d = 0; d < kNDevs; ++d) {
+            sdevs.push_back({kSnvmeDevs[d], 16384, 1, (uint32_t)gpu,
+                             32, 4096});
+        }
+        // Round 16 S7: stripe_unit=ts (512KiB) so each request = 1 entry
+        // per shard (not 8 as with 64KiB). 920 reqs × 4 shards × 1 = 3680
+        // entries → 8192 fits with headroom.
+        auto* sdp = new tutti::data_paths::striped_local_nvme::StripedDataPath(
+            std::move(sdevs), (uint32_t)gpu,
+            /*mdts_override=*/0, /*cq_poll_budget=*/0,
+            /*max_batch_entries=*/8192, /*max_in_flight_operations=*/4,
+            /*handle_cache_capacity=*/0, /*prp_cache_capacity=*/4096);
+        // Build N LocalFileResolvers + StripedResolver
+        std::vector<std::unique_ptr<StorageTargetResolver>> sub_resolvers;
+        for (int d = 0; d < kNDevs; ++d) {
+            sub_resolvers.push_back(std::make_unique<LocalFileResolver>(
+                kPciBdfs[d], 1, 4096,
+                BackingDeviceConfig{kBackingDevs[d], 0}));
+        }
+        auto* sres = new tutti::resolvers::striped_file::StripedResolver(
+            std::move(sub_resolvers), ts);  // Round 16 S7: unit=ts (512KiB, tensor-aligned)
+
+        RuntimeComponents comps;
+        comps.resolvers.push_back({"striped", sres});
+        comps.data_paths.push_back({std::string(tutti::binding::striped_local_nvme::kRecommendedDataPathKey),
+                                     sdp, DataPathConfig{"striped-nvme"}});
+        auto created = StorageRuntime::create({}, std::move(comps));
+        if (!created.ok()) STEP_FAIL("create striped: %s", created.status().message().c_str());
+        rt = std::move(created).value();
+        seam = make_dp_seam(*sdp);
+        STEP_OK("StorageRuntime created (StripedDataPath, N=4)");
+        // Keep sdp/sres alive — owned by the unique_ptr<>s above, but
+        // StripedDataPath/StripedResolver are heap-allocated and injected
+        // as raw pointers into RuntimeComponents. They live until rt is
+        // destroyed. We intentionally leak them (process-lifetime).
+        (void)sdp; (void)sres;
+    } else {
+        // ---- Default single-disk mode ----
+        auto* ldp = new LocalNvmeDataPath(kSnvme,kBar0,gpu,16,1,4096,
+                           /*mdts_bytes=*/0, /*max_batch_entries=*/4096,
+                           /*cq_poll_budget=*/0, /*handle_cache_capacity=*/4096,
+                           /*prp_cache_capacity=*/4096,
+                           /*max_in_flight_operations=*/4,
+                           /*max_batch_requests=*/0,
+                           /*max_request_bytes_override=*/0);
+        auto* lres = new LocalFileResolver("0000:08:00.0",1,4096,BackingDeviceConfig{"/dev/snvme0n1",0});
+        RuntimeComponents comps;
+        comps.resolvers.push_back({"file", lres});
+        comps.data_paths.push_back({kDPKey, ldp, DataPathConfig{"local_nvme"}});
+        auto created = StorageRuntime::create({}, std::move(comps));
+        if (!created.ok()) STEP_FAIL("create: %s", created.status().message().c_str());
+        rt = std::move(created).value();
+        seam = make_dp_seam(*ldp);
+        STEP_OK("StorageRuntime created (LocalNvmeDataPath)");
+        (void)ldp; (void)lres;
+    }
 
     // ---- Phase A: create files ----
     auto t0=std::chrono::steady_clock::now();
     std::vector<std::string> paths(n_chunks);
-    for(uint64_t i=0;i<n_chunks;++i){
-        char nm[128];std::snprintf(nm,sizeof(nm),"%s/kvlw_%lu",data_dir.c_str(),(unsigned long)i);
-        paths[i]=nm;
-        if(!create_file(paths[i],file_total))STEP_FAIL("create_file %s",nm);
+    if (striped4) {
+        // Round 16 S4: 4 backing files per chunk (one per device/shard).
+        // StripedResolver path: <mount>/striped/<name>.shard<i>
+        // Each shard file = file_total / 4 bytes.
+        const uint64_t shard_size = file_total / 4;
+        const char* mounts[] = {"/mnt/nvme1","/mnt/nvme2","/mnt/nvme3","/mnt/nvme4"};
+        for (int d = 0; d < 4; ++d) {
+            std::string sdir = std::string(mounts[d]) + "/striped";
+            ::mkdir(sdir.c_str(), 0755);
+        }
+        for(uint64_t i=0;i<n_chunks;++i){
+            char nm[128];
+            std::snprintf(nm,sizeof(nm),"kvlw_%lu",(unsigned long)i);
+            paths[i]=nm;  // store the name (not path) for striped:// URI
+            for(int d=0;d<4;++d){
+                char sp[256];
+                std::snprintf(sp,sizeof(sp),"%s/striped/%s.shard%d",mounts[d],nm,d);
+                if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp);
+            }
+        }
+        STEP_OK("Phase A (striped4): %lu targets x 4 shards (%.1f GB) in %.2fs",
+                (unsigned long)n_chunks,
+                (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
+    } else {
+        for(uint64_t i=0;i<n_chunks;++i){
+            char nm[128];std::snprintf(nm,sizeof(nm),"%s/kvlw_%lu",data_dir.c_str(),(unsigned long)i);
+            paths[i]=nm;
+            if(!create_file(paths[i],file_total))STEP_FAIL("create_file %s",nm);
+        }
+        STEP_OK("Phase A: %lu files (%.1f GB) in %.2fs",(unsigned long)n_chunks,
+                (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
     }
-    STEP_OK("Phase A: %lu files (%.1f GB) in %.2fs",(unsigned long)n_chunks,
-            (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
 
     // ---- Phase B: per-chunk K/V tensors + register each ----
     std::vector<void*> _raw_ptrs;
@@ -290,20 +430,20 @@ int main(int argc,char**argv){
     for(uint64_t b=0;b<n_hit;++b){
         hk[b]=gpu_alloc(ts);
         hv[b]=gpu_alloc(ts);
-        auto r=rt->register_memory({hk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)kCudaDev,""});
+        auto r=rt->register_memory({hk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
         if(!r.ok())STEP_FAIL("reg K hit %lu: %s",(unsigned long)b,r.status().message().c_str());
         hk_m[b]=r.value();
-        r=rt->register_memory({hv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)kCudaDev,""});
+        r=rt->register_memory({hv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
         if(!r.ok())STEP_FAIL("reg V hit %lu: %s",(unsigned long)b,r.status().message().c_str());
         hv_m[b]=r.value();
     }
     for(uint64_t b=0;b<n_miss;++b){
         mk[b]=gpu_alloc(ts);
         mv[b]=gpu_alloc(ts);
-        auto r=rt->register_memory({mk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)kCudaDev,""});
+        auto r=rt->register_memory({mk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
         if(!r.ok())STEP_FAIL("reg K miss %lu: %s",(unsigned long)b,r.status().message().c_str());
         mk_m[b]=r.value();
-        r=rt->register_memory({mv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)kCudaDev,""});
+        r=rt->register_memory({mv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
         if(!r.ok())STEP_FAIL("reg V miss %lu: %s",(unsigned long)b,r.status().message().c_str());
         mv_m[b]=r.value();
     }
@@ -314,11 +454,42 @@ int main(int argc,char**argv){
     // ---- Phase C: open targets ----
     std::vector<TargetHandle> tgt(n_chunks);
     for(uint64_t i=0;i<n_chunks;++i){
-        auto o=rt->open(std::string("file://")+paths[i],OpenOptions{"file"});
-        if(!o.ok())STEP_FAIL("open %s: %s",paths[i].c_str(),o.status().message().c_str());
+        std::string uri;
+        OpenOptions opts;
+        if (striped4) {
+            // Round 16 S7: per-chunk shard rotation (rot=i%4), mirroring
+            // legacy's shard_placement (kv_cache_layerwise_overlap.cu:293):
+            //     shard_placement = {coord_devs[(2i)%ndev],
+            //                        coord_devs[(2i+1)% ndev]}
+            // Rationale (legacy comment :287-291): "every batch then mixes
+            // chunks living on every device, so a single
+            // nvme_batch_xfer_kernel drives all N NVMes concurrently".
+            //
+            // Without rotation, every request in a layer shares
+            // target_offset = L*ts, so shard = (L*ts/ts) % 4 = L % 4 is
+            // CONSTANT across the whole batch -> the entire layer lands on
+            // ONE disk and 4-disk aggregation degenerates to single-disk
+            // bandwidth (measured: 6.9 GB/s == single-disk).  With
+            // rot=i%4, chunk i's shard (L%4) maps to device
+            // ((L%4)+i)%4, so a layer's 460 chunks spread evenly over all
+            // 4 devices within one fused kernel launch.
+            char rq[64];
+            std::snprintf(rq, sizeof(rq), "&rot=%llu",
+                          (unsigned long long)(i % 4));
+            uri = std::string("striped://") + paths[i] +
+                  "?devs=/mnt/nvme1,/mnt/nvme2,/mnt/nvme3,/mnt/nvme4"
+                  "&unit=524288" + rq;
+            opts = OpenOptions{"striped"};
+        } else {
+            uri = std::string("file://") + paths[i];
+            opts = OpenOptions{"file"};
+        }
+        auto o=rt->open(uri,opts);
+        if(!o.ok())STEP_FAIL("open %s: %s",uri.c_str(),o.status().message().c_str());
         tgt[i]=o.value();
     }
-    STEP_OK("Phase C: opened %lu targets",(unsigned long)n_chunks);
+    STEP_OK("Phase C: opened %lu targets (%s)",(unsigned long)n_chunks,
+            striped4?"striped4":"file");
 
     // ---- Phase D: 3 streams ----
     int pl=0,ph=0;CUDA_OK(cudaDeviceGetStreamPriorityRange(&pl,&ph));
@@ -355,7 +526,7 @@ int main(int argc,char**argv){
     // ---- Phase E: pre-write HIT chunks ----
     {
         auto tw=std::chrono::steady_clock::now();
-        HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION,kCudaDev,s_w};
+        HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION,gpu,s_w};
         for(uint32_t L=0;L<n_layers;++L){
             // Fill all hit K/V tensors with launch_fill_pattern (DMA-visible)
             for(uint64_t b=0;b<n_hit;++b){
@@ -368,7 +539,7 @@ int main(int argc,char**argv){
             // Windowed write
             auto reqs = build_writes(L, [&]{std::vector<uint64_t>v(n_hit);for(uint64_t i=0;i<n_hit;++i)v[i]=i;return v;}(),
                                           hk_m, hv_m);
-            auto res = windowed_submit_wait(rt.get(), dp, reqs.data(), reqs.size(),
+            auto res = windowed_submit_wait(rt.get(), seam, reqs.data(), reqs.size(),
                                             ctx, s_w, ts, "prewrite");
             if(res.bytes != reqs.size() * ts)
                 STEP_FAIL("Phase E L=%u: only %lu/%lu bytes written",
@@ -401,21 +572,21 @@ int main(int argc,char**argv){
     for(uint64_t i=0;i<n_miss;++i)mi[i]=n_hit+i;
 
     // do_read / do_write: windowed submit+wait, returns {ms, bytes}
-    HostSubmitContext ctx_r{ExecutionDomain::DEVICE_EXECUTION,kCudaDev,s_r};
-    HostSubmitContext ctx_w{ExecutionDomain::DEVICE_EXECUTION,kCudaDev,s_w};
+    HostSubmitContext ctx_r{ExecutionDomain::DEVICE_EXECUTION,gpu,s_r};
+    HostSubmitContext ctx_w{ExecutionDomain::DEVICE_EXECUTION,gpu,s_w};
 
     auto do_read=[&](uint32_t L,const std::vector<uint64_t>&idx,
                      const std::vector<MemoryHandle>&km,
                      const std::vector<MemoryHandle>&vm)->WindowedIoResult{
         auto reqs=build_reads(L,idx,km,vm);
-        return windowed_submit_wait(rt.get(),dp,reqs.data(),reqs.size(),
+        return windowed_submit_wait(rt.get(),seam,reqs.data(),reqs.size(),
                                     ctx_r,s_r,ts,"read");
     };
     auto do_write=[&](uint32_t L,const std::vector<uint64_t>&idx,
                       const std::vector<MemoryHandle>&km,
                       const std::vector<MemoryHandle>&vm)->WindowedIoResult{
         auto reqs=build_writes(L,idx,km,vm);
-        return windowed_submit_wait(rt.get(),dp,reqs.data(),reqs.size(),
+        return windowed_submit_wait(rt.get(),seam,reqs.data(),reqs.size(),
                                     ctx_w,s_w,ts,"write");
     };
 
@@ -575,7 +746,7 @@ int main(int argc,char**argv){
     // hard-asserted per-round DataPath::submit()==1 and (when accepted)
     // kernel-launch==1. Aggregate calls==rounds (and multi_round==0) proves
     // every one of those calls completed in exactly one round, i.e. one
-    // rt->submit -> one DataPath::submit -> one kernel launch per
+    // rt.submit -> one DataPath::submit -> one kernel launch per
     // layer/direction, end to end.
     LOG_INFO("Round15 S4 instrumentation: windowed_submit_wait calls=%lu total_rounds=%lu "
              "multi_round_calls=%lu (expect rounds==calls, multi_round==0 at this capacity)",
@@ -594,7 +765,19 @@ int main(int argc,char**argv){
     for(uint64_t b=0;b<n_hit;++b){RT_STATUS(rt->unregister_memory(hk_m[b]));RT_STATUS(rt->unregister_memory(hv_m[b]));}
     for(uint64_t b=0;b<n_miss;++b){RT_STATUS(rt->unregister_memory(mk_m[b]));RT_STATUS(rt->unregister_memory(mv_m[b]));}
     for(void* p:_raw_ptrs)CUDA_OK(cudaFree(p));
-    for(uint64_t i=0;i<n_chunks;++i){RT_STATUS(rt->close(tgt[i]));::unlink(paths[i].c_str());}
+    for(uint64_t i=0;i<n_chunks;++i){
+        RT_STATUS(rt->close(tgt[i]));
+        if (striped4) {
+            for(int d=0;d<4;++d){
+                char sp[256];
+                std::snprintf(sp,sizeof(sp),"/mnt/nvme%d/striped/%s.shard%d",
+                              d+1,paths[i].c_str(),d);
+                ::unlink(sp);
+            }
+        } else {
+            ::unlink(paths[i].c_str());
+        }
+    }
     CUDA_OK(cudaStreamDestroy(s_r));CUDA_OK(cudaStreamDestroy(s_c));CUDA_OK(cudaStreamDestroy(s_w));
     RT_STATUS(rt->shutdown(5000));
     std::fprintf(stderr,"\n=== layerwise_kv_overlap: PASSED ===\n");

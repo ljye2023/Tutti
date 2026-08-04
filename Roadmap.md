@@ -36,7 +36,7 @@
 | # | 事项 | 来源 | 要点 | 验收 |
 |---|---|---|---|---|
 | P1-1 | striped:// `name` 路径组件校验 | R15 P1 | resolve 期拒绝 `.`/`..`/`/`/NUL/空（fail-closed 对齐 LocalFileResolver），不静默 sanitize | 非法输入负向契约 |
-| P1-2 ◆ | 构建入口统一 | 全部评审 | 根 build（daemon 产线）vs standalone（开发测试）并存且 driver 参数漂移；**决策**：superbuild 统一 or standalone-only + 根 build 仅 daemon | 单一命令可复现全部工件；README 重写 Quick Start |
+| P1-2 | 运行模式与构建入口 | 全部评审；maintainer 2026-08-03 决策 | **运行时 daemon-only 定案**（app-direct 模式不实现）；构建保持两用途：standalone `tutti/` = 开发/测试，根 build = daemon/内核模块产线，README Quick Start 写明各自入口，不做 superbuild | README 入口说明 + 根 build configure 参数固化到文档 |
 | P1-3 ◆ | GPU 可移植性定位 | AUDIT §11、R15、REVIEW | 目标架构承诺 MACA/MUSA 但只有 CUDA/HOST；**决策**：写死 NVIDIA-only or 立项 vendor abstraction；最小动作：`data_paths/` 6 处直接 `#include <cuda_runtime.h>` 改走 `cuda_like.h` 统一报错 | 定位写入 README + 目标架构 D5 消解 |
 | P1-4 | kernel 双 baseline 行为对齐 | AUDIT §9 | 5.4 树 3 个修复（queue DMA、__free_pages、rq_data_dir）未回填 5.15；5.15 从未 insmod | 修复回填 + 每 baseline insmod 冒烟门禁 |
 | P1-5 | 测试 seam 收敛（开源卫生） | AUDIT §8 | `LocalNvmeDataPath` 约 30 个 `test_*` 公有方法混入生产头 | `TestAccess` friend 模式或等价收敛，公有面只留真 API；契约全绿 |
@@ -56,7 +56,7 @@
 
 ## P3 — 机会型优化（不阻塞）
 
-submit fan-out per-request vector 池化（AUDIT §7）；`submit_read_one/write_one` 合并（opcode 参数）；striped fan-out 部分 entry 拒绝时的回滚防御（当前不可达但脆弱）；`aggregate_completion_status_` 全成功快路径跳过 entries D2H；`find_free_*_slot_` 线性扫描 → free 栈；`QueueAcquireHelper` 常量偏移混淆简化；simulator 真三重叠指标化（6 指标框架已含）；**kernel 队列/性能测量**（队列 2→16 扫描、双盘 ~2× 差距定位——maintainer 2026-08-03 暂缓，保留候选）。
+submit fan-out per-request vector 池化（AUDIT §7）；`submit_read_one/write_one` 合并（opcode 参数）；striped fan-out 部分 entry 拒绝时的回滚防御（当前不可达但脆弱）；`aggregate_completion_status_` 全成功快路径跳过 entries D2H；`find_free_*_slot_` 线性扫描 → free 栈；`QueueAcquireHelper` 常量偏移混淆简化；simulator 真三重叠指标化（6 指标框架已含）；**DataPath 构造函数 Config 聚合**（maintainer 2026-08-04 指定：15 位置参数 → `Config` 结构体，默认值内嵌，零行为变更——已排入 R16 S7）；**kernel 队列/性能测量**（队列 2→16 扫描、双盘 ~2× 差距定位——maintainer 2026-08-03 暂缓，保留候选）。
 
 ---
 
