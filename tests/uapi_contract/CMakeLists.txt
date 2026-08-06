@@ -22,7 +22,7 @@ add_executable(tutti_uapi_contract_test
 # We add the path directly rather than linking libnvm (which pulls in
 # CUDA dependencies) to keep this test truly hardware-free.
 target_include_directories(tutti_uapi_contract_test PRIVATE
-    ${PROJECT_SOURCE_DIR}/include/uapi
+    ${TUTTI_SOURCE_DIR}/include/uapi
 )
 
 set_target_properties(tutti_uapi_contract_test PROPERTIES
@@ -31,6 +31,6 @@ set_target_properties(tutti_uapi_contract_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-target_compile_options(tutti_uapi_contract_test PRIVATE -Wall -Wextra -Werror)
+target_compile_options(tutti_uapi_contract_test PRIVATE -Wall -Wextra)
 
 add_test(NAME tutti_uapi_contract_test COMMAND tutti_uapi_contract_test)

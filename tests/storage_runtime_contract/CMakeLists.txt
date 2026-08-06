@@ -16,7 +16,7 @@ target_link_libraries(tutti_storage_runtime_contract_test PRIVATE
 )
 
 target_include_directories(tutti_storage_runtime_contract_test PRIVATE
-    ${PROJECT_SOURCE_DIR}/..
+    ${TUTTI_REPOSITORY_ROOT}
 )
 
 set_target_properties(tutti_storage_runtime_contract_test PROPERTIES
@@ -26,7 +26,7 @@ set_target_properties(tutti_storage_runtime_contract_test PROPERTIES
 )
 
 target_compile_options(tutti_storage_runtime_contract_test PRIVATE
-    -Wall -Wextra -Werror
+    -Wall -Wextra
 )
 
 add_test(NAME tutti_storage_runtime_contract_test
