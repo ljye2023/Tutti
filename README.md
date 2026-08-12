@@ -7,12 +7,10 @@
 Tutti (Italian for "all instruments together") makes NVMe SSDs a practical KV-cache tier for LLM inference, building on the ideas of [GeminiFS](https://www.usenix.org/conference/fast25/presentation/qiu) (FAST'25), a companion file system for GPUs. **The CPU launches I/O kernels; the GPU executes them.** Each GPU kernel moves KV cache between SSDs and HBM on its own — giving SSD-backed KV cache DRAM-like performance with hundreds of times the capacity.
 
 ## 📰 News
-
+- **2026.8.11**   Added support for Metax GPU.
 - **2026.8** — **v0.1.1**: stable `StorageRuntime` public API (open/open_batch/register/submit/wait) over replaceable resolver/binding/DataPath boundaries; striped multi-device data path reaches 25.0 GB/s on 4× NVMe (98% of near-saturated per-drive bandwidth); vendor-neutral `cuda_like` GPU framework (CUDA proven; MUSA/MACA profiles); kernel P2P layer split into symmetric nvidia/metax backends; batch open (500 files in ~10 ms).
 
 - **2026.7** — `snvme` kernel module update: dynamic CPU-side and GPU-side queue allocation after mount, a standard POSIX interface, and poll-based I/O submission from both user-space threads and GPU kernel threads.
-
-- **2026.6** — Tutti adapted to the MetaX C600 GPU.
 
 - **2026.5** — Tutti paper released on [arXiv](https://arxiv.org/abs/2605.03375) (SSD-backed KV cache: −78.3% TTFT, 2× request rate, −27% serving cost vs. GDS-enabled LMCache).
 
