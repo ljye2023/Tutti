@@ -3,7 +3,7 @@
  *
  * The owner half of the SERVICE_CLIENT data plane.  This process is
  * the sole owner of every NVMe controller named in sys_config.yaml:
- * it does the libnvm B3 bring-up (chrdev_create + cap + bind + probe),
+ * it does the libnvm owner bring-up (chrdev_create + cap + bind + probe),
  * mounts each block device, publishes per-GPU view symlinks, and serves
  * gRPC so that Coordinator
  * instances running in SERVICE_CLIENT mode (see
@@ -176,6 +176,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The per-namespace logical block size reported by the controller is the
+    // source of truth.  Uniformity is enforced by ServiceState before any
+    // mount or gRPC setup; warn when the uniform value differs from the
+    // current 4 KiB striped assumption.
+    const auto startup_devices = state->list_devices();
+    const uint32_t startup_block_size = startup_devices.front().blk_size;
+    for (const auto& d : startup_devices) {
+        if (d.blk_size != nvmeservice::kExpectedNvmeBlockSize) {
+            std::fprintf(stderr,
+                         "WARNING: NVMe device_id=%d pci=%s reports "
+                         "block_size=%u bytes; expected %u bytes for "
+                         "striped operation\n",
+                         d.device_id, d.pci_addr.c_str(), d.blk_size,
+                         nvmeservice::kExpectedNvmeBlockSize);
+        }
+    }
+
     // Round 17 S1: post-bring-up mount.  The snvme kernel module only
     // creates /dev/snvme<id>n<ns> block devices AFTER ServiceState has
     // bound + probed the controller, so mount must come after bring-up.
@@ -246,7 +263,8 @@ int main(int argc, char** argv) {
     // daemon is ready and on which port.  Owned-devices listing and
     // shutdown messages are info-level (gated by TUTTI_VERBOSE).
     std::cout << "tutti_daemon listening on " << cfg.grpc.endpoint
-              << " (port " << bound_port << ")\n";
+              << " (port " << bound_port << ")"
+              << " block_size=" << startup_block_size << "\n";
     if (tutti_verbose()) {
         std::cout << "Owned devices:\n";
         for (const auto& d : state->list_devices()) {
@@ -254,7 +272,12 @@ int main(int argc, char** argv) {
                       << " pci="  << d.pci_addr
                       << " snvme=" << d.snvme_dev_path
                       << " ns="   << d.namespace_id
+                      << " block_size=" << d.blk_size
+                      << " io_qp_limit=" << d.max_user_qid
+                      << " kernel_io_qps=" << d.kernel_io_qps
+                      << " user_io_qps=" << d.user_io_qps
                       << " max_user_qid=" << d.max_user_qid
+                      << " max_q_per_grp=" << d.max_queues_per_group
                       << "\n";
         }
         std::cout.flush();

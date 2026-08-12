@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme-core: " fmt
+
 /*
  * NVM Express hardware monitoring support
  * Copyright (c) 2019, Guenter Roeck

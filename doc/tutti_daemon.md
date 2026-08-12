@@ -40,6 +40,11 @@ ServiceState bring-up
         └── /dev/snvme<N>n<NSID> 块设备，供 ext4 mount 使用
         │
         ▼
+检查每个 namespace 报告的 logical block size
+  多盘必须统一；不统一时在 mount/gRPC 前拒绝启动
+  非 4 KiB 的统一值输出 WARNING（当前 striped 假设仍为 4 KiB）
+        │
+        ▼
 MountManager 创建 mount_path 并挂载 ext4
         │
         ▼
@@ -261,7 +266,7 @@ nvmeservice: device=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 ...
 mount_manager: mounted /dev/snvme0n1 at /mnt/nvme0 (owned)
 tutti_daemon listening on 127.0.0.1:50051 (port 50051)
 Owned devices:
-  device_id=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 ...
+  device_id=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 block_size=4096 io_qp_limit=64 kernel_io_qps=32 user_io_qps=32 max_user_qid=64 max_q_per_grp=16
 ```
 
 `tutti_daemon listening` 只说明 gRPC 已启动。完整成功还必须确认 mount 和 GPU view，
@@ -271,6 +276,50 @@ Owned devices:
 warning: auto-mount ... failed
 warning: ... is not mounted; GPU views ... will not be published
 ```
+
+### 7.2 队列日志字段
+
+以下字段均以 I/O queue pair 为单位，不包含 QID 0 的 admin queue：
+
+| 字段 | 含义 |
+| --- | --- |
+| `io_qp_limit` | 控制器协商得到的 I/O QP 总上限 |
+| `kernel_io_qps` | kernel 实际占用的 I/O QP 数量 |
+| `user_io_qps` | 启动时划给 user QID pool 的容量，不是实时剩余量 |
+| `max_user_qid` | `NVM_ADD_USER_QUEUE` 可分配的最大 QID 编号（包含），不是 QP 数量 |
+| `max_q_per_grp` | 单个 client fd/queue group 最多可创建的 user QP 数量 |
+
+总量关系为 `kernel_io_qps + user_io_qps = io_qp_limit`。单个 client 的
+实际上限还会受到 `queue_pool.max_per_client` 和 `max_q_per_grp` 的共同限制。
+
+<details>
+<summary>QID 编号关系示例</summary>
+
+当 `start_cq_idx=33`、`max_user_qid=64` 时，QID 1～32 属于 kernel，
+QID 33～64 属于 user：
+
+```text
+kernel_io_qps = start_cq_idx - 1 = 32
+user_io_qps   = max_user_qid - start_cq_idx + 1 = 32
+io_qp_limit   = max_user_qid = 64
+```
+
+`io_qp_limit` 与 `max_user_qid` 数值相同，是因为 I/O QID 从 1 连续编号；
+前者表示 QP 总数量，后者表示最大 QID 编号。
+
+</details>
+
+### 7.3 Namespace block size
+
+日志中的 `block_size`/`blk_size` 是 namespace logical block size，即
+`1 << lba_shift` bytes；`blk_size_log` 是对应的 LBA shift。它不是 ext4 block
+size、physical block size 或 controller-wide 属性，并且无需在 YAML 中重复配置。
+
+- 多盘值不一致（例如同时出现 `4096` 和 `512`）时，daemon 会在挂载前退出；
+- 所有盘一致但不是 4 KiB 时，daemon 会输出 `WARNING` 后继续启动，但不满足当前
+  striped workload 的 4 KiB 假设。
+
+### 7.4 启动后检查
 
 在另一个终端执行：
 

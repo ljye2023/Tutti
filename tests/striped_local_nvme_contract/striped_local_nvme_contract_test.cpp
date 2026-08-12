@@ -27,6 +27,13 @@
 // verified out-of-band (result6.md), not by this binary.
 //
 // Returns 0 on pass, 1 on fail, 77 on SKIP (hardware unavailable).
+//
+// Usage:
+//   tutti_striped_local_nvme_contract_test [--devices 2|4] [--gpu ID]
+//       [--nvme ssnvme,bdf,backing,mount[,block_size[,bar0_size[,nsid]]]] ...
+// With no argument, the test selects the largest supported power-of-two
+// device count that is available: 4 when all four devices are ready,
+// otherwise 2 when at least the first two devices are ready.
 
 #include <tutti/storage_runtime.h>
 #include <tutti/io_types.h>
@@ -36,12 +43,16 @@
 #include "tutti/resolvers/local_file/resolver.h"
 #include "tutti/bindings/striped_local_nvme/binding.h"
 
+#include "../hardware_test_directory.h"
+#include "../nvme_test_cli.h"
+
 #include <tutti/cuda_like.h>
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,6 +65,7 @@ using namespace tutti;
 using namespace tutti::data_paths::striped_local_nvme;
 using namespace tutti::resolvers::striped_file;
 using namespace tutti::resolvers::local_file;
+using namespace tutti::test_support;
 
 extern "C" void launch_fill_pattern_gpu(void* buf, unsigned char val,
                                         std::uint64_t n, void* stream);
@@ -63,6 +75,10 @@ extern "C" void launch_fill_position_pattern_gpu(void* buf,
 
 static int g_pass = 0;
 static int g_fail = 0;
+static std::vector<tutti::test_support::UniqueTestDirectory> g_run_dirs;
+static std::vector<std::string> g_test_mounts;
+static std::vector<NvmeTestDevice> g_devices = default_nvme_test_devices();
+static std::int32_t g_gpu_id = 0;
 
 #define TEST_CASE(name) std::printf("--- %s ---\n", name)
 #define CHECK(cond, msg) do { \
@@ -70,23 +86,155 @@ static int g_fail = 0;
     else { std::printf("  FAIL: %s\n", msg); ++g_fail; } \
 } while (0)
 
+static bool create_test_mounts(std::uint32_t num_devices) {
+    g_run_dirs.reserve(num_devices);
+    g_test_mounts.reserve(num_devices);
+    for (std::uint32_t i = 0; i < num_devices; ++i) {
+        const std::string& parent = g_devices.at(i).mount_path;
+        tutti::test_support::UniqueTestDirectory dir;
+        std::string error;
+        if (!tutti::test_support::UniqueTestDirectory::create(
+                parent, "tutti_striped_local_nvme", dir, error)) {
+            std::fprintf(stderr, "ERROR: %s\n", error.c_str());
+            for (const auto& existing : g_run_dirs) {
+                std::fprintf(stderr, "Preserving test artifacts: %s\n",
+                             existing.path().c_str());
+            }
+            return false;
+        }
+        std::printf("Test directory for device %u: %s\n", i,
+                    dir.path().c_str());
+        g_test_mounts.push_back(dir.path());
+        g_run_dirs.push_back(std::move(dir));
+    }
+    return true;
+}
+
+static std::string shard_path(std::uint32_t device,
+                              const std::string& name,
+                              std::uint32_t shard) {
+    return g_test_mounts.at(device) + "/striped/" + name + ".shard" +
+           std::to_string(shard);
+}
+
+static bool cleanup_test_mounts() {
+    bool ok = true;
+    for (auto& dir : g_run_dirs) {
+        std::string error;
+        if (!dir.cleanup(error)) {
+            std::fprintf(stderr, "ERROR: test passed but cleanup failed: %s\n",
+                         error.c_str());
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static void print_preserved_test_mounts() {
+    for (const auto& dir : g_run_dirs) {
+        if (dir.valid()) {
+            std::printf("Preserving failed-test artifacts: %s\n",
+                        dir.path().c_str());
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Environment helpers
 // -------------------------------------------------------------------------
 
-static bool hw_available() {
-    // Round 16 S3: check all 4 /dev/ssnvme{0-3} + 4 mount points.
-    for (int i = 0; i < 4; ++i) {
-        char dev[32];
-        std::snprintf(dev, sizeof(dev), "/dev/ssnvme%d", i);
-        struct stat st{};
-        if (::stat(dev, &st) != 0) return false;
-        char mnt[32];
-        std::snprintf(mnt, sizeof(mnt), "/mnt/nvme%d", i);
-        if (::stat(mnt, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+static bool device_available(std::uint32_t device) {
+    if (device >= g_devices.size()) return false;
+    struct stat st{};
+    if (::stat(g_devices[device].ssnvme_path.c_str(), &st) != 0) return false;
+    if (::stat(g_devices[device].mount_path.c_str(), &st) != 0 ||
+        !S_ISDIR(st.st_mode)) return false;
+    const std::size_t slash = g_devices[device].mount_path.find_last_of('/');
+    const std::string parent = slash == 0
+        ? "/"
+        : g_devices[device].mount_path.substr(
+              0, slash == std::string::npos ? 0 : slash);
+    struct stat parent_st{};
+    return !parent.empty() && ::stat(parent.c_str(), &parent_st) == 0 &&
+           st.st_dev != parent_st.st_dev;
+}
+
+static std::uint32_t consecutive_device_count() {
+    std::uint32_t count = 0;
+    while (count < g_devices.size() && count < 4 && device_available(count)) ++count;
+    return count;
+}
+
+static bool hw_available(std::uint32_t num_devices) {
+    for (std::uint32_t i = 0; i < num_devices; ++i) {
+        if (!device_available(i)) return false;
     }
     int dc = 0;
     if (cudaGetDeviceCount(&dc) != cudaSuccess || dc == 0) return false;
+    return g_gpu_id >= 0 && g_gpu_id < dc;
+}
+
+static void print_usage(const char* program) {
+    std::fprintf(stderr,
+                 "Usage: %s [--devices 2|4] [--gpu ID] [--nvme %s]...\n",
+                 program, nvme_test_device_format().c_str());
+}
+
+static bool parse_device_count(const char* value, std::uint32_t& out) {
+    if (std::strcmp(value, "2") == 0) {
+        out = 2;
+        return true;
+    }
+    if (std::strcmp(value, "4") == 0) {
+        out = 4;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_args(int argc, char** argv, std::uint32_t& requested) {
+    bool nvme_overridden = false;
+    requested = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--devices") == 0 && i + 1 < argc) {
+            if (!parse_device_count(argv[++i], requested)) return false;
+            continue;
+        }
+        constexpr const char* prefix = "--devices=";
+        if (std::strncmp(argv[i], prefix, std::strlen(prefix)) == 0) {
+            if (!parse_device_count(argv[i] + std::strlen(prefix), requested)) return false;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+            std::uint32_t gpu = 0;
+            if (!parse_u32(argv[++i], &gpu) ||
+                gpu > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+                return false;
+            }
+            g_gpu_id = static_cast<std::int32_t>(gpu);
+            continue;
+        }
+        if (std::strcmp(argv[i], "--nvme") == 0 && i + 1 < argc) {
+            NvmeTestDevice device;
+            std::string error;
+            if (!parse_nvme_test_device(argv[++i], &device, &error)) {
+                std::fprintf(stderr, "invalid --nvme: %s; expected %s\n",
+                             error.c_str(), nvme_test_device_format().c_str());
+                return false;
+            }
+            if (!nvme_overridden) {
+                g_devices.clear();
+                nvme_overridden = true;
+            }
+            g_devices.push_back(std::move(device));
+            continue;
+        }
+        return false;
+    }
+    if (g_devices.size() > 4) {
+        std::fprintf(stderr, "striped contract supports at most 4 --nvme devices\n");
+        return false;
+    }
     return true;
 }
 
@@ -218,17 +366,14 @@ struct StripedEnv {
 
     explicit StripedEnv(std::uint32_t num_devices)
         : dp(build_devs(num_devices),
-             /*cuda_device=*/(std::uint32_t)test_gpu_id(),
+             /*cuda_device=*/(std::uint32_t)g_gpu_id,
              /*mdts_override=*/0, /*cq_poll_budget=*/2000000,
              /*max_batch_entries=*/4096, /*max_in_flight_operations=*/4) {
-        // Round 16 S3: per-device resolvers for up to 4 devices.
-        static const char* kPciAddrs[] = {"0000:08:00.0", "0000:4b:00.0",
-                                           "0000:57:00.0", "0000:63:00.0"};
-        static const char* kBackingDevs[] = {"/dev/snvme0n1", "/dev/snvme1n1",
-                                             "/dev/snvme2n1", "/dev/snvme3n1"};
         for (std::uint32_t i = 0; i < num_devices; ++i) {
+            const auto& device = g_devices.at(i);
             sub_resolvers.push_back(std::make_unique<LocalFileResolver>(
-                kPciAddrs[i], 1, 4096, BackingDeviceConfig{kBackingDevs[i], 0}));
+                device.pci_bdf, device.namespace_id, device.block_size,
+                BackingDeviceConfig{device.backing_device, 0}));
         }
         striped_resolver = std::make_unique<StripedResolver>(
             std::move(sub_resolvers), kStripeUnit);
@@ -238,13 +383,12 @@ struct StripedEnv {
     // num_user_queues=16 (Round 16 S3 upgrade from 1→16); ring depth is
     // kernel-authoritative (NVM_GET_DEV_INFO), not a parameter.
     static std::vector<DeviceDescriptor> build_devs(std::uint32_t n) {
-        static const char* kSnvmePaths[] = {
-            "/dev/ssnvme0", "/dev/ssnvme1", "/dev/ssnvme2", "/dev/ssnvme3"};
         std::vector<DeviceDescriptor> v;
         for (std::uint32_t i = 0; i < n; ++i) {
-            v.push_back({kSnvmePaths[i], 16384, 1,
-                         (std::uint32_t)test_gpu_id(),
-                         /*num_user_queues=*/16, 4096});
+            const auto& device = g_devices.at(i);
+            v.push_back({device.ssnvme_path, device.bar0_size,
+                         device.namespace_id, (std::uint32_t)g_gpu_id,
+                         /*num_user_queues=*/16, device.block_size});
         }
         return v;
     }
@@ -268,11 +412,10 @@ static std::unique_ptr<StripedEnv> make_env(std::uint32_t num_devices = 2) {
 // device mount list matching devs= query param for N devices.
 // Round 16 S3: extended for N=3,4.
 static std::string devs_param(std::uint32_t n) {
-    static const char* kMounts[] = {"/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme3"};
     std::string s;
     for (std::uint32_t i = 0; i < n; ++i) {
         if (i) s += ",";
-        s += kMounts[i];
+        s += g_test_mounts.at(i);
     }
     return s;
 }
@@ -285,8 +428,8 @@ static int test_82_roundtrip(StripedEnv* env) {
     TEST_CASE("82. roundtrip (single-shard + cross-shard, position-dependent pattern)");
 
     const std::uint64_t shard_size = kStripeUnit * 16;  // 1 MiB/shard, 2 MiB total
-    std::string p0 = "/mnt/nvme0/striped/t82.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t82.shard1";
+    std::string p0 = shard_path(0, "t82", 0);
+    std::string p1 = shard_path(1, "t82", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -371,31 +514,53 @@ static int test_82_roundtrip(StripedEnv* env) {
 // Test 83: single launch -- N=1 and N=2, exactly 1 submit call + 1 launch
 // -------------------------------------------------------------------------
 
-static int test_83_single_launch(StripedEnv* env2, StripedEnv* env1) {
+static int test_83_single_launch() {
     TEST_CASE("83. single launch (N=1 and N=2 devices, exactly 1 kernel launch)");
 
-    auto run_for = [](StripedEnv* env, std::uint32_t n, const char* tag) -> bool {
+    auto run_for = [](std::uint32_t n, const char* tag) -> bool {
+        auto env = make_env(n);
+        if (!env) return false;
+
         const std::uint64_t shard_size = kStripeUnit * 4;
         std::string name = std::string("t83_") + tag;
-        std::string p0 = "/mnt/nvme0/striped/" + name + ".shard0";
-        std::string p1 = "/mnt/nvme1/striped/" + name + ".shard1";
-        if (!create_backing_file(p0, shard_size)) return false;
-        if (n == 2 && !create_backing_file(p1, shard_size)) return false;
+        std::string p0 = shard_path(0, name, 0);
+        std::string p1 = n == 2 ? shard_path(1, name, 1) : std::string{};
+        if (!create_backing_file(p0, shard_size) ||
+            (n == 2 && !create_backing_file(p1, shard_size))) {
+            ::unlink(p0.c_str());
+            if (n == 2) ::unlink(p1.c_str());
+            env->rt->shutdown(5000);
+            return false;
+        }
 
         std::string uri = "striped://" + name + "?devs=" + devs_param(n) + "&unit=65536";
         auto opened = env->rt->open(uri, OpenOptions{"striped"});
-        if (!opened.ok()) { ::unlink(p0.c_str()); if (n == 2) ::unlink(p1.c_str()); return false; }
+        if (!opened.ok()) {
+            ::unlink(p0.c_str());
+            if (n == 2) ::unlink(p1.c_str());
+            env->rt->shutdown(5000);
+            return false;
+        }
         auto target = opened.value();
 
         const std::uint64_t io_size = shard_size * n;
         void* raw = nullptr;
         void* buf = cuda_malloc_aligned_64k(io_size, &raw);
+        if (buf == nullptr) {
+            env->rt->close(target);
+            ::unlink(p0.c_str());
+            if (n == 2) ::unlink(p1.c_str());
+            env->rt->shutdown(5000);
+            return false;
+        }
         auto mem_r = env->rt->register_memory(
             {buf, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
         if (!mem_r.ok()) {
             if (raw) cudaFree(raw);
             env->rt->close(target);
-            ::unlink(p0.c_str()); if (n == 2) ::unlink(p1.c_str());
+            ::unlink(p0.c_str());
+            if (n == 2) ::unlink(p1.c_str());
+            env->rt->shutdown(5000);
             return false;
         }
 
@@ -421,11 +586,12 @@ static int test_83_single_launch(StripedEnv* env2, StripedEnv* env1) {
         cudaStreamDestroy(stream);
         ::unlink(p0.c_str());
         if (n == 2) ::unlink(p1.c_str());
+        env->rt->shutdown(5000);
         return ok;
     };
 
-    CHECK(run_for(env1, 1, "n1"), "N=1: exactly 1 submit call, 1 kernel launch");
-    CHECK(run_for(env2, 2, "n2"), "N=2: exactly 1 submit call, 1 kernel launch");
+    CHECK(run_for(1, "n1"), "N=1: exactly 1 submit call, 1 kernel launch");
+    CHECK(run_for(2, "n2"), "N=2: exactly 1 submit call, 1 kernel launch");
     return g_fail > 0 ? 1 : 0;
 }
 
@@ -433,110 +599,125 @@ static int test_83_single_launch(StripedEnv* env2, StripedEnv* env1) {
 // Test 84: cross-disk parallel speedup > 1.3x vs single-disk
 // -------------------------------------------------------------------------
 
-static int test_84_speedup(StripedEnv* env2, StripedEnv* env1) {
-    TEST_CASE("84. cross-disk parallel READ speedup (>1.3x vs single-disk)");
+struct ReadPerfResult {
+    bool prepared = false;
+    bool ok = false;
+    double milliseconds = 0;
+    double bandwidth_gbps = 0;
+};
 
-    // >=64 MiB/shard so per-op overhead (kernel launch, CQ poll, wait())
-    // is amortized and the measurement reflects real device bandwidth, not
-    // submission latency.
+static ReadPerfResult measure_read_performance(std::uint32_t n,
+                                               const char* tag) {
+    ReadPerfResult result;
+    auto env = make_env(n);
+    if (!env) return result;
+
     const std::uint64_t shard_size = 64ull * 1024 * 1024;
-    auto prep = [&](StripedEnv* env, std::uint32_t n, const char* tag,
-                    TargetHandle& target_out, void** raw_out, void** buf_out,
-                    MemoryHandle& mem_out, std::string& p0_out, std::string& p1_out) -> bool {
-        std::string name = std::string("t84_") + tag;
-        p0_out = "/mnt/nvme0/striped/" + name + ".shard0";
-        p1_out = "/mnt/nvme1/striped/" + name + ".shard1";
-        if (!create_backing_file(p0_out, shard_size)) return false;
-        if (n == 2 && !create_backing_file(p1_out, shard_size)) return false;
+    const std::uint64_t io_size = shard_size * n;
+    std::string name = std::string("t84_") + tag;
+    std::string p0 = shard_path(0, name, 0);
+    std::string p1 = n == 2 ? shard_path(1, name, 1) : std::string{};
+    TargetHandle target;
+    MemoryHandle memory;
+    void* raw = nullptr;
+    void* buffer = nullptr;
+    cudaStream_t stream = nullptr;
 
-        std::string uri = "striped://" + name + "?devs=" + devs_param(n) + "&unit=65536";
-        auto opened = env->rt->open(uri, OpenOptions{"striped"});
-        if (!opened.ok()) return false;
-        target_out = opened.value();
-
-        const std::uint64_t io_size = shard_size * n;
-        *buf_out = cuda_malloc_aligned_64k(io_size, raw_out);
-        auto mem_r = env->rt->register_memory(
-            {*buf_out, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
-        if (!mem_r.ok()) return false;
-        mem_out = mem_r.value();
-
-        cudaStream_t s;
-        cudaStreamCreate(&s);
-        launch_fill_pattern_gpu(*buf_out, 0x5A, io_size, s);
-        cudaStreamSynchronize(s);
-        HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
-        IoRequest wreq{IoDirection::WRITE, mem_out, 0, target_out, 0, io_size};
-        bool ok = submit_wait_all(env->rt.get(), &wreq, 1, ctx);
-        cudaStreamDestroy(s);
-        return ok;
+    auto cleanup = [&]() {
+        if (memory.valid()) env->rt->unregister_memory(memory);
+        if (raw != nullptr) cudaFree(raw);
+        if (target.valid()) env->rt->close(target);
+        if (stream != nullptr) cudaStreamDestroy(stream);
+        env->rt->shutdown(5000);
+        ::unlink(p0.c_str());
+        if (n == 2) ::unlink(p1.c_str());
     };
 
-    TargetHandle t2{}, t1{};
-    void *raw2 = nullptr, *buf2 = nullptr, *raw1 = nullptr, *buf1 = nullptr;
-    MemoryHandle m2{}, m1{};
-    std::string p0_2, p1_2, p0_1, p1_1;
+    if (!create_backing_file(p0, shard_size) ||
+        (n == 2 && !create_backing_file(p1, shard_size))) {
+        cleanup();
+        return result;
+    }
 
-    bool prep2 = prep(env2, 2, "dual", t2, &raw2, &buf2, m2, p0_2, p1_2);
-    bool prep1 = prep(env1, 1, "single", t1, &raw1, &buf1, m1, p0_1, p1_1);
-    CHECK(prep2 && prep1, "prepare dual-disk and single-disk targets");
-    if (!prep2 || !prep1) return 1;
+    std::string uri = "striped://" + name + "?devs=" +
+                      devs_param(n) + "&unit=65536";
+    auto opened = env->rt->open(uri, OpenOptions{"striped"});
+    if (!opened.ok()) {
+        cleanup();
+        return result;
+    }
+    target = opened.value();
 
-    cudaStream_t s2, s1;
-    cudaStreamCreate(&s2);
-    cudaStreamCreate(&s1);
+    buffer = cuda_malloc_aligned_64k(io_size, &raw);
+    if (buffer == nullptr) {
+        cleanup();
+        return result;
+    }
+    auto registered = env->rt->register_memory(
+        {buffer, io_size, MemoryKind::DEVICE,
+         MemoryOwnership::CALLER_OWNED, 0, ""});
+    if (!registered.ok()) {
+        cleanup();
+        return result;
+    }
+    memory = registered.value();
 
-    const std::uint64_t io_size2 = shard_size * 2;
-    const std::uint64_t io_size1 = shard_size * 1;
+    cudaStreamCreate(&stream);
+    HostSubmitContext context{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
+    launch_fill_pattern_gpu(buffer, 0x5A, io_size, stream);
+    cudaStreamSynchronize(stream);
+    IoRequest write_request{
+        IoDirection::WRITE, memory, 0, target, 0, io_size};
+    if (!submit_wait_all(env->rt.get(), &write_request, 1, context)) {
+        cleanup();
+        return result;
+    }
+    result.prepared = true;
 
-    cudaMemsetAsync(buf2, 0, io_size2, s2);
-    cudaStreamSynchronize(s2);
-    HostSubmitContext ctx2{ExecutionDomain::DEVICE_EXECUTION, 0, s2};
-    auto t_start2 = std::chrono::steady_clock::now();
-    IoRequest rreq2{IoDirection::READ, m2, 0, t2, 0, io_size2};
-    bool rok2 = submit_wait_all(env2->rt.get(), &rreq2, 1, ctx2);
-    double dual_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_start2).count();
+    cudaMemsetAsync(buffer, 0, io_size, stream);
+    cudaStreamSynchronize(stream);
+    IoRequest read_request{
+        IoDirection::READ, memory, 0, target, 0, io_size};
+    auto start = std::chrono::steady_clock::now();
+    result.ok = submit_wait_all(
+        env->rt.get(), &read_request, 1, context);
+    result.milliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    if (result.ok && result.milliseconds > 0) {
+        result.bandwidth_gbps =
+            (static_cast<double>(io_size) / 1e9) /
+            (result.milliseconds / 1000.0);
+    }
 
-    cudaMemsetAsync(buf1, 0, io_size1, s1);
-    cudaStreamSynchronize(s1);
-    HostSubmitContext ctx1{ExecutionDomain::DEVICE_EXECUTION, 0, s1};
-    auto t_start1 = std::chrono::steady_clock::now();
-    IoRequest rreq1{IoDirection::READ, m1, 0, t1, 0, io_size1};
-    bool rok1 = submit_wait_all(env1->rt.get(), &rreq1, 1, ctx1);
-    double single_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_start1).count();
+    cleanup();
+    return result;
+}
 
-    CHECK(rok1 && rok2, "both reads completed");
-    double single_bw_gbps = (single_ms > 0)
-        ? (shard_size / 1e9) / (single_ms / 1000.0) : 0.0;
-    double dual_bw_gbps = (dual_ms > 0)
-        ? ((shard_size * 2) / 1e9) / (dual_ms / 1000.0) : 0.0;
-    double speedup = (dual_ms > 0) ? (2.0 * single_ms) / dual_ms : 0.0;
+static int test_84_speedup() {
+    TEST_CASE("84. cross-disk parallel READ speedup (>1.3x vs single-disk)");
+
+    ReadPerfResult dual = measure_read_performance(2, "dual");
+    ReadPerfResult single = measure_read_performance(1, "single");
+    CHECK(single.prepared && dual.prepared,
+          "prepare dual-disk and single-disk targets");
+    CHECK(single.ok && dual.ok, "both reads completed");
+    if (!single.ok || !dual.ok) return 1;
+
+    double speedup = dual.milliseconds > 0
+        ? (2.0 * single.milliseconds) / dual.milliseconds : 0.0;
     std::printf("  single-disk READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
-               shard_size / 1048576.0, single_ms, single_bw_gbps);
+               64.0, single.milliseconds, single.bandwidth_gbps);
     std::printf("  dual-disk striped READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
-               (shard_size * 2) / 1048576.0, dual_ms, dual_bw_gbps);
+               128.0, dual.milliseconds, dual.bandwidth_gbps);
     std::printf("  effective speedup: %.2fx\n", speedup);
     // Accept either a clean >1.3x speedup over this run's single-disk
     // baseline, OR an absolute aggregate bandwidth (>=12 GB/s) that by
     // itself already exceeds what one NVMe device can deliver -- i.e. the
     // two devices are demonstrably being driven in parallel by the single
     // fused kernel launch, independent of single-disk-baseline jitter.
-    CHECK(speedup > 1.3 || dual_bw_gbps >= 12.0,
+    CHECK(speedup > 1.3 || dual.bandwidth_gbps >= 12.0,
          "cross-disk speedup > 1.3x, or dual-disk bandwidth >= 12 GB/s "
          "(exceeds single-NVMe ceiling, proving real parallelism)");
-
-    env2->rt->unregister_memory(m2);
-    env1->rt->unregister_memory(m1);
-    cudaFree(raw2);
-    cudaFree(raw1);
-    env2->rt->close(t2);
-    env1->rt->close(t1);
-    cudaStreamDestroy(s2);
-    cudaStreamDestroy(s1);
-    ::unlink(p0_2.c_str()); ::unlink(p1_2.c_str());
-    ::unlink(p0_1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
@@ -548,8 +729,8 @@ static int test_85_distribution(StripedEnv* env) {
     TEST_CASE("85. stripe distribution (round-robin verified in backing files)");
 
     const std::uint64_t shard_size = kStripeUnit * 8;
-    std::string p0 = "/mnt/nvme0/striped/t85.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t85.shard1";
+    std::string p0 = shard_path(0, "t85", 0);
+    std::string p1 = shard_path(1, "t85", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -617,8 +798,8 @@ static int test_86_lifecycle(StripedEnv* env) {
     TEST_CASE("86. lifecycle (in-flight close BUSY, drain, clean teardown)");
 
     const std::uint64_t shard_size = kStripeUnit * 32;  // bigger, to keep IO in-flight briefly
-    std::string p0 = "/mnt/nvme0/striped/t86.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t86.shard1";
+    std::string p0 = shard_path(0, "t86", 0);
+    std::string p1 = shard_path(1, "t86", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -674,9 +855,8 @@ static int test_86_lifecycle(StripedEnv* env) {
     ::unlink(p0.c_str());
     ::unlink(p1.c_str());
 
-    // resolver_test dir cleanliness (shared convention with local_nvme tests):
-    // this test uses /mnt/nvme{1,2}/striped, not resolver_test, so nothing
-    // to check here; striped dirs are removed in main() after all tests.
+    // The run-scoped per-device directories are removed by main() only after
+    // the complete suite passes; failures retain their artifacts.
     return g_fail > 0 ? 1 : 0;
 }
 
@@ -691,8 +871,8 @@ static int test_87_full_public_path(StripedEnv* env) {
     TEST_CASE("87. full public path (zero striped-awareness at the call site)");
 
     const std::uint64_t shard_size = kStripeUnit * 4;
-    std::string p0 = "/mnt/nvme0/striped/t87.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t87.shard1";
+    std::string p0 = shard_path(0, "t87", 0);
+    std::string p1 = shard_path(1, "t87", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -766,8 +946,8 @@ static int test_88_block_addressing(StripedEnv* env) {
     constexpr std::uint32_t kNumBlocks = 8;
     const std::uint64_t shard_size = kBlockSize * kNumBlocks / 2;  // per shard
 
-    std::string p0 = "/mnt/nvme0/striped/t88.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t88.shard1";
+    std::string p0 = shard_path(0, "t88", 0);
+    std::string p1 = shard_path(1, "t88", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -850,8 +1030,8 @@ static int test_89_restart_persistence() {
     TEST_CASE("89. restart persistence (new Runtime+Resolver+DataPath re-opens same URI)");
 
     const std::uint64_t shard_size = kStripeUnit * 8;
-    std::string p0 = "/mnt/nvme0/striped/t89.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t89.shard1";
+    std::string p0 = shard_path(0, "t89", 0);
+    std::string p1 = shard_path(1, "t89", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -973,8 +1153,8 @@ static int test_90_fault_partial_commit(StripedEnv* env) {
     TEST_CASE("90. fault semantics (illegal request rejected, others complete: partial commit)");
 
     const std::uint64_t shard_size = kStripeUnit * 4;
-    std::string p0 = "/mnt/nvme0/striped/t90.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t90.shard1";
+    std::string p0 = shard_path(0, "t90", 0);
+    std::string p1 = shard_path(1, "t90", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -1081,8 +1261,8 @@ static int test_91_striped_unregister_inflight(StripedEnv* env) {
     TEST_CASE("91. striped op in-flight: unregister_memory returns BUSY");
 
     const std::uint64_t shard_size = kStripeUnit * 32;
-    std::string p0 = "/mnt/nvme0/striped/t91.shard0";
-    std::string p1 = "/mnt/nvme1/striped/t91.shard1";
+    std::string p0 = shard_path(0, "t91", 0);
+    std::string p1 = shard_path(1, "t91", 1);
     if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
         CHECK(false, "create backing files");
         return 1;
@@ -1152,9 +1332,7 @@ static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     const std::uint32_t n = 4;
     std::string paths[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t92.shard%d", i, i);
-        paths[i] = buf;
+        paths[i] = shard_path(i, "t92", i);
         if (!create_backing_file(paths[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(paths[j].c_str());
             CHECK(false, "create 4 backing files"); return 1;
@@ -1222,9 +1400,7 @@ static int test_93_n4_distribution(StripedEnv* env4) {
     const std::uint32_t n = 4;
     std::string paths[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t93.shard%d", i, i);
-        paths[i] = buf;
+        paths[i] = shard_path(i, "t93", i);
         if (!create_backing_file(paths[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(paths[j].c_str());
             CHECK(false, "create 4 backing files"); return 1;
@@ -1276,9 +1452,7 @@ static int test_94_n4_speedup(StripedEnv* env4) {
     // N=4 backing files (one per device).
     std::string p4[4];
     for (std::uint32_t i = 0; i < n4; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t94.shard%d", i, i);
-        p4[i] = buf;
+        p4[i] = shard_path(i, "t94", i);
         if (!create_backing_file(p4[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p4[j].c_str());
             CHECK(false, "create N=4 backing files"); return 1;
@@ -1361,8 +1535,7 @@ static int test_95_multi_target_batch(StripedEnv* env4) {
     // Target A: t95a
     std::string pa[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t95a.shard%d", i, i);
-        pa[i] = buf;
+        pa[i] = shard_path(i, "t95a", i);
         if (!create_backing_file(pa[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(pa[j].c_str());
             CHECK(false, "create target A backing files"); return 1;
@@ -1371,8 +1544,7 @@ static int test_95_multi_target_batch(StripedEnv* env4) {
     // Target B: t95b (different URI, different backing files)
     std::string pb[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t95b.shard%d", i, i);
-        pb[i] = buf;
+        pb[i] = shard_path(i, "t95b", i);
         if (!create_backing_file(pb[i], shard_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(pb[j].c_str());
             for (auto& p : pa) ::unlink(p.c_str());
@@ -1491,8 +1663,7 @@ static int test_96_many_targets_batch(StripedEnv* env4) {
     for (std::uint32_t t = 0; t < n_targets && setup_ok; ++t) {
         std::string ps[4];
         for (std::uint32_t i = 0; i < n; ++i) {
-            char buf[64]; std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t96_%u.shard%d", i, t, i);
-            ps[i] = buf;
+            ps[i] = shard_path(i, "t96_" + std::to_string(t), i);
             if (!create_backing_file(ps[i], shard_size)) { setup_ok = false; break; }
         }
         if (!setup_ok) { for (auto& p : ps) ::unlink(p.c_str()); break; }
@@ -1608,15 +1779,12 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     // few targets) still works correctly.
     std::string p0[4], p1[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t97a.shard%d", i, i);
-        p0[i] = buf;
+        p0[i] = shard_path(i, "t97a", i);
         if (!create_backing_file(p0[i], shard_size * 4)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p0[j].c_str());
             CHECK(false, "create t97a"); return 1;
         }
-        std::snprintf(buf, sizeof(buf), "/mnt/nvme%d/striped/t97b.shard%d", i, i);
-        p1[i] = buf;
+        p1[i] = shard_path(i, "t97b", i);
         if (!create_backing_file(p1[i], shard_size * 4)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p1[j].c_str());
             for (auto& p : p0) ::unlink(p.c_str());
@@ -1688,15 +1856,37 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     return g_fail > 0 ? 1 : 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("=== Striped Local-NVMe E2E Contract Test (Round 15-16) ===\n");
 
-    if (!hw_available()) {
-        std::printf("SKIP: hardware not available "
-                    "(need /mnt/nvme0-3 mounted + /dev/ssnvme0-3 + CUDA device)\n");
+    if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 ||
+                      std::strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    g_gpu_id = test_gpu_id();
+    std::uint32_t requested = 0;
+    if (!parse_args(argc, argv, requested)) {
+        print_usage(argv[0]);
+        return 2;
+    }
+
+    const std::uint32_t available = consecutive_device_count();
+    const std::uint32_t num_devices = requested != 0
+        ? requested
+        : (available >= 4 ? 4 : (available >= 2 ? 2 : 0));
+
+    if (num_devices > g_devices.size() || num_devices == 0 ||
+        !hw_available(num_devices)) {
+        std::printf("SKIP: hardware not available (found %u configured devices; "
+                    "need 2 or 4 matching ssnvme + mount pairs and CUDA device %d)\n",
+                    available, g_gpu_id);
         return 77;
     }
-    cudaSetDevice(test_gpu_id());
+    std::printf("Using %u striped devices (found %u configured devices)\n",
+                num_devices, available);
+    cudaSetDevice(g_gpu_id);
 
     auto env2 = make_env(2);
     if (!env2) {
@@ -1705,13 +1895,7 @@ int main() {
     }
     std::printf("Dual-device StorageRuntime created (StripedResolver + StripedDataPath, N=2)\n");
 
-    // Round 16 S3: N=4 env for tests 92-94.
-    auto env4 = make_env(4);
-    if (!env4) {
-        std::fprintf(stderr, "FATAL: failed to create quad-device StorageRuntime\n");
-        return 1;
-    }
-    std::printf("Quad-device StorageRuntime created (StripedResolver + StripedDataPath, N=4)\n");
+    if (!create_test_mounts(num_devices)) return 1;
 
     int rc = 0;
     rc |= test_82_roundtrip(env2.get());
@@ -1722,35 +1906,27 @@ int main() {
     rc |= test_88_block_addressing(env2.get());
     rc |= test_90_fault_partial_commit(env2.get());
 
-    // Round 16 S3: N=4 tests (92-94).
-    rc |= test_92_n4_roundtrip_single_launch(env4.get());
-    rc |= test_93_n4_distribution(env4.get());
-    // Round 16 S5: multi-target batch contracts (95-97).
-    rc |= test_95_multi_target_batch(env4.get());
-    rc |= test_96_many_targets_batch(env4.get());
-    rc |= test_97_dev_table_overflow(env4.get());
+    env2->rt->shutdown(5000);
 
-    // Tests 83/84 need a fresh N=1 env alongside the N=2 env (separate
-    // StorageRuntime instances -> separate StripedDataPath instances, no
-    // shared arena/device state).
-    {
-        auto env1 = make_env(1);
-        if (!env1) {
-            std::fprintf(stderr, "FATAL: failed to create single-device StorageRuntime\n");
+    rc |= test_83_single_launch();
+    rc |= test_84_speedup();
+
+    if (num_devices == 4) {
+        auto env4 = make_env(4);
+        if (!env4) {
+            std::fprintf(stderr, "FATAL: failed to create quad-device StorageRuntime\n");
             rc = 1;
         } else {
-            rc |= test_83_single_launch(env2.get(), env1.get());
-            rc |= test_84_speedup(env2.get(), env1.get());
-            env1->rt->shutdown(5000);
+            std::printf("Quad-device StorageRuntime created (StripedResolver + StripedDataPath, N=4)\n");
+            rc |= test_92_n4_roundtrip_single_launch(env4.get());
+            rc |= test_93_n4_distribution(env4.get());
+            rc |= test_95_multi_target_batch(env4.get());
+            rc |= test_96_many_targets_batch(env4.get());
+            rc |= test_97_dev_table_overflow(env4.get());
+            rc |= test_94_n4_speedup(env4.get());
+            env4->rt->shutdown(5000);
         }
     }
-
-    // Round 16 S3: N=4 vs N=1 speedup (creates its own N=1 env internally
-    // to avoid queue conflicts with env4 which is still live).
-    rc |= test_94_n4_speedup(env4.get());
-
-    env2->rt->shutdown(5000);
-    env4->rt->shutdown(5000);
 
     // Test 89 builds and tears down its OWN two Runtime+Resolver+DataPath
     // instances (env_a, env_b) to prove restart persistence -- run after
@@ -1758,16 +1934,13 @@ int main() {
     // test are not muddied by a still-live sibling instance in this process.
     rc |= test_89_restart_persistence();
 
-    rmdir("/mnt/nvme0/striped");
-    rmdir("/mnt/nvme1/striped");
-    rmdir("/mnt/nvme2/striped");
-    rmdir("/mnt/nvme3/striped");
-
     std::printf("\n=== Summary: %d passed, %d failed ===\n", g_pass, g_fail);
     if (rc != 0 || g_fail > 0) {
         std::printf("RESULT: FAIL\n");
+        print_preserved_test_mounts();
         return 1;
     }
+    if (!cleanup_test_mounts()) return 1;
     std::printf("RESULT: PASS\n");
     return 0;
 }

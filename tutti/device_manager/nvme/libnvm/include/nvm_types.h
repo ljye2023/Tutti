@@ -318,7 +318,7 @@ typedef struct
     struct queue*           queues;   
     struct pci_device_addr  pdev_addr;
 
-    /* === NEW for B3 (sourced from NVM_GET_DEV_INFO) ===
+    /* === Queue metadata sourced from NVM_GET_DEV_INFO ===
      *
      * These mirror the like-named fields in struct nvm_ioctl_dev and are
      * the single source of truth for q_depth / user QID pool / BAR0 size
@@ -331,6 +331,11 @@ typedef struct
     uint32_t                max_user_qid;        // top of user QID pool
     uint32_t                max_queues_per_group;// echoes NVM_MAX_QUEUES_PER_GROUP
     uint32_t                sgl_supported;       // Identify Controller SGLS dword
+
+    /* True only when this process registered mm_ptr with the accelerator
+     * runtime.  Owner-only daemon handles leave this false; standalone GPU
+     * owners and GPU clients set it after cudaHostRegister succeeds. */
+    uint8_t                 bar0_cuda_registered;
 } nvm_ctrl_t;
 
 /* Disk descriptor */
@@ -339,7 +344,7 @@ struct disk
     size_t      page_size;
     size_t      max_data_size;
     uint32_t    ns_id;
-    size_t      block_size;
+    size_t      block_size;     // Namespace logical block size in bytes (1 << ns->lba_shift)
     char       disk_name[32];
 };
 
