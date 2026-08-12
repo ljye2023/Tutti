@@ -108,7 +108,6 @@ if(TUTTI_P2P_BACKEND STREQUAL "nvidia")
         list(APPEND _snvme_vendor_hints "${_vendor_hint}")
     endforeach()
 else()
-    set(_snvme_backend_header "metax_p2p.h")
     set(_snvme_vendor_hints
         "${MUSA_INCLUDE_DIR}"
         "${MACA_INCLUDE_DIR}"
