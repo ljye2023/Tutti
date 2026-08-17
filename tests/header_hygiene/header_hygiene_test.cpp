@@ -23,9 +23,13 @@
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 #include <tutti/cuda_like.h>
+#include <tutti/config/tutti_runtime_config_parser.h>
+#include <tutti/config/tutti_runtime_spec.h>
+#include <tutti/resource.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/storage_runtime.h>
+#include <tutti/tutti_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +44,13 @@
 // ---------------------------------------------------------------------------
 
 #if defined(__has_include)
+
+#  if __has_include(<tutti/tutti_runtime/tutti_runtime_internal.h>)
+#    error "HYGIENE VIOLATION: Runtime test seam is publicly reachable"
+#  endif
+#  if __has_include(<tutti/resource/nvme/nvme_resource.h>)
+#    error "HYGIENE VIOLATION: NVMe Resource implementation is publicly reachable"
+#  endif
 
 // --- libnvm private headers (tutti/device_manager/nvme/libnvm/include/) ---
 #  if __has_include(<nvm_types.h>)
@@ -160,6 +171,12 @@ int main() {
     tutti::TargetHandle th{};
     req.memory = mh;
     req.target = th;
+
+    tutti::config::TuttiRuntimeSpec spec;
+    tutti::ResourceInfo resource_info;
+    if (!spec.storage.resources.empty() || !resource_info.id.empty()) {
+        return 1;
+    }
 
     std::printf("header_hygiene_test: all checks passed\n");
     return 0;

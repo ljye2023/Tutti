@@ -659,7 +659,8 @@ static int nvm_controller_init_common(nvm_ctrl_t** ctrl,
                                       const char* snvme_control_path,
                                       const char* pci_addr,
                                       uint32_t kernel_ioq_cap,
-                                      struct disk* out_disk)
+                                      struct disk* out_disk,
+                                      struct nvm_owner_bringup_result* out_result)
 {
     struct pci_device_addr device_addr, pdev_addr;
     char snvme_path[256];
@@ -670,6 +671,10 @@ static int nvm_controller_init_common(nvm_ctrl_t** ctrl,
         return EINVAL;
     }
     *ctrl = NULL;
+    if (out_result != NULL) {
+        memset(out_result, 0, sizeof(*out_result));
+        out_result->chrdev_minor = -1;
+    }
 
     snvme_c_fd = open(snvme_control_path, O_RDWR | O_NONBLOCK);
     if (snvme_c_fd < 0) {
@@ -696,6 +701,11 @@ static int nvm_controller_init_common(nvm_ctrl_t** ctrl,
      * Keep using pdev_addr for the original PCI address. */
     int minor_n = device_addr.domain;
     snprintf(snvme_path, sizeof(snvme_path), "/dev/ssnvme%d", minor_n);
+    if (out_result != NULL) {
+        out_result->chrdev_minor = minor_n;
+        snprintf(out_result->chrdev_path, sizeof(out_result->chrdev_path),
+                 "%s", snvme_path);
+    }
 
     snvme_d_fd = open(snvme_path, O_RDWR | O_NONBLOCK);
     if (snvme_d_fd < 0) {
@@ -771,6 +781,13 @@ static int nvm_controller_init_common(nvm_ctrl_t** ctrl,
         out_disk->block_size    = info.block_size;
         out_disk->page_size     = (*ctrl)->page_size;
         memcpy(out_disk->disk_name, info.disk_name, DISK_NAME_LEN);
+        out_disk->disk_name[DISK_NAME_LEN - 1] = '\0';
+        if (out_result != NULL) {
+            snprintf(out_result->disk_name, sizeof(out_result->disk_name),
+                     "%s", out_disk->disk_name);
+            snprintf(out_result->block_path, sizeof(out_result->block_path),
+                     "/dev/%s", out_disk->disk_name);
+        }
     }
 
     /* nvm_ctrl_init duped the originating fds into the controller. */
@@ -804,6 +821,18 @@ fail_close_dev:
     return status ? status : EFAULT;
 }
 
+int nvm_controller_init_owner_with_result(
+    nvm_ctrl_t** ctrl,
+    const char* snvme_control_path,
+    const char* pci_addr,
+    uint32_t kernel_ioq_cap,
+    struct disk* out_disk,
+    struct nvm_owner_bringup_result* out_result)
+{
+    return nvm_controller_init_common(ctrl, snvme_control_path, pci_addr,
+                                      kernel_ioq_cap, out_disk, out_result);
+}
+
 int nvm_controller_init_owner(nvm_ctrl_t** ctrl,
                               const char* snvme_control_path,
                               const char* pci_addr,
@@ -811,7 +840,7 @@ int nvm_controller_init_owner(nvm_ctrl_t** ctrl,
                               struct disk* out_disk)
 {
     return nvm_controller_init_common(ctrl, snvme_control_path, pci_addr,
-                                      kernel_ioq_cap, out_disk);
+                                      kernel_ioq_cap, out_disk, NULL);
 }
 
 int nvm_controller_init_gpu(nvm_ctrl_t** ctrl,
@@ -821,7 +850,7 @@ int nvm_controller_init_gpu(nvm_ctrl_t** ctrl,
                             struct disk* out_disk)
 {
     int status = nvm_controller_init_common(
-        ctrl, snvme_control_path, pci_addr, kernel_ioq_cap, out_disk);
+        ctrl, snvme_control_path, pci_addr, kernel_ioq_cap, out_disk, NULL);
     if (status != 0) {
         return status;
     }

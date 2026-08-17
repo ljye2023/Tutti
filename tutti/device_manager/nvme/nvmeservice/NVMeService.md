@@ -112,13 +112,13 @@ Expected lines (excerpt):
 
 ```
 nvmeservice: device=0 pci=0000:08:00.0 snvme=/dev/ssnvme0 ns=1 qdepth=64
-             max_user_qid=135 max_q_per_grp=16 allowed_gpus={0}
+             max_user_qid=135 max_q_per_grp=32 allowed_gpus={0}
 NVMeService daemon listening on 127.0.0.1:50051 (port 50051)
 Registered devices:
-  device_id=0 ... max_user_qid=135 max_q/grp=16
+  device_id=0 ... max_user_qid=135 max_q/grp=32
       allowed: cuda_device=0 mount=/mnt/gpu0/ssnvme0
 lease: heartbeat=10s timeout=30s
-queue_pool: default=4 max=16
+queue_pool: default=4 max=32
 ```
 
 Terminal B (client):
@@ -135,7 +135,7 @@ Expected client output (8-step IO smoke):
 ```
 [ OK ] step=1   cudaSetDevice(0)
 [ OK ] step=2   nvm_ctrl_attach_client /dev/ssnvme0 page=4096
-[ OK ] step=3   nvm_create_group gid=1 max_queues=16 granted=4
+[ OK ] step=3   nvm_create_group gid=1 max_queues=32 granted=4
 [ OK ] step=4   mapped SQ/CQ + wbuf/rbuf
 [ OK ] step=5   nvm_add_user_queue qid=33 sq_db=0x1108 cq_db=0x110c
 [ OK ] step=6   Write+Read+verify x 4 IOs at LBA [2621440..2621443]
@@ -180,7 +180,7 @@ nvmes:
 
 queue_pool:
   default_per_client: 4                  # ConnectRequest.num_queues == 0 -> use this
-  max_per_client: 16                     # daemon clamp; kernel still enforces 16/group
+  max_per_client: 32                     # daemon clamp; kernel also enforces 32/group
 
 lease:
   heartbeat_interval_sec: 10
@@ -315,7 +315,7 @@ Hard invariants you can rely on:
   `granted_queues` is returned it is policy guidance only; the
   authoritative numbers come from `NVM_GET_DEV_INFO`
   (`max_user_qid` / `max_queues_per_group`) plus runtime add/destroy.
-- Kernel hard cap per fd: `NVM_MAX_QUEUES_PER_GROUP = 16`
+- Kernel hard cap per fd: `NVM_MAX_QUEUES_PER_GROUP = 32`
   (`backends/local/kernel_modules/snvme/...`).  The daemon also
   clamps `max_per_client`; the *effective* cap is `min(both)`.
 
@@ -443,7 +443,7 @@ has to come from the client.  Two options:
 | client: `Connect rejected: cuda_device=N not in allowed_gpus` | YAML `allowed_gpus` doesn't list this GPU | edit `sys_config.yaml`, restart daemon. |
 | client: `nvm_ctrl_attach_client … EACCES` | perms on `/dev/ssnvmeN` (default root-only) | run client as root or chmod the chrdev. |
 | client: `nvm_create_group … ENOSPC` | another fd already used all 16 group slots on the controller | check `/proc/<pid>/fd` for stale daemon/clients. |
-| client: `nvm_add_user_queue … EBUSY` | per-fd cap (16) already reached; or `granted_queues` was clamped to 0 | reduce `num_queues`, or check `max_per_client` and `max_queues_per_group`. |
+| client: `nvm_add_user_queue … EBUSY` | per-fd cap (32) already reached; or `granted_queues` was clamped to 0 | reduce `num_queues`, or check `max_per_client` and `max_queues_per_group`. |
 | `cudaSetDevice -> initialization error` in a child after fork | classic CUDA-fork-without-exec | fork **before** any `cuda*` call; see `snvme_smoke_libnvm_role.cu` for the reference handshake-via-pipe pattern. |
 | dmesg: `cascade-released N DATA map(s)` after client exit but daemon still alive | normal: B6 fd-scoped DATA reclaim path | nothing to fix, this is the invariant working. |
 | daemon log: `nvmeservice reaper: dropped lease device=… (pid=…)` | client crashed or lost heartbeat for `lease.timeout_sec` | check the client; the queues/DATA were already reclaimed at fd close. |
@@ -536,3 +536,81 @@ context:
 - Trust model is cooperative: anyone who can `connect()` can issue
   IO at the LBA level.  Production deployments should use unix
   domain socket + uid check at minimum.
+
+---
+
+## Phase 3 canonical resource and allocation update
+
+The preceding sections are retained as the complete historical B3/client
+contract. Where they conflict with this section, this phase 3 update is the
+current daemon contract. In particular, phase 3 adds a daemon admission ledger,
+uses explicit NVMe identities, and receives actual device paths from owner
+bring-up instead of deriving them.
+
+### Canonical YAML
+
+```yaml
+grpc: {endpoint: "127.0.0.1:50051"}
+accelerators:
+  - {accel_id: 0, view_root: "/mnt/snvme/gpu0"}
+  - {accel_id: 1, view_root: "/mnt/snvme/gpu1"}
+nvmes:
+  - device_id: 0
+    pci_addr: "0000:41:00.0"
+    backing_mount_path: "/mnt/snvme/nvme1"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0, 1]
+    auto_mount: true
+queue_pool: {default_per_client: 4, max_per_client: 32}
+lease: {heartbeat_interval_sec: 10, timeout_sec: 30}
+```
+
+`accel_id` is the compiled backend ordinal. `device_id` is an explicit NVMe
+resource identity and is never inferred from YAML order. `pci_addr` is
+normalized to the RPC `pci_bdf`. Empty `allowed_accel_ids` expands to all
+configured accelerators in sorted order.
+
+One transition release accepts a completely legacy file with `gpus[].id`,
+`gpus[].mount_path`, `nvmes[].mount_path`, and `allowed_gpus`. It emits parser
+diagnostics and fills missing legacy `device_id` from the array index. Any
+canonical/legacy mixing, including within one NVMe entry, fails closed.
+
+### Canonical RPC and client API
+
+- `ListAccelerators()` returns configured `accel_id` and `view_root` facts.
+- `ListNvmeResources()` returns explicit `device_id`, normalized BDF, actual
+  owner-returned `chrdev_path`/minor, ioctl `disk_name`-derived `block_path`,
+  backing mount, queue/page/block/BAR metadata, ACL, availability, and ledger
+  counters.
+- `AcquireNvmeSlices()` accepts `allowed`, `explicit`, or `striped`. Allowed
+  picks the lowest eligible `device_id`; explicit requires one ID; striped
+  requires two or more unique IDs and preserves request order.
+- `Release()` releases one logical allocation. A striped allocation releases
+  every slice in one operation. Repeated Release is idempotent.
+
+New CLI calls use `--accel`; `--cuda` is reserved for the legacy `Connect`
+compatibility path. `ListDevices`, `Connect`, `Disconnect`, and `Heartbeat`
+retain their protobuf method names and field numbers and adapt to the same
+canonical allocator and release helper.
+
+### Current lifecycle and invariants
+
+After `SNVM_CHRDEV_CREATE`, libnvm returns the actual minor and chrdev path.
+After probe, the ioctl disk name forms `/dev/<disk_name>`. The daemon validates
+the BDF/chrdev/block association and keeps a diagnostic resource unavailable
+when validation, mount, or view publication fails. Clients and future resolvers
+must consume the returned paths and must not reconstruct them from `device_id`,
+array order, or an accelerator ordinal.
+
+Admission capacity comes from the kernel-reported user queue pool. The daemon
+clamps each grant by policy and `max_queues_per_group`, validates every selected
+controller, reserves all slices, and inserts the allocation in one critical
+section. Failed striped requests leave no partial reservation. The kernel QID
+pool remains authoritative for actual queue creation; attach/add-queue failure
+must be followed by `Release`.
+
+`Release`, legacy `Disconnect`, heartbeat timeout, and PID/starttime death or
+reuse all refund the complete allocation. Client fd close still performs the
+kernel queue/map cascade described above. The daemon remains control-plane only
+and does not initialize CUDA/MUSA/MACA or create an accelerator compute context.

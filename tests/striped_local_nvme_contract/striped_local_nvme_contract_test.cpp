@@ -388,7 +388,8 @@ struct StripedEnv {
             const auto& device = g_devices.at(i);
             v.push_back({device.ssnvme_path, device.bar0_size,
                          device.namespace_id, (std::uint32_t)g_gpu_id,
-                         /*num_user_queues=*/16, device.block_size});
+                         /*num_user_queues=*/16, device.block_size,
+                         device.pci_bdf});
         }
         return v;
     }
@@ -1883,6 +1884,40 @@ int main(int argc, char** argv) {
                     "need 2 or 4 matching ssnvme + mount pairs and CUDA device %d)\n",
                     available, g_gpu_id);
         return 77;
+    }
+
+    // Phase 2 direct-DataPath probe: resource setup/teardown must be
+    // independent of the caller's current accelerator.
+    int cuda_device_count = 0;
+    if (cudaGetDeviceCount(&cuda_device_count) == cudaSuccess &&
+        cuda_device_count >= 2) {
+        const int caller_gpu = g_gpu_id == 0 ? 1 : 0;
+        CHECK(cudaSetDevice(caller_gpu) == cudaSuccess,
+              "direct StripedDataPath probe selects non-target caller device");
+        StripedDataPath direct_dp(
+            StripedEnv::build_devs(num_devices),
+            static_cast<std::uint32_t>(g_gpu_id),
+            /*mdts_override=*/0, /*cq_poll_budget=*/2000000,
+            /*max_batch_entries=*/4096, /*max_in_flight_operations=*/4);
+        DataPathConfig direct_config{"striped-local-nvme"};
+        ResourceProvider* direct_resources = nullptr;
+        const Status direct_init = direct_dp.initialize(
+            direct_config, *direct_resources);
+        CHECK(direct_init.ok(),
+              "direct StripedDataPath initialize works from wrong caller device");
+        int after_init = -1;
+        CHECK(cudaGetDevice(&after_init) == cudaSuccess &&
+              after_init == caller_gpu,
+              "direct StripedDataPath initialize restores caller device");
+        const Status direct_shutdown = direct_dp.shutdown(0);
+        CHECK(direct_shutdown.ok(),
+              "direct StripedDataPath shutdown works from wrong caller device");
+        int after_shutdown = -1;
+        CHECK(cudaGetDevice(&after_shutdown) == cudaSuccess &&
+              after_shutdown == caller_gpu,
+              "direct StripedDataPath shutdown restores caller device");
+        CHECK(cudaSetDevice(g_gpu_id) == cudaSuccess,
+              "direct striped probe restores test accelerator");
     }
     std::printf("Using %u striped devices (found %u configured devices)\n",
                 num_devices, available);

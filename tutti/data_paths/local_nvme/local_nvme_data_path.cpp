@@ -9,12 +9,12 @@
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"
 
 #include <tutti/cuda_like.h>
+#include <tutti/accelerator_device_guard.h>
 #include <nvm_types.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -59,6 +59,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     caps_.max_concurrent_operations = 1;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;
+    caps_.bound_accel_id = static_cast<std::int32_t>(cuda_device_);
     caps_.optional_target_features = {};
 }
 
@@ -75,11 +76,14 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     std::uint64_t max_in_flight_operations,
     std::uint64_t max_batch_requests,
     std::uint64_t max_request_bytes_override,
-    std::uint32_t handle_cache_l2_capacity)
+    std::uint32_t handle_cache_l2_capacity,
+    std::string controller_pci_addr,
+    std::uint32_t threads_per_block)
     : snvme_dev_path_(std::move(snvme_dev_path)), bar0_size_(bar0_size),
       cuda_device_(cuda_device), num_user_queues_(num_user_queues),
       namespace_id_(namespace_id),
       block_size_(block_size),
+      controller_pci_addr_(std::move(controller_pci_addr)),
       mdts_bytes_(mdts_bytes),
       max_batch_entries_(max_batch_entries == 0 ? 256 : max_batch_entries),
       max_batch_requests_(max_batch_requests == 0
@@ -88,6 +92,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
       max_in_flight_operations_(max_in_flight_operations == 0
                                  ? 16 : max_in_flight_operations),
       max_request_bytes_override_(max_request_bytes_override),
+      threads_per_block_(threads_per_block),
       cq_poll_budget_(cq_poll_budget == 0 ? 10000000 : cq_poll_budget),
       handle_cache_capacity_(handle_cache_capacity),
       handle_cache_l2_capacity_(handle_cache_l2_capacity),
@@ -129,11 +134,14 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     caps_.max_concurrent_operations = max_in_flight_operations_;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;
+    caps_.bound_accel_id = static_cast<std::int32_t>(cuda_device_);
     caps_.optional_target_features = {};
 }
 
 LocalNvmeDataPath::~LocalNvmeDataPath() {
     if (!initialized_) return;
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device_));
+    if (!device_guard.ok()) return;
 
     // Check for in-flight ops.  If any exist, wait for their completion
     // fence before tearing down.  This may block, but it prevents UAF.
@@ -243,9 +251,140 @@ const DataPathCapabilities& LocalNvmeDataPath::capabilities() const {
 // -------------------------------------------------------------------------
 
 Status LocalNvmeDataPath::initialize(const DataPathConfig& config,
-                                     ResourceProvider& /*resources*/) {
+                                     ResourceProvider& resources) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = initialize_impl_(config, resources);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Status LocalNvmeDataPath::shutdown(std::uint64_t timeout_ns) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = shutdown_impl_(timeout_ns);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Result<DataPathTarget> LocalNvmeDataPath::open(const ResolvedTarget& target) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<DataPathTarget>::Failure(guard.status());
+    auto result = open_impl_(target);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<DataPathTarget>::Failure(std::move(restored));
+}
+
+Status LocalNvmeDataPath::close(DataPathTarget target) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = close_impl_(target);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Result<RegistrationDomainKey> LocalNvmeDataPath::registration_domain(
+    DataPathTarget target) const {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) {
+        return Result<RegistrationDomainKey>::Failure(guard.status());
+    }
+    auto result = registration_domain_impl_(target);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<RegistrationDomainKey>::Failure(std::move(restored));
+}
+
+Result<DataPathMemory> LocalNvmeDataPath::register_memory(
+    const DataPathMemoryView& view,
+    const RegistrationDomainKey& domain) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<DataPathMemory>::Failure(guard.status());
+    auto result = register_memory_impl_(view, domain);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<DataPathMemory>::Failure(std::move(restored));
+}
+
+Status LocalNvmeDataPath::unregister_memory(DataPathMemory memory) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = unregister_memory_impl_(memory);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+SubmitOutcome LocalNvmeDataPath::submit(const DataPathRequest* requests,
+                                        std::size_t count,
+                                        const HostSubmitContext& ctx) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) {
+        SubmitOutcome result;
+        result.status = guard.status();
+        result.initial_states.resize(count);
+        for (auto& state : result.initial_states) {
+            state.state = RequestState::REJECTED;
+            state.status = result.status;
+        }
+        return result;
+    }
+    SubmitOutcome result = submit_impl_(requests, count, ctx);
+    Status restored = guard.restore();
+    if (!restored.ok()) {
+        result.status = restored;
+        return result;
+    }
+    return result;
+}
+
+Result<ProgressResult> LocalNvmeDataPath::progress(ProgressBudget budget) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<ProgressResult>::Failure(guard.status());
+    auto result = progress_impl_(budget);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<ProgressResult>::Failure(std::move(restored));
+}
+
+Result<DataPathSnapshot> LocalNvmeDataPath::query(DataPathOp op) const {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<DataPathSnapshot>::Failure(guard.status());
+    auto result = query_impl_(op);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<DataPathSnapshot>::Failure(std::move(restored));
+}
+
+Status LocalNvmeDataPath::release(DataPathOp op) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = release_impl_(op);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
+                                           ResourceProvider& /*resources*/) {
     if (initialized_) {
         return Status(StatusCode::BUSY, "already initialized");
+    }
+    if (threads_per_block_ == 0 || threads_per_block_ > 1024) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "threads_per_block must be in [1, 1024]");
+    }
+    cudaDeviceProp device_properties{};
+    const cudaError_t properties_error = cudaGetDeviceProperties(
+        &device_properties, static_cast<int>(cuda_device_));
+    if (properties_error != cudaSuccess) {
+        return Status(StatusCode::DEVICE_ERROR,
+                      std::string("cudaGetDeviceProperties failed: ") +
+                          cudaGetErrorString(properties_error));
+    }
+    if (threads_per_block_ >
+        static_cast<std::uint32_t>(device_properties.maxThreadsPerBlock)) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "threads_per_block exceeds device maximum");
     }
 
     if (!config.name.empty()) {
@@ -369,6 +508,14 @@ Status LocalNvmeDataPath::initialize(const DataPathConfig& config,
                               std::string("queue group creation failed: ") +
                               e.what());
             }
+            if (threads_per_block_ > queue_group_->n_qps()) {
+                queue_group_.reset();
+                nvm_ctrl_free_client(ctrl_);
+                ctrl_ = nullptr;
+                return Status(
+                    StatusCode::INVALID_ARGUMENT,
+                    "threads_per_block exceeds the granted NVMe queue count");
+            }
 
             // Initialize the MetadataArena: pre-allocate all per-op
             // workspace (events, entry/status arrays, PRP-list pool).
@@ -389,16 +536,6 @@ Status LocalNvmeDataPath::initialize(const DataPathConfig& config,
                 ctrl_ = nullptr;
                 return Status(StatusCode::NOT_READY,
                               "MetadataArena init failed");
-            }
-
-            // Initialize caches (env var override for testing).
-            if (handle_cache_capacity_ == 0) {
-                const char* env = std::getenv("TUTTI_HANDLE_CACHE_CAP");
-                if (env) handle_cache_capacity_ = static_cast<std::uint32_t>(std::atoi(env));
-            }
-            if (prp_cache_capacity_ == 0) {
-                const char* env = std::getenv("TUTTI_PRP_CACHE_CAP");
-                if (env) prp_cache_capacity_ = static_cast<std::uint32_t>(std::atoi(env));
             }
 
             if (handle_cache_capacity_ > 0) {
@@ -439,7 +576,7 @@ Status LocalNvmeDataPath::initialize(const DataPathConfig& config,
     return Status::Ok();
 }
 
-Status LocalNvmeDataPath::shutdown(std::uint64_t timeout_ns) {
+Status LocalNvmeDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     if (!initialized_) return Status::Ok();  // idempotent
 
     // Check for in-flight ops.
@@ -540,7 +677,7 @@ Status LocalNvmeDataPath::shutdown(std::uint64_t timeout_ns) {
 // target lifecycle
 // -------------------------------------------------------------------------
 
-Result<DataPathTarget> LocalNvmeDataPath::open(const ResolvedTarget& target) {
+Result<DataPathTarget> LocalNvmeDataPath::open_impl_(const ResolvedTarget& target) {
     if (!initialized_) {
         return Result<DataPathTarget>::Failure(
             Status(StatusCode::NOT_READY,
@@ -566,6 +703,22 @@ Result<DataPathTarget> LocalNvmeDataPath::open(const ResolvedTarget& target) {
         return Result<DataPathTarget>::Failure(
             Status(StatusCode::INVALID_ARGUMENT,
                    "open: controller_pci_addr is empty"));
+    }
+    if (!controller_pci_addr_.empty() &&
+        ns.controller_pci_addr != controller_pci_addr_) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "open: controller_pci_addr does not match DataPath resource view"));
+    }
+    if (namespace_id_ != 0 && ns.namespace_id != namespace_id_) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "open: namespace_id does not match DataPath resource view"));
+    }
+    if (block_size_ != 0 && ns.block_size != block_size_) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "open: block_size does not match DataPath resource view"));
     }
 
     LocalNvmeTargetState state;
@@ -705,7 +858,7 @@ Result<DataPathTarget> LocalNvmeDataPath::open(const ResolvedTarget& target) {
             token, generation));
 }
 
-Status LocalNvmeDataPath::close(DataPathTarget target) {
+Status LocalNvmeDataPath::close_impl_(DataPathTarget target) {
     if (!target.valid()) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "close: target identity is invalid (never minted)");
@@ -743,9 +896,8 @@ Status LocalNvmeDataPath::close(DataPathTarget target) {
     return Status::Ok();
 }
 
-Result<RegistrationDomainKey> LocalNvmeDataPath::registration_domain(
+Result<RegistrationDomainKey> LocalNvmeDataPath::registration_domain_impl_(
     DataPathTarget target) const {
-
     const auto* state = find_(target);
     if (!state) {
         return Result<RegistrationDomainKey>::Failure(
@@ -766,10 +918,9 @@ Result<RegistrationDomainKey> LocalNvmeDataPath::registration_domain(
 // memory registration
 // -------------------------------------------------------------------------
 
-Result<DataPathMemory> LocalNvmeDataPath::register_memory(
+Result<DataPathMemory> LocalNvmeDataPath::register_memory_impl_(
     const DataPathMemoryView& view,
     const RegistrationDomainKey& /*domain*/) {
-
     if (!initialized_ || ctrl_ == nullptr) {
         return Result<DataPathMemory>::Failure(
             Status(StatusCode::NOT_READY,
@@ -786,6 +937,49 @@ Result<DataPathMemory> LocalNvmeDataPath::register_memory(
         return Result<DataPathMemory>::Failure(
             Status(StatusCode::INVALID_ARGUMENT,
                    "register_memory: view.size_bytes is 0"));
+    }
+
+    if (view.expected_accel_id >= 0 &&
+        view.expected_accel_id != static_cast<std::int32_t>(cuda_device_)) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "register_memory: accelerator does not match DataPath"));
+    }
+    if (view.kind == DataPathMemoryKind::DEVICE) {
+#if defined(TUTTI_USE_HOST)
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::UNSUPPORTED,
+                   "register_memory: HOST profile has no device memory"));
+#elif defined(TUTTI_USE_CUDA) || defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
+        cudaPointerAttributes attributes{};
+        const cudaError_t pointer_error =
+            cudaPointerGetAttributes(&attributes, view.base);
+        if (pointer_error != cudaSuccess) {
+            return Result<DataPathMemory>::Failure(
+                Status(StatusCode::DEVICE_ERROR,
+                       "register_memory: pointer ownership query failed: " +
+                       std::string(cudaGetErrorString(pointer_error))));
+        }
+#if defined(TUTTI_USE_CUDA)
+        if (attributes.type != cudaMemoryTypeDevice &&
+            attributes.type != cudaMemoryTypeManaged) {
+            return Result<DataPathMemory>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "register_memory: pointer is not device memory"));
+        }
+#else
+        if (attributes.type != cudaMemoryTypeDevice) {
+            return Result<DataPathMemory>::Failure(
+                Status(StatusCode::UNSUPPORTED,
+                       "register_memory: backend cannot verify pointer kind"));
+        }
+#endif
+        if (attributes.device != static_cast<int>(cuda_device_)) {
+            return Result<DataPathMemory>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "register_memory: pointer belongs to another accelerator"));
+        }
+#endif
     }
 
     // DEVICE memory must be 64 KiB-aligned.
@@ -827,7 +1021,7 @@ Result<DataPathMemory> LocalNvmeDataPath::register_memory(
     reg.base = view.base;
     reg.size_bytes = view.size_bytes;
     reg.kind = view.kind;
-    reg.device_id = view.device_id;
+    reg.accel_id = view.expected_accel_id;
     reg.generation = generation;
     reg.unregistered = false;
 
@@ -850,7 +1044,7 @@ Result<DataPathMemory> LocalNvmeDataPath::register_memory(
             token, generation));
 }
 
-Status LocalNvmeDataPath::unregister_memory(DataPathMemory memory) {
+Status LocalNvmeDataPath::unregister_memory_impl_(DataPathMemory memory) {
     if (!memory.valid()) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "unregister_memory: memory identity is invalid");
@@ -1035,7 +1229,7 @@ void LocalNvmeDataPath::destroy_prebuilt_descriptors_(MemReg& reg) {
 // submit / progress / query / release (real IO implementation)
 // -------------------------------------------------------------------------
 
-SubmitOutcome LocalNvmeDataPath::submit(
+SubmitOutcome LocalNvmeDataPath::submit_impl_(
     const DataPathRequest* requests,
     std::size_t count,
     const HostSubmitContext& ctx) {
@@ -1087,12 +1281,29 @@ SubmitOutcome LocalNvmeDataPath::submit(
         return outcome;
     }
 
-    // Device ID check (restored from S2).
-    if (ctx.device_id != static_cast<std::int32_t>(queue_group_->cuda_device())) {
+    // Accelerator identity check (the daemon's NVMe device_id is unrelated).
+    if (ctx.accel_id >= 0 &&
+        ctx.accel_id != static_cast<std::int32_t>(queue_group_->cuda_device())) {
         reject_all(StatusCode::INVALID_ARGUMENT,
-                   "ctx.device_id does not match queue group's CUDA device");
+                   "ctx.accel_id does not match queue group's CUDA device");
         return outcome;
     }
+#if defined(TUTTI_USE_CUDA)
+    int stream_accel_id = -1;
+    const cudaError_t stream_error =
+        cudaStreamGetDevice(ctx.stream, &stream_accel_id);
+    if (stream_error != cudaSuccess) {
+        reject_all(StatusCode::DEVICE_ERROR,
+                   std::string("stream ownership query failed: ") +
+                   cudaGetErrorString(stream_error));
+        return outcome;
+    }
+    if (stream_accel_id != static_cast<int>(queue_group_->cuda_device())) {
+        reject_all(StatusCode::INVALID_ARGUMENT,
+                   "stream belongs to another accelerator");
+        return outcome;
+    }
+#endif
 
     // Request count check.
     if (count > max_batch_requests_) {
@@ -1573,7 +1784,8 @@ SubmitOutcome LocalNvmeDataPath::submit(
         if (test_inject_nvme_error_)          inject_flag |= 0x2u;
 
         launch_err = launch_submit_one(d_entries, d_status, total_entries,
-                                        cq_poll_budget_, inject_flag,
+                                        cq_poll_budget_, threads_per_block_,
+                                        inject_flag,
                                         ctx.stream);
     }
     if (launch_err != cudaSuccess) {
@@ -1774,7 +1986,7 @@ SubmitOutcome LocalNvmeDataPath::submit(
     return outcome;
 }
 
-Result<ProgressResult> LocalNvmeDataPath::progress(ProgressBudget budget) {
+Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) {
     ProgressResult result{};
     result.work_units_consumed = 0;
     result.operations_advanced = 0;
@@ -1872,7 +2084,7 @@ Result<ProgressResult> LocalNvmeDataPath::progress(ProgressBudget budget) {
     return Result<ProgressResult>::Success(std::move(result));
 }
 
-Result<DataPathSnapshot> LocalNvmeDataPath::query(DataPathOp op) const {
+Result<DataPathSnapshot> LocalNvmeDataPath::query_impl_(DataPathOp op) const {
     const auto* entry = find_op_(op);
     if (!entry) {
         return Result<DataPathSnapshot>::Failure(
@@ -1887,7 +2099,7 @@ Result<DataPathSnapshot> LocalNvmeDataPath::query(DataPathOp op) const {
     return Result<DataPathSnapshot>::Success(std::move(snap));
 }
 
-Status LocalNvmeDataPath::release(DataPathOp op) {
+Status LocalNvmeDataPath::release_impl_(DataPathOp op) {
     auto* entry = find_op_(op);
     if (!entry) {
         return Status(StatusCode::NOT_FOUND, "release: op not found");

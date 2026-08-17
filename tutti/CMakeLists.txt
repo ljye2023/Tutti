@@ -82,6 +82,19 @@ option(TUTTI_FEATURE_MEMFS_SAMPLE "Include memfs sample extension" ON)
 option(TUTTI_BUILD_KERNEL_MODULE
     "Configure snvme kernel-module build/load targets" OFF)
 
+find_package(yaml-cpp REQUIRED)
+if(TARGET yaml-cpp::yaml-cpp)
+    set(TUTTI_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+elseif(TARGET yaml-cpp)
+    set(TUTTI_YAML_CPP_TARGET yaml-cpp)
+else()
+    set(TUTTI_YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
+endif()
+message(STATUS "Tutti: yaml-cpp target: ${TUTTI_YAML_CPP_TARGET}")
+
+add_subdirectory(resource)
+add_subdirectory(config)
+
 # ---------------------------------------------------------------------------
 # Include directories
 # ---------------------------------------------------------------------------
@@ -124,14 +137,16 @@ tutti_configure_cuda_like(tutti_cuda_like)
 # ---------------------------------------------------------------------------
 # tutti_api -- public usage-requirements target
 #
-# Consumers link only tutti_api to obtain: public headers (tutti/include),
-# profile definition (TUTTI_USE_<PROFILE>), and CUDA-like vendor requirements.
-# No source files; no direct CUDA links — all inherited via tutti_cuda_like.
+# Consumers link only tutti_api to obtain: public headers (tutti/include plus
+# the generated config public-header view), profile definition
+# (TUTTI_USE_<PROFILE>), and CUDA-like vendor requirements. No source files;
+# no direct CUDA links — all inherited via tutti_cuda_like.
 # ---------------------------------------------------------------------------
 
 add_library(tutti_api INTERFACE)
 target_include_directories(tutti_api INTERFACE
     $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${TUTTI_CONFIG_PUBLIC_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(tutti_api INTERFACE tutti_cuda_like)
@@ -170,6 +185,8 @@ add_subdirectory(bindings/ext4_local_nvme)
 add_subdirectory(resolvers/local_file)
 add_subdirectory(bindings/striped_local_nvme)
 add_subdirectory(resolvers/striped_file)
+add_subdirectory(resolvers)
+add_subdirectory(data_paths)
 
 # SAMPLE-ONLY: community extension sample (doc/extending_tutti.md).
 # The subdirectory is added inside BUILD_TESTING (below) because its
@@ -210,10 +227,8 @@ if(TUTTI_BUILD_HARDWARE_STACK)
     # SDK through their profile modules.
     find_package(Threads REQUIRED)
 
-    # gRPC: optional; when found, nvmeservice (daemon NVMe multi-process path) is
-    # enabled and TUTTI_NVMESERVICE_ENABLED is defined on all targets that need it.
-    # gRPC and yaml-cpp are local-NVMe-specific dependencies (nvmeservice config).
-    # When TUTTI_FEATURE_LOCAL_NVME=OFF they are not looked up.
+    # gRPC is optional and local-NVMe-specific. yaml-cpp is resolved above for
+    # the profile-independent application config parser.
     if(TUTTI_FEATURE_LOCAL_NVME)
         find_package(gRPC CONFIG QUIET)
         if(gRPC_FOUND)
@@ -221,22 +236,8 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         else()
             message(STATUS "Tutti: gRPC NOT found -- daemon NVMe path disabled")
         endif()
-
-        # yaml-cpp: used by Layer 2 (device_manager/nvme/nvmeservice) config parser.
-        # Normalize the target name across packagings:
-        #   vcpkg / new upstream : yaml-cpp::yaml-cpp
-        #   old system pkg (0.5.x): bare "yaml-cpp" target, or only ${YAML_CPP_LIBRARIES}
-        find_package(yaml-cpp REQUIRED)
-        if(TARGET yaml-cpp::yaml-cpp)
-            set(TUTTI_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
-        elseif(TARGET yaml-cpp)
-            set(TUTTI_YAML_CPP_TARGET yaml-cpp)
-        else()
-            set(TUTTI_YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
-        endif()
-        message(STATUS "Tutti: yaml-cpp target: ${TUTTI_YAML_CPP_TARGET}")
     else()
-        message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- gRPC/yaml-cpp/libnvm skipped")
+        message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- gRPC/libnvm skipped")
     endif()
 
     if(TUTTI_ACCELERATOR STREQUAL "CUDA")
@@ -286,10 +287,17 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
 
-        # Round 20 S1: application config loader (yaml → RuntimeComponents).
-        # Translates config/tutti_config.yaml into DataPath/Resolver
-        # construction via the public API.
-        add_subdirectory(config)
+        tutti_enable_data_path_factory_local_nvme()
+        tutti_enable_nvme_resource_grpc()
+
+        # Public TuttiRuntime + YAML NVMe hardware example. Keep this
+        # outside BUILD_TESTING so applications can build the example without
+        # enabling the test suite.
+        add_subdirectory(
+            "${TUTTI_REPOSITORY_ROOT}/examples/tutti_runtime"
+            "${CMAKE_CURRENT_BINARY_DIR}/examples_tutti_runtime"
+        )
+
     else()
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping device_manager, data_paths/local_nvme")
     endif()
@@ -310,6 +318,15 @@ endif()
 option(TUTTI_BUILD_HARDWARE_TESTS "Register hardware-dependent tests" OFF)
 
 if(BUILD_TESTING)
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/config"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_config"
+    )
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/tutti_runtime"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_tutti_runtime"
+    )
+
     # SAMPLE-ONLY: community extension sample (doc/extending_tutti.md).
     # Must live inside this block: add_test() only registers in directories
     # processed after include(CTest) has enabled testing.
@@ -326,6 +343,12 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/tests_cuda_like"
     )
     message(STATUS "Tutti: added tests/cuda_like (contract test)")
+
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/accelerator_device_guard"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_accelerator_device_guard"
+    )
+    message(STATUS "Tutti: added accelerator device guard contract test")
 
     # Public API usage test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
@@ -411,6 +434,22 @@ if(BUILD_TESTING)
     )
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
 
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/resource"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_resource"
+    )
+    message(STATUS "Tutti: added tests/resource (hardware-free Resource contract)")
+
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/resolvers"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_resolvers"
+    )
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/datapaths"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_datapaths"
+    )
+    message(STATUS "Tutti: added resolver and DataPath factory tests")
+
     # Round 17 S1: MountManager host-side unit tests (hardware-free).
     # Tests config parsing, /proc scanning, mount/unmount lifecycle
     # with tmpfs, and force-exit flag.  No real NVMe devices needed.
@@ -482,11 +521,6 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_register_perf"
             )
 
-            # Round 20 S1: tutti_config loader unit test (ctest).
-            add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/config_loader"
-                "${CMAKE_CURRENT_BINARY_DIR}/tests_config_loader"
-            )
         else()
             message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping local_nvme hardware tests")
         endif()

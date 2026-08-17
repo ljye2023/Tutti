@@ -96,6 +96,7 @@ struct DeviceDescriptor {
     // (no queue_depth field: ring depth is fixed by the kernel module's
     //  io_queue_depth and obtained via NVM_GET_DEV_INFO at initialize())
     std::uint32_t block_size = 4096;
+    std::string controller_pci_addr;
 };
 
 // -------------------------------------------------------------------------
@@ -114,6 +115,8 @@ public:
     // handle_cache_capacity: 0 = OFF (default); >0 = GPU LRU handle cache slots.
     // prp_cache_capacity: 0 = OFF (default); >0 = PRP LIST page cache slots.
     //   (Round 16 S5: aligned to LocalNvmeDataPath's prp_cache_capacity.)
+    // threads_per_block: fused submit kernel block size (1..1024, default 16).
+    //   Must not exceed any device's actual queue count.
     StripedDataPath(std::vector<DeviceDescriptor> devices,
                     std::uint32_t cuda_device = 0,
                     std::uint64_t mdts_override = 0,
@@ -121,7 +124,8 @@ public:
                     std::uint32_t max_batch_entries = 256,
                     std::uint32_t max_in_flight_operations = 16,
                     std::uint32_t handle_cache_capacity = 0,
-                    std::uint32_t prp_cache_capacity = 0);
+                    std::uint32_t prp_cache_capacity = 0,
+                    std::uint32_t threads_per_block = 16);
     ~StripedDataPath() override;
 
     StripedDataPath(const StripedDataPath&) = delete;
@@ -154,7 +158,13 @@ public:
     std::uint32_t test_num_devices() const {
         return static_cast<std::uint32_t>(devices_.size());
     }
+    const std::vector<DeviceDescriptor>& test_device_descriptors() const {
+        return device_descs_;
+    }
     std::uint64_t test_effective_mdts() const { return effective_mdts_bytes_; }
+    std::uint32_t test_threads_per_block() const {
+        return threads_per_block_;
+    }
     std::uint64_t test_submit_call_count() const { return test_submit_call_count_; }
     std::uint64_t test_kernel_launch_count() const { return test_kernel_launch_count_; }
     void test_reset_submit_counters() {
@@ -172,6 +182,26 @@ public:
                                  std::vector<std::uint32_t>& out) const;
 
 private:
+    // Public SPI entry points are thin device-guarded wrappers; impl methods
+    // keep resource/error paths free of duplicated current-device plumbing.
+    Status initialize_impl_(const DataPathConfig& config,
+                            ResourceProvider& resources);
+    Status shutdown_impl_(std::uint64_t timeout_ns);
+    Result<DataPathTarget> open_impl_(const ResolvedTarget& target);
+    Status close_impl_(DataPathTarget target);
+    Result<RegistrationDomainKey> registration_domain_impl_(
+        DataPathTarget target) const;
+    Result<DataPathMemory> register_memory_impl_(
+        const DataPathMemoryView& view,
+        const RegistrationDomainKey& domain);
+    Status unregister_memory_impl_(DataPathMemory memory);
+    SubmitOutcome submit_impl_(const DataPathRequest* requests,
+                               std::size_t count,
+                               const HostSubmitContext& ctx);
+    Result<ProgressResult> progress_impl_(ProgressBudget budget);
+    Result<DataPathSnapshot> query_impl_(DataPathOp op) const;
+    Status release_impl_(DataPathOp op);
+
     struct DeviceSlot {
         DeviceDescriptor desc;
         nvm_ctrl_t* ctrl = nullptr;
@@ -288,6 +318,7 @@ private:
     std::uint32_t cq_poll_budget_ = 0;
     std::uint32_t max_batch_entries_ = 0;
     std::uint64_t max_in_flight_operations_ = 0;
+    std::uint32_t threads_per_block_ = 16;
     // Round 16 S5: cache capacities (default OFF, aligned to LocalNvme).
     std::uint32_t handle_cache_capacity_ = 0;
     std::uint32_t prp_cache_capacity_ = 0;

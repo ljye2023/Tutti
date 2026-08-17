@@ -128,6 +128,7 @@ public:
         caps.supports_multi_stream = true;
         caps.max_concurrent_streams = 4;
         caps.max_concurrent_operations = 16;
+        caps.bound_accel_id = TUTTI_DEFAULT_ACCEL_ID;
         caps.supports_multi_gpu = true;
         caps.supports_cross_device = false;
         caps.optional_target_features = {"feature_a", "feature_b"};
@@ -169,7 +170,10 @@ public:
 
     // ---- Unblock progress (for block_progress_flag tests) ----
     void unblock_progress() {
-        block_progress_flag.store(false);
+        {
+            std::lock_guard<std::mutex> lock(block_progress_mtx_);
+            block_progress_flag.store(false);
+        }
         block_progress_cv_.notify_all();
     }
 

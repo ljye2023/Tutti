@@ -63,7 +63,7 @@ static const NvmeTestDevice& primary_device() {
 }
 
 static std::string primary_test_parent() {
-    return primary_device().mount_path + "/GPU" + std::to_string(g_test_gpu);
+    return primary_device().mount_path + "/ACCEL" + std::to_string(g_test_gpu);
 }
 
 static RegistrationDomainKey primary_registration_domain() {
@@ -916,6 +916,34 @@ int main(int argc, char** argv) {
     }
     const std::uint32_t kBar0Size = primary_device().bar0_size;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
+
+    // Phase 2 direct-DataPath probe: initialize/shutdown must select the
+    // bound accelerator even when the caller entered on the other GPU.
+    if (cuda_dev_count >= 2) {
+        const int caller_gpu = test_gpu == 0 ? 1 : 0;
+        CHECK(cudaSetDevice(caller_gpu) == cudaSuccess,
+              "direct DataPath probe selects non-target caller device");
+        LocalNvmeDataPath direct_dp(kSnvmeDevPath, kBar0Size);
+        DataPathConfig direct_config{"local_nvme"};
+        ResourceProvider* direct_resources = nullptr;
+        const Status direct_init = direct_dp.initialize(
+            direct_config, *direct_resources);
+        CHECK(direct_init.ok(),
+              "direct LocalNvmeDataPath initialize works from wrong caller device");
+        int after_init = -1;
+        CHECK(cudaGetDevice(&after_init) == cudaSuccess &&
+              after_init == caller_gpu,
+              "direct LocalNvmeDataPath initialize restores caller device");
+        const Status direct_shutdown = direct_dp.shutdown(0);
+        CHECK(direct_shutdown.ok(),
+              "direct LocalNvmeDataPath shutdown works from wrong caller device");
+        int after_shutdown = -1;
+        CHECK(cudaGetDevice(&after_shutdown) == cudaSuccess &&
+              after_shutdown == caller_gpu,
+              "direct LocalNvmeDataPath shutdown restores caller device");
+        CHECK(cudaSetDevice(test_gpu) == cudaSuccess,
+              "direct DataPath probe restores test accelerator");
+    }
 
     // Helper lambda for DP with real device.
     auto make_real_dp = [&]() {
@@ -3186,7 +3214,7 @@ int main(int argc, char** argv) {
     next_t42:;
 
     // =====================================================================
-    // 43. Device mismatch: wrong ctx.device_id → REJECTED before zero issued
+    // 43. Accelerator mismatch: wrong ctx.accel_id -> REJECTED before zero issued
     // =====================================================================
     TEST_CASE("43. device mismatch");
     {
@@ -3210,7 +3238,7 @@ int main(int argc, char** argv) {
 
         cudaStream_t s; cudaStreamCreate(&s);
 
-        // Wrong device_id (1 instead of 0).
+        // Wrong accel_id (1 instead of 0).
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 1, s};
         DataPathRequest wr;
         wr.intent.direction = IoDirection::WRITE;
@@ -3220,7 +3248,7 @@ int main(int argc, char** argv) {
         wr.intent.target_offset = 0;
         wr.intent.length = kBlockSize;
         auto out = dp.submit(&wr, 1, ctx);
-        CHECK(!out.status.ok(), "wrong device_id rejected");
+        CHECK(!out.status.ok(), "wrong accel_id rejected");
         CHECK(!out.op.has_value(), "no op (zero issued)");
         CHECK(out.initial_states[0].state == RequestState::REJECTED,
               "REJECTED");
@@ -7358,7 +7386,13 @@ int main(int argc, char** argv) {
                                 /*mdts*/0, /*max_batch_entries*/256,
                                 /*cq_poll_budget*/0,
                                 /*handle_cache_capacity*/1,
-                                /*prp_cache_capacity*/0);
+                                /*prp_cache_capacity*/0,
+                                /*max_in_flight_operations*/0,
+                                /*max_batch_requests*/0,
+                                /*max_request_bytes_override*/0,
+                                /*handle_cache_l2_capacity*/0,
+                                /*controller_pci_addr*/{},
+                                /*threads_per_block*/kNumQueues);
 
         // Assemble through StorageRuntime so we get public API (IoRequest with MemoryHandle).
         MultiDeviceResolverWrapper resolver_hc(
