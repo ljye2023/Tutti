@@ -1,42 +1,20 @@
-// layerwise_kv_overlap.cu -- StorageRuntime port of the layerwise KV-cache
-// overlap simulator.
+// layerwise_kv_overlap.cpp -- TuttiRuntime port of the layerwise KV-cache
+// overlap workload.
 //
 // HY3-shaped 128K-context request (80 layers, 512 x 256-token chunks,
 // 90% prefix hit) with 3-stream layerwise pipeline:
 //   read(L+1) || SGEMM compute(L) || write(L-1)
 //
-// All data-plane operations use ONLY the public StorageRuntime API.
+// TuttiRuntime mode: the runtime (devices, queues, datapaths) is assembled
+// from a Tutti YAML (--config); the daemon owns all deployment facts. The
+// user only passes the daemon-published accelerator view directories
+// (--directory), never PCI BDFs, chrdev paths, or mount points.
 //
-// MEMORY ARCHITECTURE (matches legacy Coordinator):
-//   Per-chunk K/V tensors: each tensor_size (512 KiB), registered
-//   individually with the DataPath.  NVMe DMA goes directly to/from
-//   tensors — no scratch buffer, no D2D bounce.
-//
-// PARTIAL-COMMIT CONTRACT / CAPACITY (Round 15 S4):
-//   The DataPath below is constructed with an explicit large capacity
-//   (max_in_flight_operations=4, max_batch_entries=4096; max_batch_requests
-//   and max_request_bytes_override left at their "follow entries" / "entries
-//   * MDTS" defaults) so that a full per-layer per-direction batch (up to
-//   2*n_hit requests) is accepted by a single DataPath::submit() call — one
-//   kernel launch — on the normal path. windowed_submit_wait() still
-//   window-loops on partial commit (per-request RESOURCE_EXHAUSTED etc.) as
-//   a defensive safety net, but under this capacity it always completes in
-//   exactly one round for the shapes exercised here (checked below via the
-//   DataPath's test_submit_call_count()/test_kernel_launch_count() seams).
-//
-// PIPELINE (Option B — interleaved single-thread):
-//   Per layer L:
-//     1. submit read(L+1) windows on s_r (non-blocking after wait)
-//     2. submit write(L-1) windows on s_w (non-blocking after wait)
-//     3. compute(L) on s_c (async, depends on read(L) event)
-//   read and write IO are on separate streams → GPU-side concurrent.
-//   Host blocks during each window's wait, but compute runs on s_c
-//   concurrently with the other stream's IO.
-//
-// HONEST TIMING:
-//   IO time = host wall clock of the submit+wait loop (all windows).
-//   IO bytes = only actually-accepted bytes (sum of accepted * ts).
-//   Bandwidth = accepted_bytes / io_time.
+// MEMORY ARCHITECTURE: per-chunk K/V tensors (tensor_size, 512 KiB default)
+// are registered individually with the DataPath. NVMe DMA goes directly
+// to/from tensors -- no scratch buffer, no D2D bounce.
+
+#include <tutti/tutti_runtime.h>
 
 #include <tutti/storage_runtime.h>
 #include <tutti/io_types.h>
@@ -56,8 +34,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -65,6 +43,10 @@
 #include <vector>
 
 using namespace tutti;
+
+#ifndef TUTTI_LAYERWISE_DEFAULT_CONFIG
+#define TUTTI_LAYERWISE_DEFAULT_CONFIG "tutti_layerwise_striped.yaml"
+#endif
 
 #define STEP_OK(...) do { char _b[1024]; std::snprintf(_b,sizeof(_b),__VA_ARGS__); std::fprintf(stderr,"[ OK ] %s\n",_b); } while(0)
 #define STEP_FAIL(...) do { char _b[1024]; std::snprintf(_b,sizeof(_b),__VA_ARGS__); std::fprintf(stderr,"[FAIL] %s\n",_b); std::_Exit(2); } while(0)
@@ -92,34 +74,17 @@ static bool ensure_nofile_limit(uint64_t required, uint64_t* previous) {
     return ::setrlimit(RLIMIT_NOFILE,&limit)==0;
 }
 
-static bool parse_nvme_device(const char* value,
-                              presets::NvmeDeviceConfig* device) {
-    std::vector<std::string> fields;
-    std::string input(value);
-    size_t begin = 0;
-    while (begin <= input.size()) {
-        size_t comma = input.find(',', begin);
-        fields.push_back(input.substr(begin, comma - begin));
-        if (comma == std::string::npos) break;
-        begin = comma + 1;
-    }
-    if (fields.size() != 4 ||
-        std::any_of(fields.begin(), fields.end(),
-                    [](const std::string& field) { return field.empty(); })) {
-        return false;
-    }
-    device->ssnvme_path = std::move(fields[0]);
-    device->pci_bdf = std::move(fields[1]);
-    device->backing_device = std::move(fields[2]);
-    device->mount_path = std::move(fields[3]);
-    return true;
+static std::string join_path(const std::string& directory, const std::string& name) {
+    std::string path = directory;
+    if (!path.empty() && path.back() != '/') path.push_back('/');
+    path += name;
+    return path;
 }
 
 bool create_file(const std::string& path, uint64_t size) {
     // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution).
     int f=::open(path.c_str(),O_CREAT|O_RDWR|O_TRUNC|O_DIRECT,0644);
     if(f<0)return false;
-    // O_DIRECT requires block-aligned buffers.
     void* ap=nullptr; if(::posix_memalign(&ap,4096,1<<20)!=0){::close(f);return false;}
     std::memset(ap,0,1<<20);
     while(size>0){size_t n=std::min((uint64_t)(1<<20),size);if(::write(f,ap,n)!=(ssize_t)n){std::free(ap);::close(f);return false;}size-=n;}
@@ -127,143 +92,53 @@ bool create_file(const std::string& path, uint64_t size) {
     ::fsync(f);::close(f);return true;
 }
 
-// Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
-inline int32_t test_gpu_id(){const char*e=std::getenv("TUTTI_TEST_GPU");int v=e?std::atoi(e):0;int dc=0;if(cudaGetDeviceCount(&dc)!=cudaSuccess||dc==0)return 0;return(v>=0&&v<dc)?v:0;}
-
-// ---------------------------------------------------------------------------
-// DpSeam — abstracts test-seam counters so windowed_submit_wait
-// works with both LocalNvmeDataPath and StripedDataPath.
-// R20 S2: now uses public RuntimeTelemetry from presets/local_nvme.h.
-// ---------------------------------------------------------------------------
-struct DpSeam {
-    std::function<uint64_t()> submit_count;
-    std::function<uint64_t()> launch_count;
-    std::function<void()>     reset;
-};
-static DpSeam make_dp_seam(const presets::RuntimeTelemetry& t) {
-    return DpSeam{t.submit_call_count, t.kernel_launch_count, t.reset_counters};
-}
-
 // ---------------------------------------------------------------------------
 // Windowed submit+wait: handles partial-commit by retrying rejected requests.
 // Returns {total_ms_host, total_accepted_bytes}.
-//
-// Round 15 S4 instrumentation: `dp` is the single LocalNvmeDataPath backing
-// `rt`. On the normal (single-round) path, one call here must drive exactly
-// one DataPath::submit() and one kernel launch (test_submit_call_count() /
-// test_kernel_launch_count() seams) — this is asserted below and tallied
-// into the g_windowed_* globals for the end-of-run instrumentation summary.
 // ---------------------------------------------------------------------------
 struct WindowedIoResult { double ms; uint64_t bytes; };
 
-static uint64_t g_windowed_calls = 0;
-static uint64_t g_windowed_multi_round_calls = 0;
-static uint64_t g_windowed_rounds_total = 0;
-
-// Round 16 S4: uses DpSeam instead of template (works with both DataPath types).
 static WindowedIoResult windowed_submit_wait(
         StorageRuntime* rt,
-        DpSeam& dp,
         const IoRequest* all_reqs, size_t n_reqs,
         const HostSubmitContext& ctx,
-        cudaStream_t /*stream*/,  // Round 16 S7: no longer synced here; the
-                                  // caller's event DAG expresses ordering.
         uint64_t bytes_per_req,
         const char* tag) {
-    // Build a mutable copy of request indices that still need submission
     std::vector<IoRequest> pending(all_reqs, all_reqs + n_reqs);
     double total_ms = 0;
     uint64_t total_bytes = 0;
     int rounds = 0;
-    ++g_windowed_calls;
 
     while (!pending.empty()) {
-        // Submit everything still pending in one call; the DataPath is
-        // configured with enough capacity (see Phase 0 construction) that
-        // this is normally the full remaining batch and the only round.
-        // The loop itself remains a generic safety net for any
-        // over-capacity / partial-commit scenario.
         size_t submit_count = pending.size();
-
-        uint64_t dp_submit0 = dp.submit_count();
-        uint64_t dp_launch0 = dp.launch_count();
-
         auto t0 = std::chrono::steady_clock::now();
         auto o = rt->submit(pending.data(), submit_count, ctx);
 
         if (o.io.has_value()) {
-            // Some accepted — wait for them
             auto wo = rt->wait(o.io.value(), 60000);
             if (wo.observation_status.code() != StatusCode::OK ||
                 !wo.result || wo.result->state != IoState::COMPLETED) {
                 STEP_FAIL("%s: wait failed (round %d)", tag, rounds);
             }
             RT_STATUS(rt->release_io(o.io.value()));
-            // Round 16 S7: removed cudaStreamSynchronize(stream) here.
-            // rt->wait() already polls until the kernel (launched on
-            // `stream`) has completed -- the extra host sync was redundant
-            // and prevented GPU-side read/write overlap across layers.
-            // Cross-layer ordering is expressed via the event DAG
-            // (cudaStreamWaitEvent in Phase G), not host sync.
-            // rt->wait() already polls until the kernel (launched on
-            // `stream`) has completed — the extra host sync was redundant
-            // and prevented GPU-side read/write overlap across layers.
-            // Cross-layer ordering is expressed via the event DAG
-            // (cudaStreamWaitEvent in Phase G), not host sync.
 
-            // Count accepted
-            size_t accepted = 0;
-            for (size_t i = 0; i < o.initial_states.size() && i < submit_count; ++i) {
-                if (o.initial_states[i].state == IoRequestState::ACCEPTED) {
-                    ++accepted;
-                    total_bytes += bytes_per_req;
-                }
-            }
-            // Collect rejected for next round
             std::vector<IoRequest> next_round;
             for (size_t i = 0; i < submit_count; ++i) {
-                if (i >= o.initial_states.size() ||
-                    o.initial_states[i].state != IoRequestState::ACCEPTED) {
+                if (i < o.initial_states.size() &&
+                    o.initial_states[i].state == IoRequestState::ACCEPTED) {
+                    total_bytes += bytes_per_req;
+                } else {
                     next_round.push_back(pending[i]);
                 }
             }
-            // Append un-submitted (beyond submit_count)
-            for (size_t i = submit_count; i < pending.size(); ++i)
-                next_round.push_back(pending[i]);
-
             pending = std::move(next_round);
         } else {
-            // All rejected — no handle, all in initial_states
-            std::vector<IoRequest> next_round;
-            for (size_t i = 0; i < submit_count; ++i)
-                next_round.push_back(pending[i]);
-            for (size_t i = submit_count; i < pending.size(); ++i)
-                next_round.push_back(pending[i]);
-            pending = std::move(next_round);
-            // Safety: avoid infinite loop
             if (rounds > 10000) STEP_FAIL("%s: too many rounds (stuck)", tag);
         }
 
         total_ms += sec_since(t0) * 1e3;
         ++rounds;
-
-        // Round 15 S4: on this (necessarily single-DataPath) runtime, a
-        // round that reaches the DataPath at all must drive exactly one
-        // DataPath::submit() and, on the normal path, exactly one kernel
-        // launch (see LocalNvmeDataPath::submit()'s early reject_all path
-        // for the only case where a call is counted without a launch).
-        uint64_t dp_submit_delta = dp.submit_count() - dp_submit0;
-        uint64_t dp_launch_delta = dp.launch_count() - dp_launch0;
-        if (dp_submit_delta != 1)
-            STEP_FAIL("%s: round %d drove %lu DataPath::submit() calls (expected 1)",
-                      tag, rounds, (unsigned long)dp_submit_delta);
-        if (o.io.has_value() && dp_launch_delta != 1)
-            STEP_FAIL("%s: round %d drove %lu kernel launches for an accepted op (expected 1)",
-                      tag, rounds, (unsigned long)dp_launch_delta);
     }
-
-    g_windowed_rounds_total += (uint64_t)rounds;
-    if (rounds > 1) ++g_windowed_multi_round_calls;
 
     return {total_ms, total_bytes};
 }
@@ -272,16 +147,10 @@ int main(int argc,char**argv){
     uint32_t n_layers=80, chunk_tokens=256, hit_pct=90, tensor_kb=512, n_requests=2;
     uint32_t gemm_n=1024, compute_sms=64;
     uint64_t ctx_tokens=131072, compute_us=0;
-    std::string data_dir="/mnt/nvme0/GPU0";
-    std::vector<presets::NvmeDeviceConfig> nvme_devices = {
-        {"/dev/ssnvme0","0000:08:00.0","/dev/snvme0n1","/mnt/nvme0"},
-        {"/dev/ssnvme1","0000:4b:00.0","/dev/snvme1n1","/mnt/nvme1"},
-        {"/dev/ssnvme2","0000:57:00.0","/dev/snvme2n1","/mnt/nvme2"},
-        {"/dev/ssnvme3","0000:63:00.0","/dev/snvme3n1","/mnt/nvme3"},
-    };
-    bool nvme_overridden=false;
+    std::string config_path=TUTTI_LAYERWISE_DEFAULT_CONFIG;
+    std::vector<std::string> directories;
     bool verify=true;
-    bool striped=true;
+    bool striped=true;   // default matches the default (striped) YAML
     for(int i=1;i<argc;){
         const char*a=argv[i];
         if(!std::strcmp(a,"--layers")&&i+1<argc){n_layers=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
@@ -293,34 +162,37 @@ int main(int argc,char**argv){
         else if(!std::strcmp(a,"--compute-us")&&i+1<argc){compute_us=std::strtoull(argv[++i],0,10);++i;}
         else if(!std::strcmp(a,"--gemm-n")&&i+1<argc){gemm_n=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
         else if(!std::strcmp(a,"--compute-sms")&&i+1<argc){compute_sms=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
-        else if(!std::strcmp(a,"--data-dir")&&i+1<argc){data_dir=argv[++i];++i;}
-        else if(!std::strcmp(a,"--nvme")&&i+1<argc){
-            presets::NvmeDeviceConfig device;
-            if(!parse_nvme_device(argv[++i],&device)){
-                std::fprintf(stderr,
-                    "invalid --nvme: expected ssnvme_path,pci_bdf,backing_device,mount_path\n");
-                return 1;
-            }
-            if(!nvme_overridden){nvme_devices.clear();nvme_overridden=true;}
-            nvme_devices.push_back(std::move(device));
-            ++i;
-        }
+        else if(!std::strcmp(a,"--config")&&i+1<argc){config_path=argv[++i];++i;}
+        else if(!std::strcmp(a,"--directory")&&i+1<argc){directories.emplace_back(argv[++i]);++i;}
         else if(!std::strcmp(a,"--verify")){verify=true;++i;}
         else if(!std::strcmp(a,"--no-verify")){verify=false;++i;}
         else if(!std::strcmp(a,"--striped")){striped=true;++i;}
         else if(!std::strcmp(a,"--single")){striped=false;++i;}
-        else{std::fprintf(stderr,"unknown: %s\n",a);return 1;}
+        else if(!std::strcmp(a,"--help")||!std::strcmp(a,"-h")){
+            std::fprintf(stderr,
+                "Usage: %s --directory PATH [--directory PATH ...] [--config PATH] [workload flags]\n"
+                "  --directory  daemon-published accelerator view (1 = single, >=2 power-of-two = striped)\n"
+                "  --config     Tutti YAML (default: " TUTTI_LAYERWISE_DEFAULT_CONFIG ")\n",
+                argv[0]);
+            return 0;
+        }
+        else{std::fprintf(stderr,"unknown: %s (try --help)\n",a);return 1;}
     }
+
+    if(directories.empty())
+        STEP_FAIL("no view directories given: pass --directory <daemon-published view> "
+                  "(e.g. /mnt/gpu0/ssnvme0; see `nvmeservice_client --list-only`)");
     const uint64_t ts=(uint64_t)tensor_kb*1024;
     const uint64_t n_chunks=ctx_tokens/chunk_tokens;
     const uint64_t n_hit=n_chunks*hit_pct/100, n_miss=n_chunks-n_hit;
     const uint64_t file_total=2ull*n_layers*ts;
     if(!n_chunks||!n_hit||!n_miss)STEP_FAIL("bad geometry");
     if(!ts||ts%4096)STEP_FAIL("--tensor-kb must produce a positive 4 KiB-aligned tensor size");
-    if(nvme_devices.empty())STEP_FAIL("no NVMe devices configured");
-    const size_t ndev=nvme_devices.size();
+    const size_t ndev=directories.size();
+    if(!striped&&ndev!=1)
+        STEP_FAIL("--single requires exactly one --directory (got %lu)",(unsigned long)ndev);
     if(striped&&(ndev<2||(ndev&(ndev-1))!=0))
-        STEP_FAIL("striped mode requires a power-of-two --nvme device count >= 2 (got %lu)",
+        STEP_FAIL("striped mode requires a power-of-two --directory count >= 2 (got %lu)",
                   (unsigned long)ndev);
     constexpr uint64_t kFdHeadroom=256;
     const uint64_t fds_per_target=striped?ndev:1;
@@ -336,76 +208,43 @@ int main(int argc,char**argv){
         STEP_OK("RLIMIT_NOFILE raised from %lu to %lu",
                 (unsigned long)previous_nofile,(unsigned long)required_fds);
 
-    std::string striped_devs;
-    for(size_t i=0;i<nvme_devices.size();++i){
-        if(i)striped_devs+=',';
-        striped_devs+=nvme_devices[i].mount_path;
-    }
-
+    // ---- Runtime: assembled from the Tutti YAML; devices come from the daemon ----
+    auto created = TuttiRuntime::create(config_path);
+    if(!created.ok())
+        STEP_FAIL("TuttiRuntime::create(%s): %s",config_path.c_str(),
+                  created.status().message().c_str());
+    std::unique_ptr<TuttiRuntime> owner = std::move(created).value();
+    StorageRuntime* rt = owner->storage_runtime();
+    if(rt==nullptr)
+        STEP_FAIL("TuttiRuntime did not create a StorageRuntime");
+    const int32_t gpu = rt->accel_id();
+    if(gpu<0)
+        STEP_FAIL("runtime accel_id is unspecified (< 0); set runtime.accel_id in the YAML");
     CUDA_OK(cudaFree(0));
-    int32_t gpu=test_gpu_id();
     CUDA_OK(cudaSetDevice(gpu));
-    STEP_OK("cudaSetDevice(%d)",gpu);
+    STEP_OK("cudaSetDevice(%d) via TuttiRuntime (%s)",gpu,config_path.c_str());
+    STEP_OK("StorageRuntime created (%s, N=%lu)",striped?"StripedDataPath":"LocalNvmeDataPath",
+            (unsigned long)ndev);
 
-    // ---- Runtime ----
-    // R20 S2: uses public preset factory (no private headers).
-    // Capacity knobs: in-flight=4, batch_entries=4096 (single) or 8192 (striped)
-    // so that a full per-layer per-direction batch fits in a single submit.
-    DpSeam seam;
-    std::unique_ptr<StorageRuntime> rt;
-
-    if (striped) {
-        presets::StripedNvmePreset preset;
-        preset.devices = nvme_devices;
-        preset.gpu_id = gpu;
-        preset.num_queues = 32;
-        preset.stripe_unit = ts;  // Round 16 S7: unit=ts (512KiB, tensor-aligned)
-        preset.max_batch_entries = 8192;
-        preset.max_in_flight_operations = 4;
-        preset.prp_cache_capacity = 4096;
-
-        auto rwt = presets::make_striped_nvme_runtime(preset);
-        if (!rwt.runtime) STEP_FAIL("create striped runtime");
-        rt = std::move(rwt.runtime);
-        seam = make_dp_seam(rwt.telemetry);
-        STEP_OK("StorageRuntime created (StripedDataPath, N=%lu)",
-                (unsigned long)ndev);
-    } else {
-        presets::LocalNvmePreset preset;
-        preset.device = nvme_devices.front();
-        preset.gpu_id = gpu;
-        preset.num_queues = 16;
-        preset.max_batch_entries = 4096;
-        preset.max_in_flight_operations = 4;
-        preset.handle_cache_capacity = 4096;
-        preset.prp_cache_capacity = 4096;
-
-        auto rwt = presets::make_local_nvme_runtime(preset);
-        if (!rwt.runtime) STEP_FAIL("create runtime");
-        rt = std::move(rwt.runtime);
-        seam = make_dp_seam(rwt.telemetry);
-        STEP_OK("StorageRuntime created (LocalNvmeDataPath)");
-    }
-
-    // ---- Phase A: create files ----
+    // ---- Phase A: create backing files under the daemon-published views ----
     auto t0=std::chrono::steady_clock::now();
     std::vector<std::string> paths(n_chunks);
     if (striped) {
-        // One backing file per chunk and device/shard.
-        // StripedResolver path: <mount>/striped/<name>.shard<i>
+        // One backing file per chunk and device/shard, under <view>/striped/.
         const uint64_t total_stripes = 2ull * n_layers;
         const uint64_t shard_size = ((total_stripes + ndev - 1) / ndev) * ts;
         for (size_t d = 0; d < ndev; ++d) {
-            std::string sdir = nvme_devices[d].mount_path + "/striped";
-            ::mkdir(sdir.c_str(), 0755);
+            std::string sdir = join_path(directories[d], "striped");
+            if(::mkdir(sdir.c_str(),0755)!=0&&errno!=EEXIST)
+                STEP_FAIL("mkdir %s: %s",sdir.c_str(),std::strerror(errno));
         }
         for(uint64_t i=0;i<n_chunks;++i){
             char nm[128];
             std::snprintf(nm,sizeof(nm),"kvlw_%lu",(unsigned long)i);
             paths[i]=nm;  // store the name (not path) for striped:// URI
             for(size_t d=0;d<ndev;++d){
-                std::string sp=nvme_devices[d].mount_path+"/striped/"+nm+
-                               ".shard"+std::to_string(d);
+                std::string sp=join_path(join_path(directories[d],"striped"),
+                                         std::string(nm)+".shard"+std::to_string(d));
                 if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp.c_str());
             }
         }
@@ -414,9 +253,9 @@ int main(int argc,char**argv){
                 (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
     } else {
         for(uint64_t i=0;i<n_chunks;++i){
-            char nm[128];std::snprintf(nm,sizeof(nm),"%s/kvlw_%lu",data_dir.c_str(),(unsigned long)i);
-            paths[i]=nm;
-            if(!create_file(paths[i],file_total))STEP_FAIL("create_file %s",nm);
+            char nm[128];std::snprintf(nm,sizeof(nm),"kvlw_%lu",(unsigned long)i);
+            paths[i]=join_path(directories.front(),nm);
+            if(!create_file(paths[i],file_total))STEP_FAIL("create_file %s",paths[i].c_str());
         }
         STEP_OK("Phase A: %lu files (%.1f GB) in %.2fs",(unsigned long)n_chunks,
                 (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
@@ -435,20 +274,20 @@ int main(int argc,char**argv){
     for(uint64_t b=0;b<n_hit;++b){
         hk[b]=gpu_alloc(ts);
         hv[b]=gpu_alloc(ts);
-        auto r=rt->register_memory({hk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
+        auto r=rt->register_memory({hk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg K hit %lu: %s",(unsigned long)b,r.status().message().c_str());
         hk_m[b]=r.value();
-        r=rt->register_memory({hv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
+        r=rt->register_memory({hv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg V hit %lu: %s",(unsigned long)b,r.status().message().c_str());
         hv_m[b]=r.value();
     }
     for(uint64_t b=0;b<n_miss;++b){
         mk[b]=gpu_alloc(ts);
         mv[b]=gpu_alloc(ts);
-        auto r=rt->register_memory({mk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
+        auto r=rt->register_memory({mk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg K miss %lu: %s",(unsigned long)b,r.status().message().c_str());
         mk_m[b]=r.value();
-        r=rt->register_memory({mv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,(int32_t)gpu,"",ts});
+        r=rt->register_memory({mv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg V miss %lu: %s",(unsigned long)b,r.status().message().c_str());
         mv_m[b]=r.value();
     }
@@ -462,23 +301,14 @@ int main(int argc,char**argv){
         std::string uri;
         OpenOptions opts;
         if (striped) {
-            // Round 16 S7: per-chunk shard rotation (rot=i%N), mirroring
-            // legacy's shard_placement (kv_cache_layerwise_overlap.cu:293):
-            //     shard_placement = {coord_devs[(2i)%ndev],
-            //                        coord_devs[(2i+1)% ndev]}
-            // Rationale (legacy comment :287-291): "every batch then mixes
-            // chunks living on every device, so a single
-            // nvme_batch_xfer_kernel drives all N NVMes concurrently".
-            //
-            // Without rotation, every request in a layer shares
-            // target_offset = L*ts, so shard = (L*ts/ts) % N = L % N is
-            // CONSTANT across the whole batch -> the entire layer lands on
-            // ONE disk and aggregation degenerates to single-disk bandwidth.
-            // With rot=i%N, chunk i's shard (L%N) maps to device
-            // ((L%N)+i)%N, so a layer's chunks spread evenly over all devices
-            // within one fused kernel launch.
+            // Per-chunk shard rotation (rot=i%N): without it every request in a
+            // layer shares target_offset = L*ts, so shard = L%N is constant and
+            // the whole layer lands on ONE disk. With rot=i%N a layer's chunks
+            // spread evenly over all devices within one fused kernel launch.
+            std::string devs;
+            for(size_t d=0;d<ndev;++d){if(d)devs+=',';devs+=directories[d];}
             uri = std::string("striped://") + paths[i] +
-                  "?devs=" + striped_devs + "&unit=" +
+                  "?devs=" + devs + "&unit=" +
                   std::to_string(ts) + "&rot=" + std::to_string(i % ndev);
             opts = OpenOptions{"striped"};
         } else {
@@ -529,7 +359,6 @@ int main(int argc,char**argv){
         auto tw=std::chrono::steady_clock::now();
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION,gpu,s_w};
         for(uint32_t L=0;L<n_layers;++L){
-            // Fill all hit K/V tensors with launch_fill_pattern (DMA-visible)
             for(uint64_t b=0;b<n_hit;++b){
                 uint8_t sk=(uint8_t)((b*n_layers+L)&0xFF);
                 uint8_t sv=(uint8_t)(sk^0xA5);
@@ -537,11 +366,10 @@ int main(int argc,char**argv){
                 presets::launch_fill_pattern(hv[b],sv,ts,s_w);
             }
             CUDA_OK(cudaStreamSynchronize(s_w));
-            // Windowed write
             auto reqs = build_writes(L, [&]{std::vector<uint64_t>v(n_hit);for(uint64_t i=0;i<n_hit;++i)v[i]=i;return v;}(),
                                           hk_m, hv_m);
-            auto res = windowed_submit_wait(rt.get(), seam, reqs.data(), reqs.size(),
-                                            ctx, s_w, ts, "prewrite");
+            auto res = windowed_submit_wait(rt, reqs.data(), reqs.size(),
+                                            ctx, ts, "prewrite");
             if(res.bytes != reqs.size() * ts)
                 STEP_FAIL("Phase E L=%u: only %lu/%lu bytes written",
                           L,(unsigned long)res.bytes,(unsigned long)(reqs.size()*ts));
@@ -572,7 +400,6 @@ int main(int argc,char**argv){
     for(uint64_t i=0;i<n_hit;++i)hi[i]=i;
     for(uint64_t i=0;i<n_miss;++i)mi[i]=n_hit+i;
 
-    // do_read / do_write: windowed submit+wait, returns {ms, bytes}
     HostSubmitContext ctx_r{ExecutionDomain::DEVICE_EXECUTION,gpu,s_r};
     HostSubmitContext ctx_w{ExecutionDomain::DEVICE_EXECUTION,gpu,s_w};
 
@@ -580,15 +407,13 @@ int main(int argc,char**argv){
                      const std::vector<MemoryHandle>&km,
                      const std::vector<MemoryHandle>&vm)->WindowedIoResult{
         auto reqs=build_reads(L,idx,km,vm);
-        return windowed_submit_wait(rt.get(),seam,reqs.data(),reqs.size(),
-                                    ctx_r,s_r,ts,"read");
+        return windowed_submit_wait(rt,reqs.data(),reqs.size(),ctx_r,ts,"read");
     };
     auto do_write=[&](uint32_t L,const std::vector<uint64_t>&idx,
                       const std::vector<MemoryHandle>&km,
                       const std::vector<MemoryHandle>&vm)->WindowedIoResult{
         auto reqs=build_writes(L,idx,km,vm);
-        return windowed_submit_wait(rt.get(),seam,reqs.data(),reqs.size(),
-                                    ctx_w,s_w,ts,"write");
+        return windowed_submit_wait(rt,reqs.data(),reqs.size(),ctx_w,ts,"write");
     };
 
     // Calibrate
@@ -607,20 +432,11 @@ int main(int argc,char**argv){
                 tw_ms,(double)rw.bytes/1e9,rw.bytes/1e9/(tw_ms/1e3));
     }
     const uint32_t ci=(uint32_t)std::max(1.0,(double)compute_us/((double)gemm_ms*1000)+0.5);
-    LOG_INFO("pipeline: layers=%u chunks=%lu (hit=%lu miss=%lu) compute=%lu us = %u iters "
-             "(DataPath in-flight=4/batch_entries=4096, 1 submit/layer/direction expected)",
+    LOG_INFO("pipeline: layers=%u chunks=%lu (hit=%lu miss=%lu) compute=%lu us = %u iters",
              (unsigned)n_layers,(unsigned long)n_chunks,(unsigned long)n_hit,(unsigned long)n_miss,
              (unsigned long)compute_us,(unsigned)ci);
 
-    // ---- Phase G: 3-stream pipeline (Option B: interleaved) ----
-    // Per layer L:
-    //   1. submit read(L+1) windows on s_r, wait all
-    //   2. submit write(L-1) windows on s_w, wait all
-    //   3. compute(L) on s_c (async, depends on read(L) via event)
-    // read and write are on separate streams; while host waits on write
-    // windows, s_r is idle but s_c compute may be running from a prior
-    // async launch.  The overlap comes from compute running on s_c
-    // while host is blocked in IO waits.
+    // ---- Phase G: 3-stream pipeline ----
     std::vector<cudaEvent_t> er(n_layers),ec(n_layers);
     for(auto&e:er)CUDA_OK(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
     for(auto&e:ec)CUDA_OK(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
@@ -628,7 +444,6 @@ int main(int argc,char**argv){
     double sim_wall=0, sim_rms=0, sim_wms=0;
     uint64_t sim_rbytes=0, sim_wbytes=0;
 
-    // Profiling support (CUDA only; no-op on other profiles).
 #if defined(TUTTI_USE_CUDA)
     CUDA_OK(cudaProfilerStart());
 #endif
@@ -746,24 +561,6 @@ int main(int argc,char**argv){
         STEP_OK("Phase H: verified %lu samples, all correct",(unsigned long)ck);
     }
 
-    // ---- Round 15 S4 instrumentation summary ----
-    // Every windowed_submit_wait() call above (Phase E prewrite, Phase F
-    // calibration, Phase G per-layer read/write, Phase H verify) already
-    // hard-asserted per-round DataPath::submit()==1 and (when accepted)
-    // kernel-launch==1. Aggregate calls==rounds (and multi_round==0) proves
-    // every one of those calls completed in exactly one round, i.e. one
-    // rt.submit -> one DataPath::submit -> one kernel launch per
-    // layer/direction, end to end.
-    LOG_INFO("Round15 S4 instrumentation: windowed_submit_wait calls=%lu total_rounds=%lu "
-             "multi_round_calls=%lu (expect rounds==calls, multi_round==0 at this capacity)",
-             (unsigned long)g_windowed_calls,(unsigned long)g_windowed_rounds_total,
-             (unsigned long)g_windowed_multi_round_calls);
-    if (g_windowed_multi_round_calls != 0 || g_windowed_rounds_total != g_windowed_calls)
-        STEP_FAIL("Round15 S4: expected every windowed_submit_wait call to complete in exactly "
-                  "1 round (calls=%lu rounds=%lu multi_round=%lu)",
-                  (unsigned long)g_windowed_calls,(unsigned long)g_windowed_rounds_total,
-                  (unsigned long)g_windowed_multi_round_calls);
-
     // ---- Cleanup ----
     CUDA_OK(cudaFree(dA));CUDA_OK(cudaFree(dB));CUDA_OK(cudaFree(dC));
     for(auto&e:er)CUDA_OK(cudaEventDestroy(e));
@@ -775,8 +572,8 @@ int main(int argc,char**argv){
         RT_STATUS(rt->close(tgt[i]));
         if (striped) {
             for(size_t d=0;d<ndev;++d){
-                std::string sp=nvme_devices[d].mount_path+"/striped/"+paths[i]+
-                               ".shard"+std::to_string(d);
+                std::string sp=join_path(join_path(directories[d],"striped"),
+                                         paths[i]+".shard"+std::to_string(d));
                 if(::unlink(sp.c_str())!=0)
                     STEP_FAIL("unlink %s failed",sp.c_str());
             }
@@ -785,7 +582,10 @@ int main(int argc,char**argv){
         }
     }
     CUDA_OK(cudaStreamDestroy(s_r));CUDA_OK(cudaStreamDestroy(s_c));CUDA_OK(cudaStreamDestroy(s_w));
-    RT_STATUS(rt->shutdown(5000));
+    {
+        const Status shutdown = owner->shutdown();
+        if(!shutdown.ok())STEP_FAIL("TuttiRuntime::shutdown: %s",shutdown.message().c_str());
+    }
     std::fprintf(stderr,"\n=== layerwise_kv_overlap: PASSED ===\n");
     return 0;
 }

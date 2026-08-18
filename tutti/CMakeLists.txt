@@ -92,6 +92,28 @@ else()
 endif()
 message(STATUS "Tutti: yaml-cpp target: ${TUTTI_YAML_CPP_TARGET}")
 
+# ---------------------------------------------------------------------------
+# CCCL headers (cuda/atomic, cuda/std/...) — CUDA 13.0+ keeps them under
+# targets/<arch>/include/cccl/, which is NOT part of CUDAToolkit_INCLUDE_DIRS.
+# Add them globally BEFORE any hardware target is defined (config/ alone
+# defines tutti_runtime, whose sources include cuda_like.h) so every later
+# target resolves <cuda/atomic> regardless of whether CUDA lives at the
+# standard /usr/local/cuda or a vendored location.
+# ---------------------------------------------------------------------------
+if(TUTTI_ACCELERATOR STREQUAL "CUDA")
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        foreach(_tutti_inc_dir ${CUDAToolkit_INCLUDE_DIRS})
+            get_filename_component(_tutti_cuda_root "${_tutti_inc_dir}/.." ABSOLUTE)
+            file(GLOB _tutti_cccl_dirs "${_tutti_cuda_root}/targets/*/include/cccl")
+            if(_tutti_cccl_dirs)
+                include_directories(${_tutti_cccl_dirs})
+                message(STATUS "Tutti: CCCL include: ${_tutti_cccl_dirs}")
+            endif()
+        endforeach()
+    endif()
+endif()
+
 add_subdirectory(resource)
 add_subdirectory(config)
 
@@ -112,6 +134,9 @@ add_subdirectory(config)
 # ---------------------------------------------------------------------------
 
 include("${TUTTI_SOURCE_DIR}/cmake/accelerators/${TUTTI_ACCELERATOR}.cmake")
+
+# CCCL include-directories were already added globally before add_subdirectory(config);
+# see the block above. Nothing to do here.
 
 if(TUTTI_BUILD_KERNEL_MODULE)
     if(TUTTI_ACCELERATOR STREQUAL "HOST")
@@ -244,20 +269,8 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         message(STATUS "Tutti: Using CUDA ${CUDAToolkit_VERSION}")
         message(STATUS "Tutti: Target architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
-        # CUDA 13.0+: CCCL headers (cuda/atomic, cuda/std/...) live under
-        # targets/<arch>/include/cccl/ which is NOT in CUDAToolkit_INCLUDE_DIRS.
-        # Add it for hardware stack targets (libnvm queue.cpp includes <cuda/atomic>).
-        # Only needed when local-NVMe (libnvm) is in the build.
-        if(TUTTI_FEATURE_LOCAL_NVME)
-            foreach(_tutti_inc_dir ${CUDAToolkit_INCLUDE_DIRS})
-                get_filename_component(_tutti_cuda_root "${_tutti_inc_dir}/.." ABSOLUTE)
-                file(GLOB _tutti_cccl_dirs "${_tutti_cuda_root}/targets/*/include/cccl")
-                if(_tutti_cccl_dirs)
-                    include_directories(${_tutti_cccl_dirs})
-                    message(STATUS "Tutti: CCCL include: ${_tutti_cccl_dirs}")
-                endif()
-            endforeach()
-        endif()
+        # CCCL include-directories were already added globally right after
+        # the accelerator module include (see above); nothing to do here.
     elseif(TUTTI_ACCELERATOR STREQUAL "MUSA" OR TUTTI_ACCELERATOR STREQUAL "MACA")
         message(STATUS "Tutti: Using ${TUTTI_ACCELERATOR} profile "
                        "(SDK paths configured via cmake/accelerators/${TUTTI_ACCELERATOR}.cmake)")

@@ -21,6 +21,7 @@ target_link_libraries(nvmeservice_daemon_example PRIVATE
 
 set_target_properties(nvmeservice_daemon_example PROPERTIES
     OUTPUT_NAME   "nvmeservice_daemon"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
 )
@@ -46,6 +47,7 @@ target_link_libraries(nvmeservice_client_example PRIVATE
 
 set_target_properties(nvmeservice_client_example PROPERTIES
     OUTPUT_NAME   "nvmeservice_client"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
     CUDA_SEPARABLE_COMPILATION ON
@@ -68,6 +70,7 @@ target_link_libraries(tutti_daemon PRIVATE
     ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
 set_target_properties(tutti_daemon PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
 )

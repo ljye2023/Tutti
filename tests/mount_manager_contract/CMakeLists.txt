@@ -29,6 +29,7 @@ add_executable(tutti_mount_manager_contract_test
 target_link_libraries(tutti_mount_manager_contract_test PRIVATE
     ${_tutti_mount_manager_yaml_target}
     Threads::Threads
+    ${TUTTI_FILESYSTEM_LIBS}
 )
 
 target_include_directories(tutti_mount_manager_contract_test PRIVATE

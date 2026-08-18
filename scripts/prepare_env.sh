@@ -214,7 +214,10 @@ install_pkg "uuid-dev" "libuuid-devel" "util-linux"
 install_pkg "build-essential" "gcc-c++"              "base-devel"
 install_pkg "cmake"           "cmake"                "cmake"
 install_pkg "pkg-config"      "pkgconf-pkg-config"   "pkgconf"
-install_pkg "libyaml-cpp-dev" "yaml-cpp-devel"       "yaml-cpp"
+# yaml-cpp 在 RHEL/TencentOS 上常因 modular filtering 装不上（yaml-cpp-devel
+# 被过滤），且最终由 vcpkg 统一提供（见 ensure_cpp_deps_via_vcpkg），因此这里
+# 设为 optional：装不上只告警、不中断，后续 vcpkg 会补齐。
+install_pkg "libyaml-cpp-dev" "yaml-cpp-devel"       "yaml-cpp" optional
 install_pkg "libunwind-dev"   "libunwind-devel"      "libunwind"
 
 # CMakePresets.json version 3 requires CMake 3.21+.  Some older supported

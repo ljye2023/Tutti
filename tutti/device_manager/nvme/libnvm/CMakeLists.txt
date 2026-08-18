@@ -63,6 +63,7 @@ target_link_libraries(libnvm
         tutti_cuda_like
         ${TUTTI_ACCEL_RUNTIME_LIBS}
         Threads::Threads
+        ${TUTTI_FILESYSTEM_LIBS}
 )
 
 # =============================================================================

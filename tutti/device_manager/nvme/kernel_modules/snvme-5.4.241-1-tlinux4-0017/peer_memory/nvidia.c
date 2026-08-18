@@ -176,7 +176,7 @@ static int nvidia_peer_put_pages(uint64_t p2p_token, uint32_t va_space,
 static int nvidia_peer_dma_map_pages(struct pci_dev *peer,
 			      struct peer_page_table *pt,
 			      struct peer_dma_mapping **dm,
-				  uint32_t)
+			      uint32_t expect_page_size SNVME_P2P_UNUSED)
 {
 	struct nvidia_p2p_dma_mapping *ndm = NULL;
 	int ret;

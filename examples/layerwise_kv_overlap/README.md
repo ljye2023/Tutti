@@ -2,155 +2,121 @@
 
 ## 这是什么
 
-`layerwise_kv_overlap` 是 Tutti 的标准 KV-cache 参考负载示例。它模拟 HY3-shaped 128K-context 请求（80 层，512 × 256-token chunks，90% prefix hit），采用 3-stream layerwise pipeline：
+`layerwise_kv_overlap` 是 Tutti 的标准 KV-cache 参考负载。它模拟 HY3-shaped
+128K-context 请求（80 层，512 × 256-token chunks，90% prefix hit），采用
+3-stream layerwise pipeline：
 
 ```
 read(L+1) ∥ SGEMM compute(L) ∥ write(L-1)
 ```
 
-每个 chunk 的 K/V tensor（512 KiB）独立注册到 DataPath，NVMe DMA 直接读写 GPU tensor——无 scratch buffer、无 D2D bounce。
+每个 chunk 的 K/V tensor（512 KiB）独立注册到 DataPath，NVMe DMA 直接读写
+GPU tensor——无 scratch buffer、无 D2D bounce。
+
+## TuttiRuntime 模式
+
+本示例基于 **TuttiRuntime**：runtime（设备、队列、数据路径）由 Tutti YAML
+（`--config`）组装，部署事实（PCI BDF、chrdev、挂载点、队列配额）全部来自
+`tutti_daemon`。用户只传 daemon 发布的 **view 目录**（`--directory`），不再
+需要 `--nvme ssnvme_path,pci_bdf,...` 之类的设备细节。
+
+随示例附带两个 YAML（字段含义见文件内注释）：
+
+| YAML | 模式 | 设备 | 队列/盘 |
+| --- | --- | --- | --- |
+| `tutti_layerwise_striped.yaml`（默认） | 4 盘 striped | daemon device 0-3 | 32 |
+| `tutti_layerwise_local.yaml` | 单盘 | daemon device 0 | 16 |
 
 ## 前置环境
 
-**严格顺序**：内核模块 → `tutti_daemon` → 挂载——块设备由 daemon bring-up 后才创建，先 mount 会找不到设备。
-
-### 1. 编译内核模块
-
-```bash
-cd /path/to/Tutti
-cmake --preset cuda-module --fresh \
-    -DSNVME_KERNEL_VERSION=5.15.0-public \
-    -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda-module --target modules --parallel 8
-```
-
-产物：`build/cuda-module/module/snvme.ko`、`build/cuda-module/module/snvme-core.ko`
-
-### 2. 加载内核模块
+**严格顺序**：snvme 内核模块（已签名加载）→ `tutti_daemon` 运行中 → 记下
+daemon 发布的 view 目录：
 
 ```bash
-sudo insmod build/cuda-module/module/snvme-core.ko
-sudo insmod build/cuda-module/module/snvme.ko io_queue_depth=1024
+lsmod | grep snvme                                    # snvme + snvme_core
+cat /sys/module/snvme/parameters/io_queue_depth       # 应为 1024
+build/cuda-module/bin/nvmeservice_client \
+  --endpoint 127.0.0.1:50051 --list-only              # 查 view_root 与 chrdev
+# daemon 默认配置发布为 /mnt/gpu<N>/ssnvme<M>
 ```
-
-> **注意**：必须先加载 `snvme-core.ko`（依赖模块），再加载 `snvme.ko`。`io_queue_depth=1024` 是必需的——默认 64 会导致 striped 模式大规模 "wait failed"（见 [FAQ](../../doc/build_and_test.md#faq)）。
-
-### 3. 编译并启动 tutti_daemon
-
-```bash
-cmake --build --preset cuda-module --target tutti_daemon --parallel 8
-sudo ./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
-    --config sys_config.yaml &
-```
-
-daemon 启动后会：
-- bind 到 NVMe 控制器（`/dev/ssnvme0-3`）
-- 创建块设备 `/dev/snvme0n1` ~ `/dev/snvme3n1`
-- 按 `sys_config.yaml` 的 `auto_mount: true` 自动挂载到 `/mnt/nvme0-3`（ext4）
-
-### 4. 确认挂载
-
-```bash
-lsblk | grep snvme
-# 应看到 4 个 snvme 块设备挂载到 /mnt/nvme0-3
-```
-
-如果 daemon 没有自动挂载（`auto_mount: false` 或失败），手动挂载：
-
-```bash
-sudo mount /dev/snvme0n1 /mnt/nvme0
-sudo mount /dev/snvme1n1 /mnt/nvme1
-sudo mount /dev/snvme2n1 /mnt/nvme2
-sudo mount /dev/snvme3n1 /mnt/nvme3
-```
-
-### 5. 关闭
-
-```bash
-sudo killall tutti_daemon     # 或 kill <pid>
-sudo umount /mnt/nvme0-3
-sudo rmmod snvme snvme-core
-```
-
-详见 [`doc/build_and_test.md`](../../doc/build_and_test.md)。
 
 ## 编译
 
 ```bash
-cmake --preset cuda --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda --target tutti_layerwise_kv_overlap --parallel 8
+cmake --preset cuda-module --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
+cmake --build --preset cuda-module --target tutti_layerwise_kv_overlap --parallel 8
 ```
 
-产物：`build/cuda/bin/tutti_layerwise_kv_overlap`
+产物：`build/cuda-module/bin/tutti_layerwise_kv_overlap`
 
 ## 运行
 
-### 默认模式（striped）
+### striped（4 盘，默认）
+
+`--directory` 顺序须与 YAML 的 `device_ids` 一致：
 
 ```bash
-sudo ./build/cuda/bin/tutti_layerwise_kv_overlap --striped
+sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
+  --directory /mnt/gpu0/ssnvme0 \
+  --directory /mnt/gpu0/ssnvme1 \
+  --directory /mnt/gpu0/ssnvme2 \
+  --directory /mnt/gpu0/ssnvme3
 ```
 
-不传 `--striped` 时同样默认使用 striped 模式和源码内置的 4 盘配置。
-通过可重复的 `--nvme` 参数可以整体覆盖内置设备列表：
+### 单盘
 
 ```bash
-sudo ./build/cuda/bin/tutti_layerwise_kv_overlap --striped \
-  --nvme /dev/ssnvme0,0000:b1:00.0,/dev/snvme0n1,/mnt/nvme0 \
-  --nvme /dev/ssnvme1,0000:e3:00.0,/dev/snvme1n1,/mnt/nvme1
+sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --single \
+  --config examples/layerwise_kv_overlap/tutti_layerwise_local.yaml \
+  --directory /mnt/gpu0/ssnvme0
 ```
-
-每个 `--nvme` 值依次包含 `ssnvme_path,pci_bdf,backing_device,mount_path`。
-第一次出现 `--nvme` 时会清空内置列表，后续参数继续追加设备。striped 模式
-要求最终设备数是不小于 2 的幂，例如 2、4 或 8。
-程序会根据 chunk 和 shard 数量自动提升进程的 `RLIMIT_NOFILE` 软上限；不会修改
-系统全局配置。如果硬上限不足，程序会在创建文件前报告所需的最小值并退出。
-
-### 单盘模式
-
-```bash
-sudo ./build/cuda/bin/tutti_layerwise_kv_overlap --single
-```
-
-single 模式只使用设备列表中的第一项。覆盖设备时，应同时通过 `--data-dir`
-指定该设备文件系统上的数据目录。
 
 ### 可选参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
+| `--directory` | **必填** | daemon 发布的 view 目录，可重复；striped 要求 2 的幂个 |
+| `--config` | `tutti_layerwise_striped.yaml` | Tutti YAML 路径 |
 | `--layers` | 80 | 层数 |
 | `--ctx-tokens` | 131072 | 上下文 token 数 |
 | `--chunk-tokens` | 256 | 每层 chunk 的 token 数 |
 | `--hit-pct` | 90 | prefix hit 百分比 |
-| `--tensor-kb` | 512 | 每 K/V tensor 大小（KiB）；同时作为 stripe unit，参数值必须是 4 的倍数 |
-| `--compute-us` | 0 | 每次 compute 模拟延迟（μs） |
+| `--tensor-kb` | 512 | 每 K/V tensor 大小（KiB）；须与 YAML `stripe_unit` 一致 |
+| `--compute-us` | 0（自动校准） | 每次 compute 模拟延迟 |
 | `--gemm-n` | 1024 | SGEMM 矩阵维度 |
-| `--data-dir` | /mnt/nvme0/GPU0 | 单盘模式数据目录 |
-| `--nvme` | 内置 4 盘配置 | 覆盖 NVMe 设备；格式为 `ssnvme_path,pci_bdf,backing_device,mount_path`，可重复 |
-| `--striped` | 默认启用 | 使用 striped 模式；设备数必须是不小于 2 的幂 |
-| `--single` | | 使用单盘模式 |
-| `--no-verify` | | 跳过逐字节校验 |
+| `--striped` / `--single` | striped 默认 | 多盘 / 单盘 |
+| `--no-verify` | — | 跳过逐字节校验 |
 
-## 预期输出
+程序会按需自动提升进程 `RLIMIT_NOFILE` 软上限，不修改系统全局配置。
 
-以下以双盘 `--nvme` 覆盖命令为例：
+## 预期输出（4 盘 striped 实测）
 
 ```
-[ OK ] cudaSetDevice(0)
-[ OK ] StorageRuntime created (StripedDataPath, N=2)
-[ OK ] Phase A (striped): 512 targets x 2 shards (X.X GB) in X.XXs
+[ OK ] cudaSetDevice(0) via TuttiRuntime (examples/layerwise_kv_overlap/tutti_layerwise_striped.yaml)
+[ OK ] StorageRuntime created (StripedDataPath, N=4)
+[ OK ] Phase A (striped): 512 targets x 4 shards (40.0 GB) in X.XXs
 [ OK ] Phase B: 460 hit + 52 miss chunks, 1024 tensors registered
 [ OK ] Phase C: opened 512 targets (striped)
-[INFO] Layer  0: read   X.XX ms (XXXX MB/s)  write  X.XX ms (XXXX MB/s)
-[INFO] Layer  1: read   X.XX ms (XXXX MB/s)  write  X.XX ms (XXXX MB/s)
+[ OK ] Phase E: pre-wrote 460 chunks x 80 layers (35.94 GB) in X.XXs
+[INFO] rq1 L9   read 482.3MB/21.2ms=22.8GB/s write 54.5MB/38.4ms=1.4GB/s
 ...
-[INFO] Phase G: READ  XX.XX ms total, XXXX.X GB/s avg
-[INFO] Phase G: WRITE XX.XX ms total, XXXX.X GB/s avg
-[ OK ] Phase H: 26/26 tensors verified
+[ OK ] SIM TOTAL: 2 req wall=9.4s | READ 77.18GB=23.0GB/s | WRITE 8.72GB=1.4GB/s | overlap 40%
+[ OK ] Phase H: verified 26 samples, all correct
+
+=== layerwise_kv_overlap: PASSED ===
 ```
 
-**参考带宽**：4-disk striped 模式 ~25 GB/s（READ）。
+**参考带宽**（8×H20 + 4×PM9A1 实测）：striped 读 ~23 GB/s（文档口径 ~25 GB/s）、
+单盘读 ~6.4 GB/s。
+
+## 调整设备/队列
+
+改 YAML 即可，不用重编译（`--config` 指向改后的文件）。关键约束：
+
+- `device_ids`：daemon YAML `nvmes[].device_id`；striped 个数须为 2 的幂
+- `queues_per_controller` ≤ daemon `queue_pool.max_per_client`
+- `threads_per_block` ≤ 实际获批的队列数（否则启动即报错拒绝）
+- `stripe_unit` = 工作负载 tensor 大小（`--tensor-kb` × 1024）
 
 ## 作为 ctest 运行
 
@@ -159,14 +125,3 @@ ctest -R tutti_layerwise_kv_overlap
 ```
 
 Labels: `hardware;local_nvme;layerwise_overlap`
-
-## 公共 API
-
-此示例只使用公共 API：
-- `<tutti/storage_runtime.h>` — StorageRuntime
-- `<tutti/io_types.h>` — IoRequest, IoDirection 等
-- `<tutti/memory_types.h>` — MemoryView, MemoryHandle 等
-- `<tutti/presets/local_nvme.h>` — preset 工厂函数（make_local_nvme_runtime / make_striped_nvme_runtime）
-- `<tutti/cuda_like.h>` — CUDA 运行时抽象
-
-不引用任何私有 DataPath 或 resolver 头文件。

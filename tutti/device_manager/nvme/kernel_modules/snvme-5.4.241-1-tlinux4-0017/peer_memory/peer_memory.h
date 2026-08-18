@@ -29,6 +29,23 @@
 #define SNVME_PEER_MEMORY_H
 
 #include <linux/types.h>
+#include <linux/compiler.h>
+
+/*
+ * 跨厂商统一接口里，部分参数只被某些后端使用：例如 dma_map_pages 的第 4 个
+ * 参数 expect_page_size 是 metax 后端用于按页大小拆分 DMA 地址的，而 NVIDIA
+ * 的 nvidia_p2p_dma_map_pages 只有 3 个参数、用不到它。为保持 vendor-neutral
+ * 的 peer_memory_ops 签名统一，不使用该参数的后端用本宏标记参数名——既满足老
+ * 内核（gnu89）要求函数定义参数必须有名字，又抑制 -Wunused-parameter 告警。
+ *
+ * Some fields of the vendor-neutral ops table are only consumed by certain
+ * backends: e.g. dma_map_pages' 4th arg expect_page_size is used by metax to
+ * split DMA addresses per page, while NVIDIA's nvidia_p2p_dma_map_pages takes
+ * only 3 args. Backends that don't use an arg tag it with this macro, which
+ * both satisfies gnu89 (function-definition params must be named) and
+ * suppresses -Wunused-parameter.
+ */
+#define SNVME_P2P_UNUSED __maybe_unused
 
 struct pci_dev;
 

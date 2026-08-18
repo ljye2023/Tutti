@@ -1,0 +1,100 @@
+# ============================================================================
+# layerwise_kv_overlap —— 4 盘 striped 配置（默认配置）
+#
+# 运行时由 TuttiRuntime 从本文件组装；设备、队列、挂载等部署事实全部来自
+# daemon，应用侧不感知 PCI BDF / chrdev / 挂载点。
+# 运行示例：
+#   sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
+#     --directory /mnt/gpu0/ssnvme0 --directory /mnt/gpu0/ssnvme1 \
+#     --directory /mnt/gpu0/ssnvme2 --directory /mnt/gpu0/ssnvme3
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# accelerator —— 加速器后端
+#   profile: 编译期后端 profile，须与二进制一致（CUDA / HOST / MUSA / MACA）
+# ---------------------------------------------------------------------------
+accelerator:
+  profile: CUDA
+
+# ---------------------------------------------------------------------------
+# runtime —— 本 Runtime 绑定的加速器
+#   accel_id: CUDA device index（cudaSetDevice 用的编号，同 nvidia-smi -L 序号）
+#             必须在 daemon YAML 的 allowed_accel_ids 允许范围内
+# ---------------------------------------------------------------------------
+runtime:
+  accel_id: 0
+
+storage:
+  # -------------------------------------------------------------------------
+  # resources —— 存储资源：向 daemon（tutti_daemon）申请 NVMe 设备与队列
+  # -------------------------------------------------------------------------
+  resources:
+    - id: layerwise-striped-nvme      # 本资源的应用侧名字（backends 引用它）
+      type: nvme
+      provider:
+        type: nvme-service            # 资源来源：tutti_daemon 的 gRPC 服务
+        endpoint: "127.0.0.1:50051"   # daemon 监听地址（daemon YAML 的 grpc.endpoint）
+      allocation:
+        # selection: 申请方式
+        #   explicit —— device_ids 逐台作为独立 local 设备使用
+        #   striped  —— device_ids 组成一组 striped 条带
+        selection: striped
+        # device_ids: daemon YAML（nvmes[].device_id）里的设备号，
+        #   不是 /dev 名；顺序即条带顺序，须与 --directory 传入顺序一致
+        device_ids: [0, 1, 2, 3]
+        # queues_per_controller: 每块盘申请的用户队列数，单位：队列对（QP）
+        #   上限：daemon queue_pool.max_per_client（超了会被钳制或拒绝）
+        #   约束：datapaths 的 threads_per_block 不得超过实际获批的队列数
+        queues_per_controller: 32
+
+  # -------------------------------------------------------------------------
+  # resolvers —— URI 解析器（file:// 或 striped:// 由谁解析）
+  # -------------------------------------------------------------------------
+  resolvers:
+    - id: layerwise-striped-file-resolver
+      type: striped-file             # 解析 striped:// URI
+      scheme: striped
+      config: {}
+
+  # -------------------------------------------------------------------------
+  # datapaths —— IO 数据路径的调优参数
+  # -------------------------------------------------------------------------
+  datapaths:
+    - id: layerwise-striped-local-nvme-datapath
+      type: striped-local-nvme       # 多盘条带数据路径（单盘用 local-nvme）
+      config:
+        # 以下缓存容量单位均为「槽位」（entries），非字节：
+        #   1 槽 = 1 个可缓存的条目
+        handle_cache_capacity: 4096  # L1 GPU 常驻句柄缓存，槽位（每槽 1 个
+                                     #   打开文件句柄，约 200B 显存/槽）；0=关闭
+        prp_cache_capacity: 4096     # L1 PRP 描述符缓存，槽位（内容寻址）；
+                                     #   0=每次 IO 重建
+        handle_cache_l2_capacity: 0  # L2 主机 pinned 句柄缓存，槽位；0=自动取 4×L1
+        threads_per_block: 32        # 每次提交的 GPU 线程数（个）；≤ 获批队列数
+        # —— 批次的两层结构 ——
+        # 一次 submit() = 1 个「操作」(op) = 1 次 fused kernel 发射，批内请求并行下发：
+        #   max_batch_entries        单批内并行下发的 IO 条目数 —— 「一堆请求」
+        #                           指这里；吞吐主要靠它吃满（本负载单批 920 条）
+        #   max_in_flight_operations 同时处于在途状态的 submit() 批次数 —— 限制
+        #                           的是并发批次数，不是批内请求数
+        # 理论最大在途 IO 条目 = max_in_flight_operations × max_batch_entries。
+        # 本负载每 stream 提交一批后立即 wait 收尾，read+write 双 stream 并发
+        # ≤ 2 批，4 已是双倍余量（arena 槽 = 2×4）。
+        max_in_flight_operations: 4  # 并发 submit() 批次数（个批次）
+        max_batch_entries: 8192      # 单批 IO 条目数（个条目）
+        io_granularity: 0            # 字节；0=动态 PRP，>0 时按该粒度预建
+
+  # -------------------------------------------------------------------------
+  # backends —— 组装绑定：resolver + datapath + resource 三者接到一起
+  #   contract: 契约名，striped 固定为 striped-local-nvme（单盘为 ext4-local-nvme）
+  #   config.stripe_unit: 条带单元（字节）。本工作负载应等于 K/V tensor 大小
+  #     （默认 --tensor-kb 512 = 524288），使一个 tensor 完整落在单块盘上
+  # -------------------------------------------------------------------------
+  backends:
+    - id: layerwise-striped-storage
+      contract: striped-local-nvme
+      resolver: layerwise-striped-file-resolver
+      datapath: layerwise-striped-local-nvme-datapath
+      resource: layerwise-striped-nvme
+      config:
+        stripe_unit: 524288          # 512 KiB，须为 4 KiB 的倍数

@@ -69,9 +69,12 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 ## Running the KV Cache Example
 
 ```bash
-cmake --preset cuda --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda --target tutti_layerwise_kv_overlap --parallel 8
-sudo ./build/cuda/bin/tutti_layerwise_kv_overlap     # 4-disk striped (default); --single for one drive
+cmake --preset cuda-module --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
+cmake --build --preset cuda-module \
+  --target tutti_layerwise_kv_overlap modules tutti_daemon --parallel 8
+sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
+  --directory /mnt/gpu0/ssnvme0 --directory /mnt/gpu0/ssnvme1 \
+  --directory /mnt/gpu0/ssnvme2 --directory /mnt/gpu0/ssnvme3
 ```
 
 `layerwise_kv_overlap` is Tutti's standard KV-cache reference workload
@@ -105,6 +108,7 @@ standalone project entries. Runtime is daemon-only.
 
 ## Deep Dive
 
+- [Getting Started](doc/getting-started.md) — bilingual (中英对照) onboarding: hardware, deps, build, run the example, profile with nsys
 - [System Architecture](doc/architecture/system-architecture.md) — the as-implemented layers, IO walkthrough, and deployment topology
 - [Key Designs](doc/architecture/key-designs.md) — the five performance designs behind the GPU-centric data path, with measured numbers
 - [Backend SPI](doc/design/backend-spi.md) — the DataPath / Resolver / Binding semantic contracts

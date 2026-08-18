@@ -111,6 +111,7 @@ target_link_libraries(nvmeservice
         libnvm
         Threads::Threads
         ${TUTTI_YAML_CPP_TARGET}
+        ${TUTTI_FILESYSTEM_LIBS}
 )
 
 # =============================================================================

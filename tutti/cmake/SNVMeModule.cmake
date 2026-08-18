@@ -102,7 +102,13 @@ endif()
 if(TUTTI_P2P_BACKEND STREQUAL "nvidia")
     set(_snvme_backend_header "nv-p2p.h")
     file(GLOB_RECURSE _snvme_vendor_headers "/usr/src/nvidia-*/nv-p2p.h")
-    set(_snvme_vendor_hints "${NVIDIA}")
+    # Vendored MIT-licensed nv-p2p.h (third_pkgs/nvidia/) is searched first so
+    # the build is reproducible on hosts without a system NVIDIA driver source
+    # tree (e.g. rpm-installed Open Kernel Module); /usr/src/nvidia-* and the
+    # legacy NVIDIA hint remain as fallbacks.
+    set(_snvme_vendor_hints
+        "${TUTTI_REPOSITORY_ROOT}/third_pkgs/nvidia"
+        "${NVIDIA}")
     foreach(_vendor_header IN LISTS _snvme_vendor_headers)
         get_filename_component(_vendor_hint "${_vendor_header}" DIRECTORY)
         list(APPEND _snvme_vendor_hints "${_vendor_hint}")

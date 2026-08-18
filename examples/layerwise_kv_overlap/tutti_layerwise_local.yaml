@@ -1,0 +1,57 @@
+# ============================================================================
+# layerwise_kv_overlap —— 单盘配置
+#
+# 运行示例：
+#   sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --single \
+#     --config examples/layerwise_kv_overlap/tutti_layerwise_local.yaml \
+#     --directory /mnt/gpu0/ssnvme0
+# 字段解释见 tutti_layerwise_striped.yaml（两边结构一致，仅单盘差异处注明）
+# ============================================================================
+
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: layerwise-local-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit           # 单盘：逐台独立使用（非条带）
+        device_ids: [0]
+        queues_per_controller: 16     # 每盘申请的用户队列数，单位：队列对（QP）；
+                                      #   threads_per_block 须 ≤ 16
+
+  resolvers:
+    - id: layerwise-file-resolver
+      type: local-file                # 单盘解析 file:// URI
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: layerwise-local-nvme-datapath
+      type: local-nvme                # 单盘数据路径（非条带）
+      config:
+        # 容量单位见 tutti_layerwise_striped.yaml 注释（槽位，非字节）
+        handle_cache_capacity: 4096   # L1 GPU 常驻句柄缓存，槽位；0=关闭
+        prp_cache_capacity: 4096      # L1 PRP 描述符缓存，槽位；0=每次 IO 重建
+        handle_cache_l2_capacity: 0   # L2 主机 pinned 句柄缓存，槽位；0=自动 4×L1
+        threads_per_block: 16         # GPU 线程数（个）；≤ 获批队列数
+        # 批次两层结构（max_batch_entries=单批 IO 条目数「一堆请求」；
+        # max_in_flight_operations=并发 submit() 批次数）详见 striped YAML 注释
+        max_in_flight_operations: 4   # 并发 submit() 批次数（个批次）
+        max_batch_entries: 4096       # 单批 IO 条目数（个条目）
+        io_granularity: 0             # 字节；0=动态 PRP
+
+  backends:
+    - id: layerwise-storage
+      contract: ext4-local-nvme       # 单盘契约名固定为 ext4-local-nvme
+      resolver: layerwise-file-resolver
+      datapath: layerwise-local-nvme-datapath
+      resource: layerwise-local-nvme
+      config: {}
