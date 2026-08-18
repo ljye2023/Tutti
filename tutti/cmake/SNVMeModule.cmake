@@ -36,6 +36,21 @@ set(SNVME_KERNEL_VERSION "" CACHE STRING
 
 set(_snvme_root_dir
     "${TUTTI_SOURCE_DIR}/device_manager/nvme/kernel_modules")
+
+# Preferred: the unified snvme/ tree — ONE copy of the snvme-private code
+# plus per-kernel-lineage upstream files under baseline/<tag>/; the kbuild
+# Makefile picks the baseline from the running kernel (see
+# kernel_modules/PORTING.md).  The legacy snvme-* versioned trees are
+# DEPRECATED (each carries a DEPRECATED marker) and will be removed once
+# the matching unified baselines pass verification.
+set(_snvme_unified_dir "${_snvme_root_dir}/snvme")
+if(EXISTS "${_snvme_unified_dir}/Makefile.in")
+    set(module_root "${_snvme_unified_dir}")
+    if(NOT SNVME_KERNEL_VERSION)
+        set(SNVME_KERNEL_VERSION "unified")
+    endif()
+    set(_snvme_tags "unified(5.4-tlinux4|5.15|6.8, auto-selected by Makefile.in)")
+else()
 file(GLOB _snvme_candidates RELATIVE "${_snvme_root_dir}"
     "${_snvme_root_dir}/snvme-*")
 set(_snvme_tags "")
@@ -90,6 +105,7 @@ if(NOT EXISTS "${module_root}/Makefile.in")
         "snvme baseline '${SNVME_KERNEL_VERSION}' is unavailable. "
         "Available baselines: ${_snvme_tags}")
 endif()
+endif() # unified tree vs legacy versioned trees
 
 set(_snvme_backend_source
     "${module_root}/peer_memory/${TUTTI_P2P_BACKEND}.c")
