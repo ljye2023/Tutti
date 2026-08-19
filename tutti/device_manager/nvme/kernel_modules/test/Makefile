@@ -34,7 +34,7 @@
 #   sudo ./snvme_smoke_io 0000:50:00.0             # B3 + IO round-trip (destructive: writes LBA)
 #
 # Override knobs:
-#   CC, CFLAGS, NVCC, NVCCFLAGS, CUDA_ARCH
+#   CC, CFLAGS, NVCC, NVCCFLAGS, CUDA_ARCH, TUTTI_ACCELERATOR
 #
 # GPU arch selection (CUDA_ARCH):
 #   - default: auto-detect via `nvidia-smi --query-gpu=compute_cap`
@@ -81,8 +81,17 @@ else
 CUDA_ARCH  ?= sm_80
 endif
 
+# Accelerator macro for the GPU test.  Defaults to CUDA; set ACCEL=maca
+# to compile with TUTTI_USE_MACA instead (see snvme_smoke_gpu.cu).
+TUTTI_ACCELERATOR        ?= cuda
+ifeq ($(TUTTI_ACCELERATOR), metax)
+TUTTI_ACCEL_DEF := -DTUTTI_USE_MACA=1
+else
+TUTTI_ACCEL_DEF := -DTUTTI_USE_CUDA=1
+endif
+
 NVCCFLAGS  ?= -O2 -std=c++17 -arch=$(CUDA_ARCH) \
-              -DTUTTI_USE_CUDA=1 -I$(UAPI_INC) -I$(TUTTI_INC) \
+              $(TUTTI_ACCEL_DEF) -I$(UAPI_INC) -I$(TUTTI_INC) \
               -Xcompiler=-Wall,-Wextra,-Wno-unused-parameter
 
 SRC         := snvme_smoke.c

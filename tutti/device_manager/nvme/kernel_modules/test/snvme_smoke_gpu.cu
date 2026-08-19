@@ -313,6 +313,9 @@ __global__ void k_poll_one(test_queue_dev qd,
     uint64_t i = 0;
     for (;;) {
         volatile nvme_cqe* slot = &qd.cq[head];
+#ifdef TUTTI_USE_MACA
+        __threadfence_system();
+#endif
         uint16_t status = slot->status;
         uint8_t phase = status & 0x1u;
         if (phase == expected) {

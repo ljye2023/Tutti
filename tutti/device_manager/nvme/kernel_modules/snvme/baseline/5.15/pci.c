@@ -49,6 +49,12 @@
 
 MODULE_IMPORT_NS(NVME_TARGET_PASSTHRU);
 
+#define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
+#define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
+
+#define SGES_PER_PAGE	(NVME_CTRL_PAGE_SIZE / sizeof(struct nvme_sgl_desc))
+
+/*
  * These can be higher, but we need to ensure that any command doesn't
  * require an sg allocation that needs more than a page of data.
  */
@@ -1307,7 +1313,7 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 }
 
 // pay attention on it
-static void nvme_free_queue(struct nvme_queue *nvmeq) 
+static void nvme_free_queue(struct nvme_queue *nvmeq)
 {
 	dma_free_coherent(nvmeq->dev->dev, CQ_SIZE(nvmeq),
 				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
@@ -2505,10 +2511,10 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 
 	dev->q_depth = min_t(u32, NVME_CAP_MQES(dev->ctrl.cap) + 1,
 				io_queue_depth);
-	
+
 	dev->ctrl.sqsize = dev->q_depth - 1; /* 0's based queue depth */
 	dev->db_stride = 1 << NVME_CAP_STRIDE(dev->ctrl.cap);
-	
+
 	dev->dbs = dev->bar + 4096;
 	pr_info("nvme_pci_enable is dev->q_depth %u\n",dev->q_depth);
 	/*
