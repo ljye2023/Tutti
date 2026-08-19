@@ -97,6 +97,8 @@
 #define cudaDeviceGetStreamPriorityRange mcDeviceGetStreamPriorityRange
 #define cudaStreamCreateWithPriority mcStreamCreateWithPriority
 #define cudaStreamDefault mcStreamDefault
+#define cudaDeviceProp _mcDeviceProp_t
+#define cudaGetDeviceProperties mcGetDeviceProperties
 // ---------------------------------------------------------------------------
 // Templated wrappers that MACA's cu-bridge provides as functions (not macros)
 // ---------------------------------------------------------------------------
