@@ -419,10 +419,14 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     arena_cfg.page_size = static_cast<std::uint32_t>(page_size);
     arena_cfg.cuda_device = cuda_device_;
     // Round 16 S4: device table supports M targets × N shards.
-    // Default capacity = 2048 entries (enough for 512 targets × 4 shards).
+    // Capacity must cover the LARGEST legal batch: up to max_batch_entries
+    // distinct targets, each contributing N shard pointers (e.g. a 921-
+    // target read batch on 4 devices needs 3684 slots > the old 2048
+    // hard-coded cap, which rejected whole 256K-context layers).
     arena_cfg.dev_table_capacity_per_slot =
         std::max(static_cast<std::uint32_t>(2048),
-                 static_cast<std::uint32_t>(devices_.size()));
+                 max_batch_entries_ *
+                     static_cast<std::uint32_t>(devices_.size()));
     if (!arena_.init(arena_cfg, ctrls)) {
         rollback_devices();
         return Status(StatusCode::NOT_READY, "StripedArena init failed");
@@ -441,42 +445,6 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
                 return Status(StatusCode::NOT_READY, "PrpPageCache init failed");
             }
         }
-    }
-
-    // Pinned staging ring for PRP-list page H2D fills (see header).
-    {
-        prp_stage_page_size_ = page_size;
-        cudaError_t ce = cudaHostAlloc(
-            &prp_stage_host_,
-            static_cast<std::size_t>(kPrpStageSlots) * page_size,
-            cudaHostAllocDefault);
-        if (ce != cudaSuccess || prp_stage_host_ == nullptr) {
-            arena_.shutdown();
-            rollback_devices();
-            return Status(StatusCode::DEVICE_ERROR,
-                          std::string("PRP staging ring cudaHostAlloc failed: ") +
-                              cudaGetErrorString(ce));
-        }
-        prp_stage_events_.resize(kPrpStageSlots, nullptr);
-        for (std::uint32_t i = 0; i < kPrpStageSlots; ++i) {
-            cudaEvent_t ev = nullptr;
-            ce = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-            if (ce != cudaSuccess) {
-                for (auto& e : prp_stage_events_) {
-                    if (e) { cudaEventDestroy(static_cast<cudaEvent_t>(e)); e = nullptr; }
-                }
-                cudaFreeHost(prp_stage_host_);
-                prp_stage_host_ = nullptr;
-                arena_.shutdown();
-                rollback_devices();
-                return Status(StatusCode::DEVICE_ERROR,
-                              std::string("PRP staging event create failed: ") +
-                                  cudaGetErrorString(ce));
-            }
-            prp_stage_events_[i] = ev;
-        }
-        prp_stage_pos_ = 0;
-        prp_stage_total_ = 0;
     }
 
     initialized_ = true;
@@ -554,20 +522,6 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
         }
     }
     devices_.clear();
-
-    // Free the pinned PRP staging ring (all ops drained above, so no copy
-    // can still reference it).
-    for (auto& e : prp_stage_events_) {
-        if (e) { cudaEventDestroy(static_cast<cudaEvent_t>(e)); e = nullptr; }
-    }
-    prp_stage_events_.clear();
-    if (prp_stage_host_) {
-        cudaFreeHost(prp_stage_host_);
-        prp_stage_host_ = nullptr;
-    }
-    prp_stage_pos_ = 0;
-    prp_stage_total_ = 0;
-    prp_stage_page_size_ = 0;
 
     initialized_ = false;
     return Status::Ok();
@@ -979,57 +933,6 @@ void StripedDataPath::destroy_striped_prebuilt_(StripedMemory& mem) {
     mem.prebuilt.valid = false;
 }
 
-// Stage one PRP-list page through the pinned ring.
-//
-// The copy is stream-ordered before the fused kernel launch (both are
-// enqueued on ctx.stream), so the page content is resident before the NVMe
-// device dereferences prp2.  Slot reuse (2nd+ revolution, possibly on a
-// different stream) is fenced by the slot's event: syncing it guarantees
-// the previous copy from that slot executed before we overwrite it.
-bool StripedDataPath::stage_prp_page_(const nvm_dma_t* dma,
-                                      std::uint32_t start_page,
-                                      std::uint32_t pages_in_io,
-                                      void* devptr,
-                                      void* stream_opaque) {
-    cudaStream_t stream = static_cast<cudaStream_t>(stream_opaque);
-    if (prp_stage_host_ == nullptr || prp_stage_events_.empty()) {
-        return false;
-    }
-    if (prp_stage_pos_ >= kPrpStageSlots) {
-        prp_stage_pos_ = 0;
-    }
-    const std::uint32_t slot = prp_stage_pos_;
-    if (prp_stage_total_ >= kPrpStageSlots) {
-        // Second+ revolution: the slot's previous H2D must have executed
-        // before its content can be overwritten.
-        cudaError_t se = cudaEventSynchronize(
-            static_cast<cudaEvent_t>(prp_stage_events_[slot]));
-        if (se != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-    }
-    void* host_page = static_cast<char*>(prp_stage_host_) +
-                      static_cast<std::size_t>(slot) * prp_stage_page_size_;
-    fill_prp_list_page(static_cast<std::uint64_t*>(host_page), dma,
-                       start_page, pages_in_io,
-                       static_cast<std::size_t>(prp_stage_page_size_));
-    cudaError_t ce = cudaMemcpyAsync(devptr, host_page,
-                                     static_cast<std::size_t>(prp_stage_page_size_),
-                                     cudaMemcpyHostToDevice, stream);
-    if (ce != cudaSuccess) {
-        return false;
-    }
-    ce = cudaEventRecord(static_cast<cudaEvent_t>(prp_stage_events_[slot]),
-                         stream);
-    if (ce != cudaSuccess) {
-        return false;
-    }
-    prp_stage_pos_ = slot + 1;
-    ++prp_stage_total_;
-    return true;
-}
-
 // =========================================================================
 // submit — stripe split -> 1 H2D (entries + dev_table) -> 1 launch -> 1 event
 // =========================================================================
@@ -1408,14 +1311,14 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     cudaError_t ce;
 
     // Fill PRP-list pages.
-    // Round 16 S5: if PrpPageCache enabled, use cache (no H2D on hit).
-    // Otherwise: arena pool + H2D fill (original path).
-    // All fills stage through the persistent pinned ring (stage_prp_page_)
-    // instead of a per-submit pageable buffer: pageable cudaMemcpyAsync
-    // sources block the host ~150us per page, which used to make a cold
-    // 64-page write batch cost ~9.4ms before the kernel even launched.
+    // Round 16 S5: if PrpPageCache enabled, use cache (host-pinned pool —
+    // the cache produces the page content itself from the data DMA table;
+    // miss = plain host memcpy, no H2D, no staging).
+    // Otherwise: arena pool + H2D fill (original path; only taken when the
+    // cache is disabled or exhausted).
     if (!list_infos.empty()) {
         const bool use_cache = !prp_caches_.empty();
+        std::vector<std::uint64_t> h_page(page_size / sizeof(std::uint64_t), 0);
         std::uint32_t list_idx = 0;
         for (const auto& li : list_infos) {
             if (use_cache && li.dev_idx < prp_caches_.size() &&
@@ -1425,12 +1328,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                 pk.memory_token = li.memory_token;
                 pk.start_page = li.start_page;
                 pk.pages_in_io = li.pages_in_io;
-                auto* pe = prp_caches_[li.dev_idx]->get_or_build(pk,
-                    [&](void* devptr) -> bool {
-                        return stage_prp_page_(li.dma, li.start_page,
-                                               li.pages_in_io, devptr,
-                                               ctx.stream);
-                    });
+                auto* pe = prp_caches_[li.dev_idx]->get_or_build(pk, li.dma);
                 if (pe) {
                     h_dynamic_descs[li.desc_idx].prp2 = pe->ioaddr;
                     continue;  // skip arena pool path
@@ -1438,10 +1336,12 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                 // fallthrough to arena pool on cache miss/failure
             }
             // Arena pool path (original)
-            if (!stage_prp_page_(li.dma, li.start_page, li.pages_in_io,
-                                 static_cast<char*>(prp_pages) +
-                                     (std::size_t)list_idx * page_size,
-                                 ctx.stream)) {
+            fill_prp_list_page(h_page.data(), li.dma,
+                               li.start_page, li.pages_in_io, page_size);
+            ce = cudaMemcpyAsync(
+                static_cast<char*>(prp_pages) + list_idx * page_size,
+                h_page.data(), page_size, cudaMemcpyHostToDevice, ctx.stream);
+            if (ce != cudaSuccess) {
                 arena_.release(lease.slot_index);
                 reject_all(StatusCode::DEVICE_ERROR, "H2D PRP page failed");
                 return outcome;

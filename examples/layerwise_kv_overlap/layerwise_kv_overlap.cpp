@@ -151,9 +151,13 @@ static WindowedIoResult windowed_submit_wait(
             if (rounds > 10000) STEP_FAIL("%s: too many rounds (stuck)", tag);
         }
 
-        float io_ms = 0.f;
-        CUDA_OK(cudaEventElapsedTime(&io_ms, ev_io0, ev_io1));
-        total_io_ms += io_ms;
+        if (o.io.has_value()) {
+            // wait() above synced the op event, which is ordered after
+            // ev_io1 on this stream — ev_io1 is complete here.
+            float io_ms = 0.f;
+            CUDA_OK(cudaEventElapsedTime(&io_ms, ev_io0, ev_io1));
+            total_io_ms += io_ms;
+        }
         total_ms += sec_since(t0) * 1e3;
         ++rounds;
     }

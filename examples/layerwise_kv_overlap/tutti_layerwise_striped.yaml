@@ -67,9 +67,19 @@ storage:
         #   1 槽 = 1 个可缓存的条目
         handle_cache_capacity: 4096  # L1 GPU 常驻句柄缓存，槽位（每槽 1 个
                                      #   打开文件句柄，约 200B 显存/槽）；0=关闭
-        prp_cache_capacity: 4096     # L1 PRP 描述符缓存，槽位（内容寻址）；
-                                     #   0=每次 IO 重建
-        handle_cache_l2_capacity: 0  # L2 主机 pinned 句柄缓存，槽位；0=自动取 4×L1
+                                     #   注意：striped 路径当前未接 handle
+                                     #   缓存，本项与 handle_cache_l2_capacity
+                                     #   暂不生效（预留）
+        prp_cache_capacity: 262144   # PRP 页缓存，槽位（内容寻址）。
+                                     #   【host DRAM 池，不占 GPU 显存】
+                                     #   cudaHostAlloc + nvm_dma_map_data_host，
+                                     #   262144 槽 = 1 GiB/盘 host 内存；
+                                     #   miss 为纯 host memcpy（~1us），
+                                     #   无 H2D/事件开销。必须覆盖部署工作集
+                                     #   的全部 LIST 键（本负载 1024 tensor
+                                     #   x 1 键/盘）；0=关闭（走 arena 兜底）
+        handle_cache_l2_capacity: 0  # L2 host-pinned 句柄缓存，槽位；
+                                     #   0=自动取 4×L1。（striped 暂未生效，见上）
         threads_per_block: 32        # 每次提交的 GPU 线程数（个）；≤ 获批队列数
         # —— 批次的两层结构 ——
         # 一次 submit() = 1 个「操作」(op) = 1 次 fused kernel 发射，批内请求并行下发：

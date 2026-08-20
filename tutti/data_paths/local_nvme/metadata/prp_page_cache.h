@@ -3,27 +3,28 @@
 // tutti/data_paths/local_nvme/metadata/prp_page_cache.h
 //
 // Single-tier content-addressed LRU cache for PRP-list pages.
-// Replaces the legacy two-tier PrpPageCache (memory/include/prp_page_cache.h,
-// 426 lines) for the LocalNvmeDataPath's LIST sub-IO path.
 //
-// Design rationale (full evaluation in chat/round11/result2.md):
-//   The legacy PrpPageCache provides two tiers (L2 host-pinned content / L1
-//   GPU-DMA-mapped), a scatter-kernel prp2 patch mechanism, and event-fenced
-//   slot reuse.  For the current DataPath this is over-engineered:
-//     - The prp2 patch problem (IOVA changes on tier move) doesn't exist
-//       when each cache slot has a fixed IOVA from a pre-allocated pool.
-//     - Event-fenced slot reuse assumes multi-stream concurrent access — the
-//       DataPath is single-threaded for submit/progress/release.
-//     - The L2 host tier only saves the content rebuild (cheap CPU work);
-//       the real cost is the H2D copy, which the L1 tier already avoids.
-//   A simple single-tier (GPU, own DMA-mapped pool) content-addressed LRU
-//   with pin/unpin is sufficient.
+// Design (2026-08-20 rework, replaces the GPU-resident pool):
+//   The pool is host-pinned memory (cudaHostAlloc), DMA-mapped with
+//   nvm_dma_map_data_host once at init().  This makes the miss path a plain
+//   host memcpy — no cudaMemcpy, no stream, no event fencing:
+//     - fill_prp_list_page() writes the page content directly into the pool
+//       slot (~1us), versus ~150us per page for a pageable-source
+//       cudaMemcpyAsync (the measured 9.4ms cold-write stall).
+//     - The NVMe controller DMAs the PRP list from host DRAM per command —
+//       one PCIe fetch either way, equivalent to fetching from GPU memory.
+//     - Host RAM is the right tier for page tables at GB-scale working
+//       sets; HBM is left for payload data.
+//   Sizing requirement: the pool MUST hold the whole deployment working set
+//   (all LIST keys of all registered memories).  Exhaustion falls back to
+//   the arena path (correct, slower) — size prp_cache_capacity accordingly
+//   (~1-2 GB per device for KV-cache-scale deployments).
 //
 // DMA lifecycle:
-//   The cache owns one contiguous GPU allocation (cudaMalloc) and one shared
-//   DMA mapping (nvm_dma_map_data_device) covering all capacity pages.
+//   The cache owns one contiguous host-pinned allocation and one shared
+//   DMA mapping (nvm_dma_map_data_host) covering all capacity pages.
 //   - Born together: init() allocates both.
-//   - Die together: shutdown() unmaps DMA first, then frees GPU memory.
+//   - Die together: shutdown() unmaps DMA first, then frees host memory.
 //   - Per-page eviction: marks slot reusable (no unmap/free).  The pin
 //     mechanism ensures no in-flight op references an evicted slot.
 //   - This satisfies "DMA mapping lives/dies with backing page": the shared
@@ -51,7 +52,7 @@ public:
     struct Config {
         std::uint32_t capacity = 0;     // 0 = disabled; number of PRP-list pages
         std::uint32_t page_size = 4096; // NVMe page size
-        std::uint32_t cuda_device = 0;
+        std::uint32_t cuda_device = 0;  // legacy field, unused (host-pinned pool)
     };
 
     struct Stats {
@@ -85,8 +86,8 @@ public:
     // Entry: a cached PRP-list page.
     struct Entry {
         Key key{};
-        void* devptr = nullptr;       // GPU pointer to the page (within pool)
-        std::uint64_t ioaddr = 0;     // DMA IOVA of the page
+        void* vaddr = nullptr;        // host-pinned VA of the page (within pool)
+        std::uint64_t ioaddr = 0;     // DMA IOVA of the page (host-side)
         std::uint32_t pin_count = 0;
         std::uint32_t checkout_refcount = 0;  // P0-1: >0 while checked out by submit
         bool in_use = false;  // deprecated: superseded by checkout_refcount
@@ -98,7 +99,7 @@ public:
     PrpPageCache(const PrpPageCache&) = delete;
     PrpPageCache& operator=(const PrpPageCache&) = delete;
 
-    // Pre-allocate the pool: one cudaMalloc + one nvm_dma_map_data_device.
+    // Pre-allocate the pool: one cudaHostAlloc + one nvm_dma_map_data_host.
     bool init(const Config& cfg, nvm_ctrl_t* ctrl);
     void shutdown();
 
@@ -106,52 +107,15 @@ public:
     std::uint32_t capacity() const { return cfg_.capacity; }
 
     // Get or build a PRP-list page.
-    // On hit: returns cached Entry* (no H2D fill).
-    // On miss: calls fill_fn(devptr) to H2D the content into the cache page.
-    // Returns nullptr on failure.
-    template <typename FillFn>
-    Entry* get_or_build(const Key& key, FillFn&& fill_fn) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        if (!enabled()) return nullptr;
-
-        auto it = index_.find(key);
-        if (it != index_.end()) {
-            std::uint32_t slot = it->second;
-            Entry& hit = entries_[slot];
-            ++hit.checkout_refcount;  // P0-1: re-checkout increments refcount
-            hit.in_use = true;        // backward compat
-            remove_from_lru_(slot);   // checked-out entries are not evictable
-            ++stats_.hits;
-            return &hit;
-        }
-
-        ++stats_.misses;
-
-        std::uint32_t slot = acquire_slot_();
-        if (slot == UINT32_MAX) return nullptr;
-
-        Entry& e = entries_[slot];
-        e.key = key;
-        e.pin_count = 0;
-        e.checkout_refcount = 1;  // P0-1: new entry starts with one checkout
-        e.in_use = true;  // backward compat
-        e.devptr = static_cast<char*>(pool_aligned_) +
-                   static_cast<std::size_t>(slot) * cfg_.page_size;
-        e.ioaddr = pool_dma_->ioaddrs[slot];
-
-        if (!fill_fn(e.devptr)) {
-            // Fill failed: return slot to free list.
-            free_list_.push_back(slot);
-            e = {};
-            return nullptr;
-        }
-
-        index_[key] = slot;
-        // Do NOT add to LRU — entry is in_use (checked out by submit).
-        // unpin() adds it to LRU when the op releases it.
-        ++stats_.entries;
-        return &e;
-    }
+    // On hit: returns cached Entry* (no work).
+    // On miss: fills the page content from data_dma's IOVA table directly
+    // into the pool slot (host memcpy, ~1us) and returns the new entry.
+    // Returns nullptr when disabled, out of slots, or on failure.
+    //
+    // The data path passes only (Key, data_dma); how the page content is
+    // produced is the cache's business — no PRP staging machinery in the
+    // data path layer.
+    Entry* get_or_build(const Key& key, const nvm_dma_t* data_dma);
 
     void pin(Entry* e) {
         if (!e) return;
@@ -222,9 +186,8 @@ private:
     nvm_ctrl_t* ctrl_ = nullptr;
     bool initialized_ = false;
 
-    // Pool: one contiguous GPU allocation, DMA-mapped as a whole.
-    void* pool_raw_ = nullptr;
-    void* pool_aligned_ = nullptr;
+    // Pool: one contiguous host-pinned allocation, DMA-mapped as a whole.
+    void* pool_host_ = nullptr;
     nvm_dma_t* pool_dma_ = nullptr;
 
     std::vector<Entry> entries_;
@@ -250,13 +213,6 @@ private:
         if (stats_.entries > 0) --stats_.entries;
         ++stats_.evictions;
         return victim;
-    }
-
-    void touch_lru_(std::uint32_t slot) {
-        auto it = lru_pos_.find(slot);
-        if (it != lru_pos_.end()) lru_.erase(it->second);
-        lru_.push_front(slot);
-        lru_pos_[slot] = lru_.begin();
     }
 
     void remove_from_lru_(std::uint32_t slot) {

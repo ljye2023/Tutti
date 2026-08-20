@@ -39,8 +39,21 @@ storage:
       config:
         # 容量单位见 tutti_layerwise_striped.yaml 注释（槽位，非字节）
         handle_cache_capacity: 4096   # L1 GPU 常驻句柄缓存，槽位；0=关闭
-        prp_cache_capacity: 4096      # L1 PRP 描述符缓存，槽位；0=每次 IO 重建
-        handle_cache_l2_capacity: 0   # L2 主机 pinned 句柄缓存，槽位；0=自动 4×L1
+        prp_cache_capacity: 262144    # PRP 页缓存，槽位。【host DRAM 池，
+                                      #   不占 GPU 显存】cudaHostAlloc +
+                                      #   nvm_dma_map_data_host，262144 槽 =
+                                      #   1 GiB host 内存；miss 为纯 host
+                                      #   memcpy（~1us），无 H2D/事件开销。
+                                      #   须覆盖部署工作集全部 LIST 键
+                                      #   （本负载 1024 tensor x 1 键）；
+                                      #   0=关闭（走 arena 兜底路径）
+        handle_cache_l2_capacity: 1000000  # L2 host-pinned 句柄缓存，槽位
+                                      #   （不占 GPU 显存）。~4.3 KiB/槽
+                                      #   （句柄镜像 ~184B + 内联 overflow
+                                      #   4 KiB），100 万槽 ≈ 4 GiB host
+                                      #   DRAM，约覆盖 100 万文件句柄；
+                                      #   cudaMallocHost 一次性整块分配；
+                                      #   0=自动取 4×L1
         threads_per_block: 16         # GPU 线程数（个）；≤ 获批队列数
         # 批次两层结构（max_batch_entries=单批 IO 条目数「一堆请求」；
         # max_in_flight_operations=并发 submit() 批次数）详见 striped YAML 注释

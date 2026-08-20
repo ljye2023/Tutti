@@ -1,8 +1,11 @@
 // tutti/data_paths/local_nvme/metadata/prp_page_cache.cpp
 //
-// PrpPageCache init/shutdown implementation (needs CUDA + libnvm).
+// PrpPageCache init/shutdown + get_or_build (host-pinned pool; the miss
+// path is a plain host memcpy — no CUDA, no stream, no events).
 
 #include "tutti/data_paths/local_nvme/metadata/prp_page_cache.h"
+
+#include "tutti/data_paths/local_nvme/io/prp_builder.h"
 
 #include <tutti/cuda_like.h>
 #include <nvm_dma.h>
@@ -21,35 +24,32 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     cfg_ = cfg;
     ctrl_ = ctrl;
 
-    int prev_dev = -1;
-    cudaGetDevice(&prev_dev);
-    cudaSetDevice(cfg_.cuda_device);
+    // Host-pinned pool: cudaHostAlloc + one nvm_dma_map_data_host for the
+    // whole pool.  The NVMe controller DMAs PRP lists from host DRAM;
+    // fills are plain host memcpy.
+    const std::size_t bytes =
+        static_cast<std::size_t>(cfg_.capacity) * cfg_.page_size;
 
-    // Allocate pool: capacity * page_size bytes, 64 KiB-aligned.
-    std::size_t user_bytes = static_cast<std::size_t>(cfg_.capacity) * cfg_.page_size;
-    std::size_t aligned_bytes = (user_bytes + 65535) & ~static_cast<std::size_t>(65535);
-    if (aligned_bytes == 0) aligned_bytes = 65536;
-
-    cudaError_t ce = cudaMalloc(&pool_raw_, aligned_bytes + 65536);
-    if (ce != cudaSuccess) {
-        std::fprintf(stderr, "[prp_cache] init: cudaMalloc failed\n");
-        cudaSetDevice(prev_dev);
+#if defined(TUTTI_USE_HOST)
+    std::fprintf(stderr, "[prp_cache] init: HOST profile has no pinned-host allocator\n");
+    return false;
+#else
+    cudaError_t ce = cudaHostAlloc(&pool_host_, bytes, cudaHostAllocDefault);
+    if (ce != cudaSuccess || pool_host_ == nullptr) {
+        std::fprintf(stderr,
+                     "[prp_cache] init: cudaHostAlloc(%zu bytes) failed: %s\n",
+                     bytes, cudaGetErrorString(ce));
         return false;
     }
+#endif
 
-    std::uintptr_t raw_addr = reinterpret_cast<std::uintptr_t>(pool_raw_);
-    std::uintptr_t aligned_addr = (raw_addr + 65535) & ~static_cast<std::uintptr_t>(65535);
-    pool_aligned_ = reinterpret_cast<void*>(aligned_addr);
-
-    // DMA-map the entire pool.
-    int rc = nvm_dma_map_data_device(&pool_dma_, ctrl_, pool_aligned_,
-                                     aligned_bytes);
+    int rc = nvm_dma_map_data_host(&pool_dma_, ctrl, pool_host_, bytes);
     if (rc != 0 || pool_dma_ == nullptr) {
-        std::fprintf(stderr, "[prp_cache] init: nvm_dma_map_data_device failed: rc=%d\n", rc);
-        cudaFree(pool_raw_);
-        pool_raw_ = nullptr;
-        pool_aligned_ = nullptr;
-        cudaSetDevice(prev_dev);
+        std::fprintf(stderr,
+                     "[prp_cache] init: nvm_dma_map_data_host failed: rc=%d\n",
+                     rc);
+        cudaFreeHost(pool_host_);
+        pool_host_ = nullptr;
         return false;
     }
 
@@ -63,7 +63,6 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     lru_pos_.clear();
     stats_ = {};
 
-    cudaSetDevice(prev_dev);
     initialized_ = true;
     return true;
 }
@@ -72,22 +71,15 @@ void PrpPageCache::shutdown() {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!initialized_) return;
 
-    int prev_dev = -1;
-    cudaGetDevice(&prev_dev);
-    cudaSetDevice(cfg_.cuda_device);
-
-    // DMA unmap FIRST, then free GPU memory (lives/dies together).
+    // DMA unmap FIRST, then free host memory (lives/dies together).
     if (pool_dma_) {
         nvm_dma_unmap(pool_dma_);
         pool_dma_ = nullptr;
     }
-    if (pool_raw_) {
-        cudaFree(pool_raw_);
-        pool_raw_ = nullptr;
+    if (pool_host_) {
+        cudaFreeHost(pool_host_);
+        pool_host_ = nullptr;
     }
-    pool_aligned_ = nullptr;
-
-    cudaSetDevice(prev_dev);
 
     entries_.clear();
     free_list_.clear();
@@ -96,6 +88,48 @@ void PrpPageCache::shutdown() {
     lru_pos_.clear();
     stats_ = {};
     initialized_ = false;
+}
+
+PrpPageCache::Entry* PrpPageCache::get_or_build(const Key& key,
+                                                const nvm_dma_t* data_dma) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!enabled()) return nullptr;
+    if (data_dma == nullptr) return nullptr;
+
+    auto it = index_.find(key);
+    if (it != index_.end()) {
+        std::uint32_t slot = it->second;
+        Entry& hit = entries_[slot];
+        ++hit.checkout_refcount;  // P0-1: re-checkout increments refcount
+        hit.in_use = true;        // backward compat
+        remove_from_lru_(slot);   // checked-out entries are not evictable
+        ++stats_.hits;
+        return &hit;
+    }
+
+    ++stats_.misses;
+
+    std::uint32_t slot = acquire_slot_();
+    if (slot == UINT32_MAX) return nullptr;
+
+    Entry& e = entries_[slot];
+    e.key = key;
+    e.pin_count = 0;
+    e.checkout_refcount = 1;  // P0-1: new entry starts with one checkout
+    e.in_use = true;  // backward compat
+    e.vaddr = static_cast<char*>(pool_host_) +
+              static_cast<std::size_t>(slot) * cfg_.page_size;
+    e.ioaddr = pool_dma_->ioaddrs[slot];
+
+    // Fill: pure host memcpy of the IOVA table into the pool page.
+    fill_prp_list_page(static_cast<std::uint64_t*>(e.vaddr), data_dma,
+                       key.start_page, key.pages_in_io, cfg_.page_size);
+
+    index_[key] = slot;
+    // Do NOT add to LRU — entry is in_use (checked out by submit).
+    // unpin() adds it to LRU when the op releases it.
+    ++stats_.entries;
+    return &e;
 }
 
 } // namespace tutti::data_paths::local_nvme
