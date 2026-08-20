@@ -233,10 +233,10 @@ nvmeservice_daemon --config <path-to-sys_config.yaml>
   module refcount at all.  If `rmmod snvme` says "Module snvme is in
   use" after a SIGKILL'd daemon, do NOT assume it's this; check for a
   mounted `/dev/snvme*n*` block device or an open raw `/dev/snvme<N>`
-  admin chardev first (`scripts/reset_snvme.sh` step 2b does this
-  automatically) -- those are the two refs that actually outlive the
+  admin chardev first (`lsof /dev/snvme*n* /dev/snvme[0-9]*` shows
+  both) -- those are the two refs that actually outlive the
   daemon and that no owner-side ioctl ever releases.
-  See `scripts/reset_snvme.sh`, which sends SIGTERM + waits before
+  When cleaning up a wedged daemon, send SIGTERM and wait before
   ever escalating to SIGKILL.  A `(deleted)` `/proc/<pid>/exe` is a
   harmless rebuild artifact, NOT a sign the daemon is stale -- confirm
   it is actually unresponsive (dead PID, no recent log activity)

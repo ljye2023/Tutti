@@ -34,7 +34,6 @@ daemon 发布的 view 目录：
 
 ```bash
 lsmod | grep snvme                                    # snvme + snvme_core
-cat /sys/module/snvme/parameters/io_queue_depth       # 应为 1024
 build/cuda-module/bin/nvmeservice_client \
   --endpoint 127.0.0.1:50051 --list-only              # 查 view_root 与 chrdev
 # daemon 默认配置发布为 /mnt/gpu<N>/ssnvme<M>
@@ -115,7 +114,8 @@ sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --single \
 
 - `device_ids`：daemon YAML `nvmes[].device_id`；striped 个数须为 2 的幂
 - `queues_per_controller` ≤ daemon `queue_pool.max_per_client`
-- `threads_per_block` ≤ 实际获批的队列数（否则启动即报错拒绝）
+- `threads_per_block` 可大于实际获批的队列数（会打告警并按取模共享队列，
+  并行队列本身支持多线程同队列提交；不会报错）
 - `stripe_unit` = 工作负载 tensor 大小（`--tensor-kb` × 1024）
 
 ## 作为 ctest 运行

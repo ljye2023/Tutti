@@ -249,8 +249,6 @@ static int              max_num_ctrls = 64;
 module_param(max_num_ctrls, int, 0);
 MODULE_PARM_DESC(max_num_ctrls, "Number of controller devices");
 
-static int              curr_ctrls;
-
 /* Resolve a libnvm pci_device_addr (domain/bus/slot/func) to a
  * struct pci_dev* via the PCI core.  Used by SNVM_* ioctls that
  * address an NVMe device by BDF rather than by fd.
@@ -289,37 +287,13 @@ MODULE_PARM_DESC(sgl_threshold,
 		"Use SGLs when average request segment size is larger or equal to "
 		"this size. Use 0 to disable SGLs.");
 
-static int io_queue_depth_set(const char *val, const struct kernel_param *kp);
-static const struct kernel_param_ops io_queue_depth_ops = {
-	.set = io_queue_depth_set,
-	.get = param_get_int,
-};
-
 /*
- * snvme: default io_queue_depth lowered from 1024 to 64.
- *
- * Rationale: user IOQs are created via NVM_ADD_USER_QUEUE, whose
- * adapter_alloc_{sq,cq}_user path currently uses Create I/O SQ/CQ
- * with CDW11.PC=1 (Physically Contiguous) and PRP1 = addrs[0] from
- * the userspace-registered ring map.  Userspace mmap() yields
- * virtually-contiguous but physically-fragmented pages, so the ring
- * MUST fit in a single 4 KiB page:
- *
- *   SQ ring bytes = q_depth * 64 (SQE)   <= 4096  -> q_depth <= 64
- *   CQ ring bytes = q_depth * 16 (CQE)   <= 4096  -> q_depth <= 256
- *
- * 64 is the tighter of the two and is the largest value that lets
- * NVM_ADD_USER_QUEUE work out-of-the-box.  Operators who want
- * deeper rings can pass io_queue_depth=N on insmod, but they must
- * either (a) only use kernel-managed IOQs (legacy path, which uses
- * dma_alloc_coherent and is unaffected) or (b) wait for the
- * planned PC=0 + PRP-List extension to land in adapter_alloc_sq_user.
+ * snvme: no io_queue_depth module parameter.  The queue depth always
+ * takes the controller's maximum: NVMe CAP.MQES + 1.  User IOQs created
+ * via NVM_ADD_USER_QUEUE support multi-page (physically-fragmented) ring
+ * memory, so the old single-page clamp (depth <= 64) no longer applies.
+ * Applies to every user queue -- snvme does not support per-queue depth.
  */
-static int io_queue_depth = 64;
-module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0644);
-MODULE_PARM_DESC(io_queue_depth,
-	"set io queue depth, should >= 2; default 64 because user IOQ "
-	"rings (NVM_ADD_USER_QUEUE) must fit in a single 4K page");
 
 static unsigned int write_queues;
 module_param(write_queues, uint, 0644);
@@ -444,17 +418,6 @@ struct nvme_dev {
 	 */
 	unsigned int ctrl_max_io_queues;
 };
-
-static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
-{
-	int n = 0, ret;
-
-	ret = kstrtoint(val, 10, &n);
-	if (ret != 0 || n < 2)
-		return -EINVAL;
-
-	return param_set_int(val, kp);
-}
 
 static inline unsigned int sq_idx(unsigned int qid, u32 stride)
 {
@@ -3058,8 +3021,7 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 
 	dev->ctrl.cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
 
-	dev->q_depth = min_t(int, NVME_CAP_MQES(dev->ctrl.cap) + 1,
-				io_queue_depth);
+	dev->q_depth = NVME_CAP_MQES(dev->ctrl.cap) + 1;
 	dev->ctrl.sqsize = dev->q_depth - 1; /* 0's based queue depth */
 	dev->db_stride = 1 << NVME_CAP_STRIDE(dev->ctrl.cap);
 	dev->dbs = dev->bar + 4096;
@@ -5004,7 +4966,6 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 	void __user *argp = (void __user *)arg;
 	u64 addr;
 	int ret = 0;
-	unsigned int i;
 
 	ctrl = ctrl_find_by_inode(&ctrl_list, file->f_inode);
 	if (!ctrl) {
@@ -5468,11 +5429,10 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		 * B3 fields.  These are the single source of truth for
 		 * userspace ring sizing and QID allocation:
 		 *
-		 *   q_depth                NVMe CAP.MQES + 1, clamped by
-		 *                          io_queue_depth module param.
-		 *                          Applies to *every* user queue
-		 *                          -- snvme does not support
-		 *                          per-queue depth.
+		 *   q_depth                NVMe CAP.MQES + 1 (controller maximum;
+		 *                          no module-param clamp).  Applies to
+		 *                          *every* user queue -- snvme does not
+		 *                          support per-queue depth.
 		 *   bar0_size              Full BAR0 region size; userspace
 		 *                          mmaps up to this many bytes
 		 *                          starting at offset 0 to reach
@@ -6617,8 +6577,7 @@ static int __init nvme_init(void)
 	 * register_driver().  See the design banner above the lazy block
 	 * for the rationale.
 	 */
-	pr_info("module loaded successfully (io_queue_depth=%u)\n",
-		io_queue_depth);
+	pr_info("module loaded successfully\n");
 	return 0;
 
 err_p2p_exit:

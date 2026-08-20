@@ -91,3 +91,12 @@ modules.order
 *.ko
 *.mod
 *.mod.c
+
+# vLLM integration orchestration runtime state (task cards, receipts,
+# board, round scratch) -- per-run collaboration artifacts, not source.
+doc/intergration/ai-orch/
+doc/intergration/rounds/
+
+# Python
+__pycache__/
+*.pyc

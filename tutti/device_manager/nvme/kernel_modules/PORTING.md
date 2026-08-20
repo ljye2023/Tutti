@@ -241,7 +241,7 @@ cmake --build build --target modules      # auto-selects baseline via uname -r
                                         # 通过 uname -r 自动选基线
 # standalone, inside a configured output dir · 独立构建:
 make TUTTI_P2P_BACKEND=nvidia             # or metax
-make insmod IO_QDEPTH=1024                # insmod snvme-core.ko then snvme.ko
+make insmod                               # insmod snvme-core.ko then snvme.ko
 ```
 
 Baseline auto-selection (`Makefile.in`; override with `make SNVME_BASELINE=<tag>`)
@@ -264,7 +264,7 @@ Baseline auto-selection (`Makefile.in`; override with `make SNVME_BASELINE=<tag>
 > 不在本文档讨论范围。
 
 ```bash
-sudo insmod snvme-core.ko && sudo insmod snvme.ko io_queue_depth=1024
+sudo insmod snvme-core.ko && sudo insmod snvme.ko
 ```
 
 ## 6. Differences vs the legacy trees · 与旧树的差异

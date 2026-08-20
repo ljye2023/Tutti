@@ -128,10 +128,11 @@ Result<CreatedDataPath> create_local_nvme(
 
     const auto& slice = view->slices.front();
     const auto& config = tuning(spec);
-    if (config.threads_per_block > slice.granted_queues) {
-        return failure<CreatedDataPath>(invalid(
-            "local-nvme threads_per_block exceeds granted queues"));
-    }
+    // threads_per_block > granted queues is allowed: the fused submit
+    // kernel maps threads onto queues round-robin (see
+    // QueueAcquireHelper::acquire_queue), and nvm_parallel_queue supports
+    // multiple concurrent submitters per queue.  The data path itself
+    // emits a warning in that case.
     auto bar0_size = checked_u32(slice.bar0_size, "bar0_size");
     if (!bar0_size.ok()) return failure<CreatedDataPath>(bar0_size.status());
     auto max_batch_entries = checked_u32(
@@ -203,11 +204,8 @@ Result<CreatedDataPath> create_striped_local_nvme(
     std::uint64_t effective_mdts = 0;
     for (std::size_t index = 0; index < view->slices.size(); ++index) {
         const auto& slice = view->slices[index];
-        if (config.threads_per_block > slice.granted_queues) {
-            return failure<CreatedDataPath>(invalid(
-                "striped-local-nvme threads_per_block exceeds granted queues "
-                "for slice " + std::to_string(index)));
-        }
+        // threads_per_block > granted queues is allowed (round-robin
+        // sharing; the data path warns) — see the local-nvme branch above.
         striped_local_nvme::DeviceDescriptor descriptor;
         descriptor.snvme_dev_path = slice.chrdev_path;
         descriptor.bar0_size = slice.bar0_size;

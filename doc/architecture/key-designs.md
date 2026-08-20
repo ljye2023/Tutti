@@ -35,8 +35,8 @@ later, independently of submission. Tutti applies the same shape to the
   `wait()`/`progress()` on the handle, decoupled from submission — the
   same submit/reap split as io_uring's SQ/CQE pair.
 
-Each controller exposes **16 queue pairs × 1024 entries** to userspace
-(queue depth is fixed at kernel-module install time via `io_queue_depth`;
+Each controller exposes **16 queue pairs × MQES+1 entries** to userspace
+(queue depth always takes the controller maximum, NVMe CAP.MQES + 1;
 the runtime follows the controller-reported depth, userspace cannot
 override it). One bounded CQ poll budget per entry makes the poll
 fail-closed instead of spinning forever on a lost completion.

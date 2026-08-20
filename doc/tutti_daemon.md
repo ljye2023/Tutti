@@ -250,7 +250,7 @@ unmount_retry:
 
 ```bash
 sudo env TUTTI_VERBOSE=1 \
-  ./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
+  ./build/cuda-module/bin/tutti_daemon \
   --config config/local/tutti_daemon.yaml
 ```
 

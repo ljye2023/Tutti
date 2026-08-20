@@ -88,12 +88,10 @@ all:
 		$(CURDIR)/baseline/5.4-tlinux4 $(CURDIR)/baseline/5.10 \
 		$(CURDIR)/baseline/5.15 $(CURDIR)/baseline/6.8
 	$(MAKE) -C $(KERNEL_SRC) M=$(CURDIR) modules
-# io_queue_depth: kernel default 64 is the conservative built-in; production
-# deployments use 1024 (maintainer 2026-08-04). Override: make insmod IO_QDEPTH=64
-IO_QDEPTH ?= 1024
-
+# Queue depth: no module parameter -- snvme always takes the controller
+# maximum (NVMe CAP.MQES + 1).
 insmod:
-	sudo insmod snvme-core.ko && sudo insmod snvme.ko io_queue_depth=$(IO_QDEPTH)
+	sudo insmod snvme-core.ko && sudo insmod snvme.ko
 rmmod:
 	sudo rmmod snvme && sudo rmmod snvme_core
 clean:

@@ -58,11 +58,10 @@ The ioctl UAPI is versioned (`tutti/include/uapi/tutti_snvme.h`):
   headers under both nvcc and plain C via layout-identical fallbacks for
   the GPU-side atomic fields.
 
-## 4. Queue geometry — fixed at install time
+## 4. Queue geometry — controller maximum
 
-- Queue depth is a **module-install-time parameter**:
-  `insmod snvme.ko io_queue_depth=1024` (production). The controller
-  reports `q_depth = min(MQES+1, io_queue_depth)`; userspace rings always
+- Queue depth always takes the **controller maximum**:
+  `q_depth = NVMe CAP.MQES + 1` (no module parameter). Userspace rings always
   follow the controller-reported depth — there is no userspace override
   (a smaller userspace ring would desynchronize SQ wrap-around and CQ
   phase tracking against the controller's deeper rings).

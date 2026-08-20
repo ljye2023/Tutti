@@ -224,6 +224,19 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
 
     queue_group_.reset();
 
+    // Free the pinned PRP staging ring (all ops drained above).
+    for (auto& e : prp_stage_events_) {
+        if (e) { cudaEventDestroy(static_cast<cudaEvent_t>(e)); e = nullptr; }
+    }
+    prp_stage_events_.clear();
+    if (prp_stage_host_) {
+        cudaFreeHost(prp_stage_host_);
+        prp_stage_host_ = nullptr;
+    }
+    prp_stage_pos_ = 0;
+    prp_stage_total_ = 0;
+    prp_stage_page_size_ = 0;
+
     for (auto& [tok, reg] : mem_regs_) {
         if (!reg.unregistered && reg.dma) {
             nvm_dma_unmap(reg.dma);
@@ -509,12 +522,15 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
                               e.what());
             }
             if (threads_per_block_ > queue_group_->n_qps()) {
-                queue_group_.reset();
-                nvm_ctrl_free_client(ctrl_);
-                ctrl_ = nullptr;
-                return Status(
-                    StatusCode::INVALID_ARGUMENT,
-                    "threads_per_block exceeds the granted NVMe queue count");
+                // Round-robin sharing (see striped path): the parallel
+                // queue supports multiple concurrent submitters per
+                // queue, so warn instead of failing.
+                std::fprintf(
+                    stderr,
+                    "[local-nvme] warning: threads_per_block (%u) > "
+                    "granted queues (%u); threads will share queues "
+                    "round-robin\n",
+                    threads_per_block_, queue_group_->n_qps());
             }
 
             // Initialize the MetadataArena: pre-allocate all per-op
@@ -568,6 +584,39 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
                     return Status(StatusCode::NOT_READY,
                                   "PrpPageCache init failed");
                 }
+            }
+
+            // Pinned staging ring for PRP-list page H2D fills (see header).
+            {
+                prp_stage_page_size_ = ctrl_->page_size;
+                cudaError_t se = cudaHostAlloc(
+                    &prp_stage_host_,
+                    static_cast<std::size_t>(kPrpStageSlots) *
+                        prp_stage_page_size_,
+                    cudaHostAllocDefault);
+                if (se != cudaSuccess || prp_stage_host_ == nullptr) {
+                    return Status(StatusCode::DEVICE_ERROR,
+                                  std::string("PRP staging ring cudaHostAlloc failed: ") +
+                                      cudaGetErrorString(se));
+                }
+                prp_stage_events_.resize(kPrpStageSlots, nullptr);
+                for (std::uint32_t i = 0; i < kPrpStageSlots; ++i) {
+                    cudaEvent_t ev = nullptr;
+                    se = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+                    if (se != cudaSuccess) {
+                        for (auto& e : prp_stage_events_) {
+                            if (e) { cudaEventDestroy(static_cast<cudaEvent_t>(e)); e = nullptr; }
+                        }
+                        cudaFreeHost(prp_stage_host_);
+                        prp_stage_host_ = nullptr;
+                        return Status(StatusCode::DEVICE_ERROR,
+                                      std::string("PRP staging event create failed: ") +
+                                          cudaGetErrorString(se));
+                    }
+                    prp_stage_events_[i] = ev;
+                }
+                prp_stage_pos_ = 0;
+                prp_stage_total_ = 0;
             }
         }
     }
@@ -654,6 +703,19 @@ Status LocalNvmeDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     targets_.clear();
 
     queue_group_.reset();
+
+    // Free the pinned PRP staging ring (all ops drained above).
+    for (auto& e : prp_stage_events_) {
+        if (e) { cudaEventDestroy(static_cast<cudaEvent_t>(e)); e = nullptr; }
+    }
+    prp_stage_events_.clear();
+    if (prp_stage_host_) {
+        cudaFreeHost(prp_stage_host_);
+        prp_stage_host_ = nullptr;
+    }
+    prp_stage_pos_ = 0;
+    prp_stage_total_ = 0;
+    prp_stage_page_size_ = 0;
 
     for (auto& [tok, reg] : mem_regs_) {
         if (!reg.unregistered && reg.dma) {
@@ -1619,22 +1681,15 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                                             li.start_page, li.pages_in_io};
                     auto* pe = prp_cache_.get_or_build(pkey,
                         [&](void* devptr) -> bool {
-                            std::vector<std::uint64_t> h_page(
-                                page_size / sizeof(std::uint64_t), 0);
-                            fill_prp_list_page(h_page.data(), pr.mreg->dma,
-                                               li.start_page, li.pages_in_io,
-                                               page_size);
-                            // ASYNC H2D on caller stream: pageable host
-                            // memory blocks the host until the copy
-                            // completes (CUDA runtime copies to internal
-                            // pinned staging first), so h_page is safe to
-                            // destroy after this call returns.  The copy
-                            // is on ctx.stream (not default stream), so it
-                            // is ordered with the subsequent kernel launch
-                            // and does NOT create a cross-stream barrier.
-                            return cudaMemcpyAsync(devptr, h_page.data(),
-                                page_size, cudaMemcpyHostToDevice,
-                                ctx.stream) == cudaSuccess;
+                            // Stage through the persistent pinned ring:
+                            // pageable sources degenerate the async copy
+                            // into a ~150us host-blocking staged copy per
+                            // page (cold batches used to pay ~9.4ms for
+                            // 64 pages before the kernel even launched).
+                            return stage_prp_page_(pr.mreg->dma,
+                                                   li.start_page,
+                                                   li.pages_in_io, devptr,
+                                                   ctx.stream);
                         });
                     if (pe == nullptr) {
                         cache_ok = false;
@@ -1667,21 +1722,18 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         }
 
         if (!prp_all_from_cache) {
-            // Arena path: H2D fill into arena's pre-allocated PRP pool.
-            std::vector<std::uint64_t> h_page(page_size / sizeof(std::uint64_t), 0);
+            // Arena path: H2D fill into arena's pre-allocated PRP pool,
+            // staged through the persistent pinned ring (see the PRP
+            // cache lambda above for why pageable staging was removed).
             std::uint32_t list_idx = 0;
             for (auto& pr : pending) {
                 if (!pr.accepted) continue;
                 for (const auto& li : pr.list_infos) {
-                    fill_prp_list_page(h_page.data(), pr.mreg->dma,
-                                       li.start_page, li.pages_in_io, page_size);
-                    // ASYNC H2D on caller stream (see PRP cache lambda
-                    // above for rationale on pageable host safety).
-                    ce = cudaMemcpyAsync(
-                        static_cast<char*>(prp_pages) + list_idx * page_size,
-                        h_page.data(), page_size, cudaMemcpyHostToDevice,
-                        ctx.stream);
-                    if (ce != cudaSuccess) {
+                    if (!stage_prp_page_(pr.mreg->dma, li.start_page,
+                                         li.pages_in_io,
+                                         static_cast<char*>(prp_pages) +
+                                             (std::size_t)list_idx * page_size,
+                                         ctx.stream)) {
                         arena_.release(lease.slot_index);
                         // Also release any PRP cache entries acquired.
                         for (const auto& ref : prp_cache_refs) {
@@ -2377,6 +2429,57 @@ bool LocalNvmeDataPath::test_op_has_timeout(DataPathOp op) const {
 // -------------------------------------------------------------------------
 // private: aggregate per-entry completion status
 // -------------------------------------------------------------------------
+
+// Stage one PRP-list page through the pinned ring.
+//
+// The copy is stream-ordered before the submit kernel launch (both are
+// enqueued on ctx.stream), so the page content is resident before the NVMe
+// device dereferences prp2.  Slot reuse (2nd+ revolution, possibly on a
+// different stream) is fenced by the slot's event: syncing it guarantees
+// the previous copy from that slot executed before we overwrite it.
+bool LocalNvmeDataPath::stage_prp_page_(const nvm_dma_t* dma,
+                                        std::uint32_t start_page,
+                                        std::uint32_t pages_in_io,
+                                        void* devptr,
+                                        void* stream_opaque) {
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_opaque);
+    if (prp_stage_host_ == nullptr || prp_stage_events_.empty()) {
+        return false;
+    }
+    if (prp_stage_pos_ >= kPrpStageSlots) {
+        prp_stage_pos_ = 0;
+    }
+    const std::uint32_t slot = prp_stage_pos_;
+    if (prp_stage_total_ >= kPrpStageSlots) {
+        // Second+ revolution: the slot's previous H2D must have executed
+        // before its content can be overwritten.
+        cudaError_t se = cudaEventSynchronize(
+            static_cast<cudaEvent_t>(prp_stage_events_[slot]));
+        if (se != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    }
+    void* host_page = static_cast<char*>(prp_stage_host_) +
+                      static_cast<std::size_t>(slot) * prp_stage_page_size_;
+    fill_prp_list_page(static_cast<std::uint64_t*>(host_page), dma,
+                       start_page, pages_in_io,
+                       static_cast<std::size_t>(prp_stage_page_size_));
+    cudaError_t ce = cudaMemcpyAsync(devptr, host_page,
+                                     static_cast<std::size_t>(prp_stage_page_size_),
+                                     cudaMemcpyHostToDevice, stream);
+    if (ce != cudaSuccess) {
+        return false;
+    }
+    ce = cudaEventRecord(static_cast<cudaEvent_t>(prp_stage_events_[slot]),
+                         stream);
+    if (ce != cudaSuccess) {
+        return false;
+    }
+    prp_stage_pos_ = slot + 1;
+    ++prp_stage_total_;
+    return true;
+}
 
 void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
     if (!op.d_status || op.entry_count == 0) {

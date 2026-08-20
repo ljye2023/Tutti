@@ -190,10 +190,10 @@ The block devices exist only after daemon bring-up; the order is fixed:
 
 ### 4.1 加载内核模块 / Load the kernel module
 
-一条命令安装并加载（内部等价于 `insmod snvme-core.ko && insmod snvme.ko io_queue_depth=1024`）：
+一条命令安装并加载（内部等价于 `insmod snvme-core.ko && insmod snvme.ko`）：
 
 Install and load with one command (equivalent to
-`insmod snvme-core.ko && insmod snvme.ko io_queue_depth=1024`):
+`insmod snvme-core.ko && insmod snvme.ko`):
 
 ```bash
 cmake --build --preset cuda-module --target insmod
@@ -201,8 +201,8 @@ lsmod | grep snvme                                    # 应看到 snvme + snvme_
 ls -l /dev/snvm_control                               # 应存在
 ```
 
-> **`io_queue_depth=1024` 是生产/性能测试必需**，默认 64 会在 striped 大 batch 下
-> 出现 "wait failed"（SQ 槽位不足）。验证：`cat /sys/module/snvme/parameters/io_queue_depth`。
+> 队列深度无需配置：snvme 自动取控制器最大值（`NVMe CAP.MQES + 1`，
+> 数据中心 SSD 通常为 1024）。
 
 ### 4.2 准备本机 YAML / Prepare a host-local YAML
 
@@ -275,7 +275,9 @@ readlink -f /mnt/gpu0/ssnvme0 # 应解析到 /mnt/nvme0/ACCEL0
 
 ```bash
 sudo kill -TERM <tutti_daemon_pid>      # 优雅停止（自动卸载）
-sudo bash scripts/reset_snvme.sh         # 需要重载模块时使用（unbind + rmmod + insmod）
+# 需要重载模块时：
+sudo bash scripts/unbind.sh             # 解绑所有 snvme 控制器（幂等）
+cmake --build --preset cuda-module --target rmmod insmod
 ```
 
 ---
@@ -410,8 +412,7 @@ nsys stats kv_overlap.nsys-rep
 | 每个 layer/方向只有 **1 次 kernel launch** | `submit` 每批一次边界跨越（O(1) per batch） |
 | 结束处无 `[FAIL]`、`PASSED` | 端到端正确 |
 
-如果 compute 与 I/O **没有重叠**（串行），检查 daemon 队列配置与
-`io_queue_depth=1024` 是否生效。
+如果 compute 与 I/O **没有重叠**（串行），检查 daemon 队列配置是否生效。
 
 ---
 
@@ -422,8 +423,7 @@ nsys stats kv_overlap.nsys-rep
 | `prepare_env.sh` 卡在 `yaml-cpp-devel` 报错退出 | EL8 上该包被 `modular filtering` 过滤装不上；已修复：脚本里改为 `optional`，由 vcpkg 提供 |
 | 链接报 `undefined reference to std::filesystem::...` | GCC 8 的 `std::filesystem` 需单独 `-lstdc++fs`；已修复：根 `CMakeLists.txt` 检测 GCC <9 时统一链接 `stdc++fs` |
 | `insmod snvme.ko` 报 `Key was rejected by service` | 本机强制签名；`.ko` 未送签。送签后 `modprobe`（见 `third_pkgs/tencent_os.md`） |
-| striped 大 batch "wait failed" | `io_queue_depth` 用了默认 64；须 `rmmod` 后带 `io_queue_depth=1024` 重载 |
-| `rmmod snvme` 报 "in use" | 有挂载的 `/dev/snvme*n*` 或打开中的 `/dev/snvme*`；先 umount / 关进程，见 `scripts/reset_snvme.sh` 输出 |
+| `rmmod snvme` 报 "in use" | 有挂载的 `/dev/snvme*n*` 或打开中的 `/dev/snvme*`；先 umount / 关进程（`lsof /dev/snvm*` 排查），再走 §4.5 重载 |
 | `NVM_ADD_USER_QUEUE` 失败 | 控制器 IOQ 总量不足；下调 `SNVME_TEST_KERNEL_IOQ_CAP`（smoke 测试） |
 | 打开文件过多 | 示例会自动抬 `RLIMIT_NOFILE`；硬上限不足会报所需最小值 |
 | 多盘 block size 不一致 | daemon 会在挂载前拒绝启动；统一 namespace logical block size（应为 4 KiB） |
@@ -437,7 +437,6 @@ nsys stats kv_overlap.nsys-rep
 | `prepare_env.sh` | ✅ 当前 | 一键依赖 + 生成 presets |
 | `pci_topology_check.sh` | ✅ 当前 | 探测 GPU↔NVMe 拓扑 |
 | `bind_nvme_device.sh` / `unbind.sh` | ✅ 当前 | 驱动绑定 / 解绑 |
-| `reset_snvme.sh` | ⚠️ 本机受限 | 内含 `insmod`，强制签名下会失败；需改为签名后 `modprobe`（见 `third_pkgs/tencent_os.md`） |
 | `umount_nvme_layer_and_reset.sh` | ⚠️ 待确认 | 依赖旧 `/mnt/nvme_layer` 布局 |
 | `kv_cache_e2e_sweep.sh` / `kv_cache_read_only_sweep.sh` | ❌ 过时 | 引用的 `kv_cache_e2e_stress` 目标已不存在 |
 | `raid0_create.sh` / `raid0_delete.sh` | ❌ 过时 | `mdadm` RAID0 已被 `striped_local_nvme` 取代 |
@@ -448,8 +447,9 @@ nsys stats kv_overlap.nsys-rep
 
 ## 9. 更多资料 / Further reading
 
-- 本机系统安装记录（NVIDIA 驱动 / CUDA / 内核签名）：[`third_pkgs/tencent_os.md`](../third_pkgs/tencent_os.md)
+- TencentOS 环境适配手册（强制签名 / 根目录满 / vendored toolkit 与 nv-p2p.h）：[`third_pkgs/tencent_os.md`](../third_pkgs/tencent_os.md)
 - 系统架构：[doc/architecture/system-architecture.md](architecture/system-architecture.md)
+- snvme 设计依据（为什么需要定制驱动）：[doc/architecture/snvme-design-rationale.md](architecture/snvme-design-rationale.md)
 - 关键设计：[doc/architecture/key-designs.md](architecture/key-designs.md)
 - 构建与 SNVMe 测试：[doc/build_and_test.md](build_and_test.md)
 - daemon 部署：[doc/tutti_daemon.md](tutti_daemon.md)

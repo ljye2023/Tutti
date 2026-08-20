@@ -94,9 +94,17 @@ bool create_file(const std::string& path, uint64_t size) {
 
 // ---------------------------------------------------------------------------
 // Windowed submit+wait: handles partial-commit by retrying rejected requests.
-// Returns {total_ms_host, total_accepted_bytes}.
+// Returns {total_ms_host, total_io_ms, total_accepted_bytes}.
+//
+// ms    = host wall time of submit+wait (INCLUDES waits on stream
+//         dependencies the caller armed beforehand, e.g. Phase G's
+//         cudaStreamWaitEvent(s_w, ec[L-1]) before write(L-1)).
+// io_ms = stream time of the actual submission machinery + fused kernel,
+//         measured with events recorded around rt->submit().  ev_io0 fires
+//         only after prior stream dependencies are satisfied, so this
+//         number excludes dependency waits and reflects real IO speed.
 // ---------------------------------------------------------------------------
-struct WindowedIoResult { double ms; uint64_t bytes; };
+struct WindowedIoResult { double ms; double io_ms; uint64_t bytes; };
 
 static WindowedIoResult windowed_submit_wait(
         StorageRuntime* rt,
@@ -106,13 +114,20 @@ static WindowedIoResult windowed_submit_wait(
         const char* tag) {
     std::vector<IoRequest> pending(all_reqs, all_reqs + n_reqs);
     double total_ms = 0;
+    double total_io_ms = 0;
     uint64_t total_bytes = 0;
     int rounds = 0;
+
+    cudaEvent_t ev_io0 = nullptr, ev_io1 = nullptr;
+    CUDA_OK(cudaEventCreate(&ev_io0));
+    CUDA_OK(cudaEventCreate(&ev_io1));
 
     while (!pending.empty()) {
         size_t submit_count = pending.size();
         auto t0 = std::chrono::steady_clock::now();
+        CUDA_OK(cudaEventRecord(ev_io0, ctx.stream));
         auto o = rt->submit(pending.data(), submit_count, ctx);
+        CUDA_OK(cudaEventRecord(ev_io1, ctx.stream));
 
         if (o.io.has_value()) {
             auto wo = rt->wait(o.io.value(), 60000);
@@ -136,11 +151,16 @@ static WindowedIoResult windowed_submit_wait(
             if (rounds > 10000) STEP_FAIL("%s: too many rounds (stuck)", tag);
         }
 
+        float io_ms = 0.f;
+        CUDA_OK(cudaEventElapsedTime(&io_ms, ev_io0, ev_io1));
+        total_io_ms += io_ms;
         total_ms += sec_since(t0) * 1e3;
         ++rounds;
     }
 
-    return {total_ms, total_bytes};
+    CUDA_OK(cudaEventDestroy(ev_io0));
+    CUDA_OK(cudaEventDestroy(ev_io1));
+    return {total_ms, total_io_ms, total_bytes};
 }
 
 int main(int argc,char**argv){
@@ -416,6 +436,15 @@ int main(int argc,char**argv){
         return windowed_submit_wait(rt,reqs.data(),reqs.size(),ctx_w,ts,"write");
     };
 
+    // Warm the miss-tensor (mk/mv) PRP-cache pages BEFORE calibrating: the
+    // first-ever write batch pays a one-time PRP cold-build (H2D per page),
+    // which would otherwise be measured as "write time" below and inflate
+    // compute_us (and with it the simulated compute iterations).
+    {
+        auto warm = do_write(0, mi, mk_m, mv_m);
+        (void)warm;
+    }
+
     // Calibrate
     if(compute_us==0){
         auto tr=std::chrono::steady_clock::now();
@@ -425,11 +454,12 @@ int main(int argc,char**argv){
         auto rw=do_write(0,mi,mk_m,mv_m);
         double tw_ms=sec_since(tw)*1e3;
         compute_us=(uint64_t)((tr_ms+tw_ms)*1e3);
-        STEP_OK("Phase F: auto compute_us=%lu us (read %.3f ms / %.2f GB = %.1f GB/s, "
-                "write %.3f ms / %.2f GB = %.1f GB/s)",
-                (unsigned long)compute_us,tr_ms,
-                (double)rr.bytes/1e9,rr.bytes/1e9/(tr_ms/1e3),
-                tw_ms,(double)rw.bytes/1e9,rw.bytes/1e9/(tw_ms/1e3));
+        STEP_OK("Phase F: auto compute_us=%lu us (read %.3f ms (io %.3f) / %.2f GB = %.1f GB/s, "
+                "write %.3f ms (io %.3f) / %.2f GB = %.1f GB/s)",
+                (unsigned long)compute_us,tr_ms,rr.io_ms,
+                (double)rr.bytes/1e9,rr.bytes/1e9/(rr.io_ms/1e3),
+                tw_ms,rw.io_ms,
+                (double)rw.bytes/1e9,rw.bytes/1e9/(rw.io_ms/1e3));
     }
     const uint32_t ci=(uint32_t)std::max(1.0,(double)compute_us/((double)gemm_ms*1000)+0.5);
     LOG_INFO("pipeline: layers=%u chunks=%lu (hit=%lu miss=%lu) compute=%lu us = %u iters",
@@ -441,7 +471,7 @@ int main(int argc,char**argv){
     for(auto&e:er)CUDA_OK(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
     for(auto&e:ec)CUDA_OK(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
 
-    double sim_wall=0, sim_rms=0, sim_wms=0;
+    double sim_wall=0, sim_rms=0, sim_wms=0, sim_rio=0, sim_wio=0;
     uint64_t sim_rbytes=0, sim_wbytes=0;
 
 #if defined(TUTTI_USE_CUDA)
@@ -449,13 +479,14 @@ int main(int argc,char**argv){
 #endif
     for(uint32_t rq=0;rq<n_requests;++rq){
         auto t0r=std::chrono::steady_clock::now();
-        double rrms=0,rwms=0;float lr_ms=0,lw_ms=0;
+        double rrms=0,rwms=0,rrio=0,rwio=0;float lr_ms=0,lw_ms=0,lr_io=0,lw_io=0;
         uint64_t lr_bytes=0,lw_bytes=0;
 
         // Prefetch L0
         {
             auto r=do_read(0,hi,hk_m,hv_m);
-            lr_ms=r.ms;lr_bytes=r.bytes;rrms+=r.ms;sim_rbytes+=r.bytes;
+            lr_ms=r.ms;lr_io=r.io_ms;lr_bytes=r.bytes;
+            rrms+=r.ms;rrio+=r.io_ms;sim_rbytes+=r.bytes;
         }
         CUDA_OK(cudaEventRecord(er[0],s_r));
 
@@ -470,53 +501,61 @@ int main(int argc,char**argv){
             if(L>=1){
                 CUDA_OK(cudaStreamWaitEvent(s_w,ec[L-1],0));
                 auto r=do_write(L-1,mi,mk_m,mv_m);
-                lw_ms=r.ms;lw_bytes=r.bytes;rwms+=r.ms;sim_wbytes+=r.bytes;
+                lw_ms=r.ms;lw_io=r.io_ms;lw_bytes=r.bytes;
+                rwms+=r.ms;rwio+=r.io_ms;sim_wbytes+=r.bytes;
             }
 
             // (3) read(L+1) — windowed on s_r
             if(L+1<n_layers){
                 auto r=do_read(L+1,hi,hk_m,hv_m);
-                lr_ms=r.ms;lr_bytes=r.bytes;rrms+=r.ms;sim_rbytes+=r.bytes;
+                lr_ms=r.ms;lr_io=r.io_ms;lr_bytes=r.bytes;
+                rrms+=r.ms;rrio+=r.io_ms;sim_rbytes+=r.bytes;
                 CUDA_OK(cudaEventRecord(er[L+1],s_r));
             }
 
             if(L%10==9||L+1==n_layers){
-                LOG_INFO("rq%u L%-3u read %.1fMB/%.2fms=%.1fGB/s write %.1fMB/%.2fms=%.1fGB/s",
-                         rq+1,L,(double)lr_bytes/1e6,(double)lr_ms,
-                         lr_ms>0?(double)lr_bytes/1e9/((double)lr_ms/1e3):0,
-                         (double)lw_bytes/1e6,(double)lw_ms,
-                         lw_ms>0?(double)lw_bytes/1e9/((double)lw_ms/1e3):0);
+                LOG_INFO("rq%u L%-3u read %.1fMB io=%.2fms=%.1fGB/s | write %.1fMB io=%.2fms=%.1fGB/s "
+                         "(wall r=%.2f w=%.2f ms, w-wall includes wait on compute)",
+                         rq+1,L,(double)lr_bytes/1e6,(double)lr_io,
+                         lr_io>0?(double)lr_bytes/1e9/((double)lr_io/1e3):0,
+                         (double)lw_bytes/1e6,(double)lw_io,
+                         lw_io>0?(double)lw_bytes/1e9/((double)lw_io/1e3):0,
+                         (double)lr_ms,(double)lw_ms);
             }
         }
         // Drain last layer write
         CUDA_OK(cudaStreamWaitEvent(s_w,ec[n_layers-1],0));
         {
             auto r=do_write(n_layers-1,mi,mk_m,mv_m);
-            lw_ms=r.ms;lw_bytes=r.bytes;rwms+=r.ms;sim_wbytes+=r.bytes;
+            lw_ms=r.ms;lw_io=r.io_ms;lw_bytes=r.bytes;
+            rwms+=r.ms;rwio+=r.io_ms;sim_wbytes+=r.bytes;
         }
         CUDA_OK(cudaStreamSynchronize(s_c));
         CUDA_OK(cudaStreamSynchronize(s_r));
         CUDA_OK(cudaStreamSynchronize(s_w));
         double rw=sec_since(t0r);
-        sim_wall+=rw;sim_rms+=rrms;sim_wms+=rwms;
-        double serial=(rrms+rwms)/1e3+(double)n_layers*(double)compute_us/1e6;
+        sim_wall+=rw;sim_rms+=rrms;sim_wms+=rwms;sim_rio+=rrio;sim_wio+=rwio;
+        // Serial baseline uses IO stream time (dependency waits are a
+        // property of the overlapped pipeline, not of the IO itself).
+        double serial=(rrio+rwio)/1e3+(double)n_layers*(double)compute_us/1e6;
         STEP_OK("Phase G: req %u %.3fs (serial %.3fs, saving %.0f%%) "
-                "READ %.2fGB=%.1fGB/s WRITE %.2fGB=%.1fGB/s",
+                "READ %.2fGB=%.1fGB/s WRITE %.2fGB=%.1fGB/s (io-time based)",
                 rq+1,rw,serial,100.0*(1.0-rw/serial),
-                (double)sim_rbytes/1e9/n_layers,(double)sim_rbytes/1e9/(sim_rms/1e3),
-                (double)sim_wbytes/1e9/n_layers,(double)sim_wbytes/1e9/(sim_wms/1e3));
+                (double)sim_rbytes/1e9/n_layers,(double)sim_rbytes/1e9/(sim_rio/1e3),
+                (double)sim_wbytes/1e9/n_layers,(double)sim_wbytes/1e9/(sim_wio/1e3));
     }
 #if defined(TUTTI_USE_CUDA)
     CUDA_OK(cudaProfilerStop());
 #endif
 
-    double t_serial=(sim_rms+sim_wms)/1e3+(double)n_layers*n_requests*(double)compute_us/1e6;
+    double t_serial=(sim_rio+sim_wio)/1e3+(double)n_layers*n_requests*(double)compute_us/1e6;
     double ov=t_serial>0?100.0*(1.0-sim_wall/t_serial):0;
     STEP_OK("SIM TOTAL: %u req wall=%.3fs | READ %.2fGB=%.1fGB/s | WRITE %.2fGB=%.1fGB/s | "
-            "serial=%.3fs overlap %.0f%% (measured: host wall / accepted-bytes IO-time + compute)",
+            "serial=%.3fs overlap %.0f%% (bandwidths are io-time based; wall write time "
+            "also waits on compute, by design)",
             (unsigned)n_requests,sim_wall,
-            (double)sim_rbytes/1e9,sim_rbytes>0?(double)sim_rbytes/1e9/(sim_rms/1e3):0,
-            (double)sim_wbytes/1e9,sim_wbytes>0?(double)sim_wbytes/1e9/(sim_wms/1e3):0,
+            (double)sim_rbytes/1e9,sim_rbytes>0?(double)sim_rbytes/1e9/(sim_rio/1e3):0,
+            (double)sim_wbytes/1e9,sim_wbytes>0?(double)sim_wbytes/1e9/(sim_wio/1e3):0,
             t_serial,ov);
 
     // ---- Phase H: verify ----

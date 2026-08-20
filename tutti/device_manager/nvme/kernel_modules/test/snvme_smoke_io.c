@@ -502,7 +502,7 @@ int main(int argc, char** argv) {
     if (round_up_pages(sq_bytes, psz) > (size_t)psz)
         step_fail(0,
             "B3 single-PRP limit: SQ ring (q_depth=%u * %zu = %zu B) "
-            "spans more than one host page; lower io_queue_depth.",
+            "spans more than one host page.",
             info.q_depth, sqe_size, sq_bytes);
     if (round_up_pages(cq_bytes, psz) > (size_t)psz)
         step_fail(0,

@@ -493,6 +493,15 @@ private:
     // Called when the stream event signals (kernel finished).
     void aggregate_completion_status_(OpEntry& op);
 
+    // Stage one PRP-list page through the persistent pinned ring and
+    // enqueue its H2D copy on `stream` (a cudaStream_t, kept opaque to
+    // avoid a CUDA include here).  Returns false on CUDA failure.
+    bool stage_prp_page_(const nvm_dma_t* dma,
+                         std::uint32_t start_page,
+                         std::uint32_t pages_in_io,
+                         void* devptr,
+                         void* stream);
+
     // Controller connection (client-only attach).
     std::string snvme_dev_path_;
     std::uint32_t bar0_size_ = 0;
@@ -556,6 +565,18 @@ private:
     // Capacity 0 = disabled (arena PRP pool used per submit, current behavior).
     PrpPageCache prp_cache_;
     std::uint32_t prp_cache_capacity_ = 0;
+
+    // Pinned host staging ring for PRP-list page H2D fills (submit path).
+    // A pageable per-submit source degenerates cudaMemcpyAsync into a
+    // ~150us staged, host-blocking copy per page; a persistent pinned slot
+    // brings each fill down to a ~1-2us enqueue.  Per-slot wrap events make
+    // ring reuse safe across streams.  (Same design as StripedDataPath.)
+    static constexpr std::uint32_t kPrpStageSlots = 256;
+    void* prp_stage_host_ = nullptr;          // cudaHostAlloc'd, kPrpStageSlots pages
+    std::vector<void*> prp_stage_events_;     // cudaEvent_t per slot (opaque)
+    std::uint32_t prp_stage_pos_ = 0;         // next slot to fill
+    std::uint64_t prp_stage_total_ = 0;       // lifetime staged pages (wrap detection)
+    std::uint64_t prp_stage_page_size_ = 0;   // cached ctrl_->page_size
 
     // Memory registration table: token -> MemReg.
     std::unordered_map<std::uint64_t, MemReg> mem_regs_;

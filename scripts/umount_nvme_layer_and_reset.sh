@@ -30,7 +30,8 @@ else
     done
 fi
 
-echo "Calling reset_snvme.sh to reset the driver..."
-bash "$SCRIPT_DIR/reset_snvme.sh"
+echo "Unloading snvme modules (snvme -> snvme_core)..."
+modprobe -r snvme 2>/dev/null || rmmod snvme
+modprobe -r snvme_core 2>/dev/null || rmmod snvme_core
 
 echo "Completed NVMe layer unmount and driver reset."

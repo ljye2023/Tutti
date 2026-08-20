@@ -62,7 +62,7 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 
 - OS: Linux, kernel 6.8.x (`snvme-6.8.0-public`) or 5.15.x (`snvme-5.15.0-public`); a 5.4.241 (tlinux4) module lineage is also maintained
 - Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode. MUSA/MACA build profiles configure-checked only (no hardware validation yet)
-- Runtime: daemon-only — `tutti_daemon` bring-up creates `/dev/snvme*`; queue depth is fixed at module install (`io_queue_depth=1024` for production)
+- Runtime: daemon-only — `tutti_daemon` bring-up creates `/dev/snvme*`; queue depth always takes the controller maximum (NVMe CAP.MQES + 1)
 - Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp — one-shot setup via `scripts/prepare_env.sh`
 - All file I/O is opened with `O_DIRECT` (project policy)
 
@@ -100,7 +100,7 @@ does not change the daemon configuration compatibility policy.
 
 DataPath cache precedence remains programmatic override > DataPath spec
 config > test-only `TUTTI_*_CACHE_CAP` environment override > built-in default.
-Queue depth remains kernel-authoritative (`io_queue_depth` at module install).
+Queue depth remains kernel-authoritative (controller maximum, NVMe CAP.MQES + 1).
 
 The repository root is the only supported CMake entry. All component
 `CMakeLists.txt` files are reached from that target graph and are not
@@ -114,6 +114,7 @@ standalone project entries. Runtime is daemon-only.
 - [Backend SPI](doc/design/backend-spi.md) — the DataPath / Resolver / Binding semantic contracts
 - [GPU Porting Guide](doc/gpu-porting-guide.md) — the `cuda_like` three-layer framework, primitive semantic contracts, and Metax integration steps
 - [Kernel Portability](doc/design/kernel-portability.md) — the snvme module across kernel versions and GPU vendors
+- [snvme Design Rationale](doc/architecture/snvme-design-rationale.md) — why a custom NVMe driver is required (no mainline facility exposes user-owned NVMe queues; RDMA user-doorbell analogy)
 - [Extending Tutti](doc/extending_tutti.md) — adding resolvers, bindings, and data paths behind the SPI
 - [Build & SNVMe Testing](doc/build_and_test.md) — environment setup, build, module install, and the smoke-test ladder
 - [Contributing](CONTRIBUTING.md) — install, test, and contribution rules

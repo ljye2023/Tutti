@@ -309,6 +309,16 @@ private:
     // D2H the op's status array, aggregate into op.state/status/bytes.
     void aggregate_completion_status_(OpEntry& op);
 
+    // Stage one PRP-list page through the persistent pinned ring and
+    // enqueue its H2D copy on `stream` (a cudaStream_t, kept opaque to
+    // avoid a CUDA include here).  Returns false on CUDA failure.
+    // See prp_stage_host_ for why pageable per-submit staging was removed.
+    bool stage_prp_page_(const nvm_dma_t* dma,
+                         std::uint32_t start_page,
+                         std::uint32_t pages_in_io,
+                         void* devptr,
+                         void* stream);
+
     // ---- Members ----
     std::vector<DeviceDescriptor> device_descs_;
     std::vector<DeviceSlot> devices_;
@@ -332,6 +342,20 @@ private:
 
     // Round 16 S5: per-device PRP page cache (one per controller).
     std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpPageCache>> prp_caches_;
+
+    // Pinned host staging ring for PRP-list page H2D fills (submit path).
+    // A pageable source degenerates cudaMemcpyAsync into a staged copy that
+    // blocks the host ~150us per page (a 64-page cold build measured ~9.4ms,
+    // which showed up entirely as first-write-batch latency).  A persistent
+    // pinned slot brings each fill down to a ~1-2us enqueue.  Per-slot wrap
+    // events make ring reuse safe across streams: before a slot is refilled,
+    // its previous copy's event is synchronized.
+    static constexpr std::uint32_t kPrpStageSlots = 256;
+    void* prp_stage_host_ = nullptr;          // cudaHostAlloc'd, kPrpStageSlots pages
+    std::vector<void*> prp_stage_events_;     // cudaEvent_t per slot (opaque)
+    std::uint32_t prp_stage_pos_ = 0;         // next slot to fill
+    std::uint64_t prp_stage_total_ = 0;       // lifetime staged pages (wrap detection)
+    std::uint64_t prp_stage_page_size_ = 0;   // cached devices_[0].page_size
 
     std::uint64_t next_target_ = 1;
     std::uint64_t next_memory_ = 1;

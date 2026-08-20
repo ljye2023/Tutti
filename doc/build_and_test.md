@@ -186,7 +186,7 @@ snvme                 217088  0
 snvme_core            106496  1 snvme
 ```
 
-To unload / reload, use `make rmmod` or the `scripts/reset_snvme.sh` helper (see [Part 2 Step 2](#step-2--rebuild--reload-the-module-only-after-editing-driver-code)).
+To unload, use `make rmmod`. To reload, use `make insmod` (or your site's signed-module install flow).
 
 ## 1.4 Build the test code
 
@@ -241,17 +241,18 @@ cd build/cuda-module/module && make
 
 > ⚠️ **Hard rule: after any driver change you must reload the `.ko`.** The smoke binaries embed `_IOC_SIZE`-derived ioctl numbers; a stale module returns `-ENOTTY` on valid requests.
 
-Recommended: use the project script (fail-fast — it unbinds first, checks for fd holders, then rmmod/insmod):
+Before rmmod, unbind all snvme-owned controllers and stop any process holding `/dev/snvm*` fds (or mounted `/dev/snvme*n*` filesystems), otherwise the module stays referenced:
 
 ```bash
-sudo bash scripts/reset_snvme.sh            # unbind + rmmod + insmod
-# rmmod only, no reload:           scripts/reset_snvme.sh --no-insmod
-# SIGKILL processes holding /dev/snvm*: scripts/reset_snvme.sh --force-cleanup
+sudo bash scripts/unbind.sh          # unbind all snvme controllers (idempotent)
+lsof /dev/snvm_control /dev/ssnvme* /dev/snvme*n* 2>/dev/null   # should print nothing
+cmake --build --preset cuda-module --target rmmod     # sudo rmmod snvme snvme_core
+cmake --build --preset cuda-module --target insmod    # reload
 ```
 
-> **`io_queue_depth`（生产必读）**：内核内置默认 64 是防呆值；**生产/性能测试必须用 1024**。`make insmod` 已默认携带 `io_queue_depth=1024`（可用 `make insmod IO_QDEPTH=64` 覆盖）。手动加载：
-> `sudo insmod snvme-core.ko && sudo insmod snvme.ko io_queue_depth=1024`。
-> 该参数在 probe 时定型（`q_depth = min(MQES+1, io_queue_depth)`），sysfs 写对已加载设备**无效**，必须 rmmod+insmod 才生效。验证：`cat /sys/module/snvme/parameters/io_queue_depth`。64 深度下 4 盘 striped 大 batch 会因 SQ 槽位不足出现 wait 超时。
+> **Queue depth**: there is no `io_queue_depth` module parameter — snvme always
+> takes the controller maximum (`q_depth = NVMe CAP.MQES + 1`, typically 1024 on
+> datacenter SSDs). It is fixed at probe time; changing it requires rmmod+insmod.
 
 ---
 
@@ -387,6 +388,6 @@ sudo ./snvme_ubind $TGT
 echo $TGT | sudo tee /sys/bus/pci/drivers/nvme/bind 2>/dev/null
 ```
 
-A full reset (unbind all snvme controllers + reload the module) is also available via `scripts/reset_snvme.sh`.
+A full reset is `scripts/unbind.sh` + `make rmmod` + `make insmod` (see Step 2).
 
 ---

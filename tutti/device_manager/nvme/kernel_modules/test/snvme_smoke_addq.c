@@ -368,8 +368,8 @@ int main(int argc, char** argv) {
             "%zu pages; the snvme NVM_MAP_HOST_MEMORY -> "
             "adapter_alloc_sq_user path only uses addrs[0], so a "
             "multi-page ring would not be physically contiguous from "
-            "the controller's POV.  Lower io_queue_depth at insmod time "
-            "(or extend snvme to chain PRP).",
+            "the controller's POV.  This controller's MQES is too deep "
+            "for the single-PRP ring path (extend snvme to chain PRP).",
             info.q_depth, sq_bytes, sq_pages);
     if (cq_pages > 1)
         step_fail(0,
