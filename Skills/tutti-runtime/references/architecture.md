@@ -37,7 +37,8 @@ tutti/integration/vllm/connector.py  (dual-role shell, same class)
   `completion.py` (handles), `transfer.py` (direct vs staged), `staging.py`,
   `metadata.py` (scheduler-side index).
 - `tutti/storage/` — `base.py` defines the `KVStore` SPI; `tutti_nvme/` is the
-  native backend (object pool, layout, striped layout, runtime factory).
+  native backend (`store.py`, `object_layout.py` over the C++ object store,
+  runtime factory).
 - `tutti/integration/vllm/` — `connector.py` (entry point registered with vLLM),
   `worker.py` (per-layer orchestration), `worker_meta.py` (worker→scheduler
   increments), `geometry.py` (derive KV geometry from vLLM config),
@@ -85,30 +86,40 @@ Consequences worth internalising:
 - `pending` entries carry an epoch and are reclaimed after a few steps, so a
   worker that never reports back cannot leak capacity reservations.
 
-## KV Layouts
+## KV Layout: Fixed Segment Files
 
-- **`file_per_chunk`** — one file per chunk. Simple; one device per rank.
-- **`striped`** — a chunk's layer segments are distributed across N devices with
-  `stripe_unit` granularity. Placement is per tensor/chunk so a single IO is
-  never fragmented; splitting inside a tensor happens only at the MDTS layer
-  (contiguous LBAs on one device). Fine-grained striping *within* a tensor is a
-  known anti-pattern that collapses bandwidth.
+There is exactly one on-disk layout. A chunk occupies one **slot**; slot numbers
+rotate over the rank's mounts (`device = slot % N`), and each device packs
+`segment_file_slots` (default 2048) of its slots into one segment file
+`<mount>/r<rank>/segments/<id>.seg`. A slot is a contiguous region: a 32 KiB
+prefix holding the object header, then every layer's segment. One chunk's IO
+therefore never spans disks; a long prompt spreads over all disks because its
+consecutive chunks rotate.
 
-## Object Pool
+- The 32 KiB prefix is not cosmetic: it makes every payload start 16 KiB-aligned.
+  With a 4 KiB prefix the same reads ran ~20% slower (the SSD's internal
+  parallelism follows the LBA pattern; see `doc/design/kv-storage-layout-and-io-submission.md`).
+- The geometry (slots per file, prefix) is part of the namespace fingerprint:
+  changing it means a new pool, and opening old media fails closed.
+- Segment files live under the mounts, not under `kv_root`; `kv_root` holds the
+  checkpoint and residency bitmaps. A new `kv_root` gives a fresh index and the
+  existing segment files are adopted (their old contents are unreachable).
 
-Slots (files) are pre-created at start-up with real zero-filled extents, then
-allocated purely in memory at run time. Two properties matter:
+## Precreation: File Groups, Never on the Write Path
 
-- **Slot paths are stable** across recycle/reallocate for `file_per_chunk`, so
-  the C++ handle cache (keyed on the extent signature: controller PCI address,
-  namespace id, file size, LBA extents) stays warm. `striped` must rename shard
-  files because their names derive from the chunk URI.
-- **The manifest arbitrates ownership** on restart; a directory scan cannot,
-  because allocated files and free slots share the same directory once paths are
-  stable.
+Segment files are zero-filled for real (the resolver rejects unwritten extents)
+and verified by FIEMAP, then marked ready with a `.ready` record. The unit is a
+**file group** — one file per device. `open()` adopts the groups already ready on
+media and, on a cold pool, builds the first group synchronously (~1 min for HY3
+TP8), so the service accepts writes as soon as it is up. Later groups are built
+by one background thread once the last group is half used. The write path never
+creates files: a reservation beyond the published groups is rejected without
+blocking, exactly like capacity exhaustion, and the caller trims its batch.
 
-Eviction lives in the index (a semantic decision), not in the pool (which only
-knows slot numbers).
+The C++ handle cache is keyed on the extent signature (controller PCI address,
+namespace id, file size, LBA extents), and tickets are per segment file, so
+recycling a slot never invalidates a ticket. Eviction lives in the index (a
+semantic decision), not in the object store (which only knows slot numbers).
 
 ## Registration Is Lazy — and Warmed Up Deliberately
 

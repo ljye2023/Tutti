@@ -131,11 +131,6 @@ Result<CreatedDataPath> create_local_nvme(
 
     const auto& slice = view->slices.front();
     const auto& config = tuning(spec);
-    // threads_per_block > granted queues is allowed: the fused submit
-    // kernel maps threads onto queues round-robin (see
-    // QueueAcquireHelper::acquire_queue), and nvm_parallel_queue supports
-    // multiple concurrent submitters per queue.  The data path itself
-    // emits a warning in that case.
     auto max_batch_entries = checked_u32(
         config.max_batch_entries, "max_batch_entries");
     if (!max_batch_entries.ok()) {
@@ -158,8 +153,7 @@ Result<CreatedDataPath> create_local_nvme(
         config.max_batch_entries,
         0,
         config.handle_cache_l2_capacity,
-        slice.pci_bdf,
-        config.threads_per_block);
+        slice.pci_bdf);
     result.initialize_config = DataPathConfig{"local_nvme"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }
@@ -204,8 +198,6 @@ Result<CreatedDataPath> create_striped_local_nvme(
     std::uint64_t effective_mdts = 0;
     for (std::size_t index = 0; index < view->slices.size(); ++index) {
         const auto& slice = view->slices[index];
-        // threads_per_block > granted queues is allowed (round-robin
-        // sharing; the data path warns) — see the local-nvme branch above.
         striped_local_nvme::DeviceDescriptor descriptor;
         descriptor.snvme_dev_path = slice.chrdev_path;
         descriptor.namespace_id = slice.namespace_id;
@@ -227,8 +219,7 @@ Result<CreatedDataPath> create_striped_local_nvme(
         0,
         max_batch_entries.value(),
         max_in_flight.value(),
-        config.prp_cache_capacity,
-        config.threads_per_block);
+        config.prp_cache_capacity);
     result.initialize_config = DataPathConfig{"striped-local-nvme"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }

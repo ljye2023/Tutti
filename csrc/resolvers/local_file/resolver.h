@@ -499,7 +499,19 @@ private:
                 out.logical_offset = ex.fe_logical;
                 out.device_offset  = device_offset;
                 out.length         = ex.fe_length;
-                out_extents.push_back(out);
+                // FIEMAP can split a physically contiguous run into 128 MiB
+                // records. Coalesce only when both address spaces are exactly
+                // adjacent; the safety flag and alignment checks above still
+                // apply independently to every original record.
+                if (!out_extents.empty() &&
+                    out_extents.back().logical_offset + out_extents.back().length ==
+                        out.logical_offset &&
+                    out_extents.back().device_offset + out_extents.back().length ==
+                        out.device_offset) {
+                    out_extents.back().length += out.length;
+                } else {
+                    out_extents.push_back(out);
+                }
 
                 // Total extent cap.
                 if (out_extents.size() > kMaxTotalExtents) {

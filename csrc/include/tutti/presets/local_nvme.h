@@ -53,7 +53,6 @@ struct LocalNvmePreset {
     // Capacity knobs (0 = use defaults)
     std::uint32_t max_batch_entries = 4096;
     std::uint32_t max_in_flight_operations = 4;
-    std::uint32_t threads_per_block = 16;
     std::uint32_t handle_cache_capacity = 4096;
     std::uint32_t prp_cache_capacity = 4096;
 };
@@ -61,7 +60,7 @@ struct LocalNvmePreset {
 // Configuration for multi-device mode: N NVMe devices, ONE fused DataPath.
 //
 // Placement model (2026-09-22): an object is ONE file on ONE device; the
-// slot number rotates files across devices (RotatingFilePlacement), and
+// slot number rotates over devices (FixedSegmentFilePlacement), and
 // parallelism across the N devices comes from the many chunks of a long
 // prompt arriving together in one submit -- never from splitting a single
 // IO. The DataPath matches each target's file to its device by the
@@ -81,7 +80,6 @@ struct StripedNvmePreset {
     // 仍超上限的批由上层按上限切成多次 submit（见 store._submit_retry）。
     std::uint32_t max_batch_entries = 16384;
     std::uint32_t max_in_flight_operations = 4;
-    std::uint32_t threads_per_block = 16;
     std::uint32_t prp_cache_capacity = 4096;
 };
 

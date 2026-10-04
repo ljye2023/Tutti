@@ -207,8 +207,6 @@ class TestLocalRankPlaceholder:
                 "num_layers": 3,
                 "store": {"type": "tutti_nvme", "options": {
                     "root": "/mnt/nvme0/pool-rank{LOCAL_RANK}",
-                    "layout": "striped",
-                    "stripe_unit": 4096,
                     "preset": {
                         "type": "striped",
                         "device_groups": [[0, 1], [2, 3]],

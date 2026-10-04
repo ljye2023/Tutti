@@ -112,13 +112,13 @@ def test_layer_span_predisposes_full_size(tmp_path):
 
     chunk = b"\x42" * 16
     layout = ObjectLayout(
-        tmp_path, segment_bytes=SEG, capacity_chunks=8, prewarm_chunks=1,
-        namespace=b"layer-span",
+        tmp_path, segment_bytes=SEG, capacity_chunks=8, namespace=b"layer-span",
+        segment_file_slots=2,
     )
     layout.set_layer_span(80)
     layout.prepare_put([derive_io_key(chunk, 0)], capacity_chunks=8)
     uri = layout.target_uri(chunk)
     path = Path(uri[len("file://"):])
-    assert path.stat().st_size == 4096 + 80 * SEG  # 首写即全尺寸
+    assert path.stat().st_size == 2 * (32 * 1024 + 80 * SEG)  # 段文件整体定型
     assert layout.target_size(chunk) == 80 * SEG
     layout.close_object_pool()

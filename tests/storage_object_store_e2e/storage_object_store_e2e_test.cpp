@@ -20,7 +20,6 @@
 
 #include "csrc/storage_objects/object_store_core.h"
 #include "csrc/storage_objects/slot_media.h"
-#include "csrc/storage_objects/slot_placement_policy.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -95,49 +94,57 @@ ObjectKey key_of(std::uint8_t tag, std::size_t len = 18) {
     return k;
 }
 
+// Every test fits in one segment file (8 slots) on one device.
+constexpr std::uint64_t kSlotsPerFile = 8;
+
 StoreConfig make_config(const std::string& root, std::uint64_t slots) {
     StoreConfig cfg;
     cfg.uri = root;
     cfg.capacity_bytes = slots * kSlotBytes;
     cfg.layout.segment_bytes = kSegmentBytes;
     cfg.layout.segment_count = kSegmentCount;
+    cfg.segment_file_slots = kSlotsPerFile;
+    cfg.segment_header_bytes = 4096;
+    StoreDevice device;
+    device.mount_path = root;
+    cfg.devices.push_back(std::move(device));
     cfg.namespace_fingerprint = {0xDE, 0xAD, 0xBE, 0xEF};
     cfg.background_reclaim = false;   // drained explicitly, for determinism
     return cfg;
 }
 
 std::unique_ptr<ObjectStoreCore> make_store(const std::string& root) {
-    return std::make_unique<ObjectStoreCore>(
-        std::make_unique<SingleFilePlacement>(root));
+    (void)root;   // placement is built at open() from the configured device
+    return std::make_unique<ObjectStoreCore>();
+}
+
+std::string segment_path(const std::string& root) {
+    return root + "/r0/segments/0.seg";
 }
 
 // Write recognisable bytes into an object's payload, the way a real caller would
 // via the DataPath -- here directly, since the stub target carries no extents.
 bool write_payload(const std::string& root, std::uint64_t slot,
                    std::uint8_t fill) {
-    SingleFilePlacement placement(root);
-    std::vector<std::string> paths;
-    if (!placement.paths_for_slot(slot, &paths).ok()) return false;
     AlignedBuffer buffer(kPayload);
     if (!buffer.valid()) return false;
     std::memset(buffer.data(), fill, kPayload);
-    const int fd = ::open(paths[0].c_str(), O_RDWR | O_DIRECT);
+    const int fd = ::open(segment_path(root).c_str(), O_RDWR | O_DIRECT);
     if (fd < 0) return false;
-    const ssize_t n = ::pwrite(fd, buffer.data(), kPayload, 4096);
+    const ssize_t n = ::pwrite(fd, buffer.data(), kPayload,
+                               static_cast<off_t>(slot * kSlotBytes + 4096));
     ::fsync(fd);
     ::close(fd);
     return n == static_cast<ssize_t>(kPayload);
 }
 
 std::uint8_t read_payload_byte(const std::string& root, std::uint64_t slot) {
-    SingleFilePlacement placement(root);
-    std::vector<std::string> paths;
-    if (!placement.paths_for_slot(slot, &paths).ok()) return 0;
     AlignedBuffer buffer(4096);
     if (!buffer.valid()) return 0;
-    const int fd = ::open(paths[0].c_str(), O_RDONLY | O_DIRECT);
+    const int fd = ::open(segment_path(root).c_str(), O_RDONLY | O_DIRECT);
     if (fd < 0) return 0;
-    const ssize_t n = ::pread(fd, buffer.data(), 4096, 4096);
+    const ssize_t n = ::pread(fd, buffer.data(), 4096,
+                              static_cast<off_t>(slot * kSlotBytes + 4096));
     ::close(fd);
     return n > 0 ? buffer.data()[0] : 0;
 }
@@ -162,7 +169,7 @@ void test_basic_cycle(const std::string& base) {
     // A URI in the format the local-file resolver parses, for the runtime to
     // open. The store itself never resolves it.
     CHECK(p.uri.rfind("file://", 0) == 0);
-    CHECK(p.uri == "file://" + root + "/slots/0.obj");
+    CHECK(p.uri == "file://" + segment_path(root));
     CHECK(p.slot == 0);
     // Segment 0 starts after the header, so payload IO is 4096-aligned.
     CHECK(p.offset == 4096);
@@ -320,16 +327,13 @@ void test_corrupted_header(const std::string& base) {
 
     // Corrupt slot 1's header in place, simulating a torn write.
     {
-        SingleFilePlacement placement(root);
-        std::vector<std::string> paths;
-        REQUIRE(placement.paths_for_slot(1, &paths).ok());
         AlignedBuffer buffer(4096);
         REQUIRE(buffer.valid());
-        const int fd = ::open(paths[0].c_str(), O_RDWR | O_DIRECT);
+        const int fd = ::open(segment_path(root).c_str(), O_RDWR | O_DIRECT);
         REQUIRE(fd >= 0);
-        REQUIRE(::pread(fd, buffer.data(), 4096, 0) == 4096);
+        REQUIRE(::pread(fd, buffer.data(), 4096, kSlotBytes) == 4096);
         buffer.data()[24] ^= 0xFF;   // payload_bytes field, CRC now wrong
-        REQUIRE(::pwrite(fd, buffer.data(), 4096, 0) == 4096);
+        REQUIRE(::pwrite(fd, buffer.data(), 4096, kSlotBytes) == 4096);
         ::fsync(fd);
         ::close(fd);
     }
@@ -465,15 +469,15 @@ void test_fingerprint(const std::string& base) {
     }
 
     {
-        // A different geometry against the same namespace. Recovery must not
-        // accept objects whose recorded size no longer matches.
+        // A different geometry against the same files is refused at open():
+        // the segment file was published for another slot size, and reusing
+        // it would silently corrupt the pool.
         auto store = make_store(root);
         StoreConfig cfg = make_config(root, 4);
         cfg.layout.segment_count = kSegmentCount * 2;
-        REQUIRE(store->open(cfg).ok());
-        CHECK(!store->contains(a));
-        CHECK(store->recovery_report().dropped_geometry >= 1);
-        CHECK(store->close().ok());
+        const Status s = store->open(cfg);
+        CHECK(!s.ok());
+        CHECK(s.code() == StatusCode::INVALID_ARGUMENT);
     }
 
     {
@@ -647,8 +651,10 @@ void test_read_only_view(const std::string& base) {
     // Opening a namespace that does not exist yet is a cold start, not a
     // failure: the scheduler's index must survive the very first run.
     const std::string empty = base + "/readonly_empty";
+    StoreConfig cold_ro = make_config(empty, 8);
+    cold_ro.read_only = true;
     auto cold = make_store(empty);
-    CHECK(cold->open(ro).ok());
+    CHECK(cold->open(cold_ro).ok());
     CHECK(cold->contains_prefix(keys, 2) == 0);
     CHECK(cold->recover().value().empty());
     CHECK(cold->close().ok());
@@ -673,14 +679,21 @@ void test_factory() {
     cfg.capacity_bytes = kSlotBytes * 2;
     cfg.layout.segment_bytes = kSegmentBytes;
     cfg.layout.segment_count = kSegmentCount;
+    cfg.segment_file_slots = kSlotsPerFile;
+    cfg.segment_header_bytes = 4096;
     const Status no_devices = store->open(cfg);
     CHECK(!no_devices.ok());
     CHECK(no_devices.code() == StatusCode::INVALID_ARGUMENT);
 
-    // Several devices are no longer contradictory: each slot lands on exactly
-    // one of them (see RotatingFilePlacement), so the only requirement a device
-    // list has is that every entry names a mount -- which the case above
-    // already covers.
+    // A segment file geometry is mandatory too.
+    auto second = std::move(create_storage_object_store("local_nvme_file")).value();
+    StoreDevice device;
+    device.mount_path = "/tmp/unused";
+    cfg.devices.push_back(device);
+    cfg.segment_file_slots = 0;
+    const Status no_geometry = second->open(cfg);
+    CHECK(!no_geometry.ok());
+    CHECK(no_geometry.code() == StatusCode::INVALID_ARGUMENT);
 }
 
 } // namespace

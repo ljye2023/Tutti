@@ -113,8 +113,7 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
                                  std::uint32_t cq_poll_budget,
                                  std::uint32_t max_batch_entries,
                                  std::uint32_t max_in_flight_operations,
-                                 std::uint32_t prp_cache_capacity,
-                                 std::uint32_t threads_per_block)
+                                 std::uint32_t prp_cache_capacity)
     : device_descs_(std::move(devices)),
       cuda_device_(cuda_device),
       mdts_override_(mdts_override),
@@ -122,7 +121,6 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
       max_batch_entries_(max_batch_entries == 0 ? 256 : max_batch_entries),
       max_in_flight_operations_(max_in_flight_operations == 0
                                  ? 16 : max_in_flight_operations),
-      threads_per_block_(threads_per_block),
       prp_cache_capacity_(prp_cache_capacity) {
 
     caps_.name = "striped-local-nvme";
@@ -312,23 +310,6 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     if (initialized_) {
         return Status(StatusCode::BUSY, "already initialized");
     }
-    if (threads_per_block_ == 0 || threads_per_block_ > 1024) {
-        return Status(StatusCode::INVALID_ARGUMENT,
-                      "threads_per_block must be in [1, 1024]");
-    }
-    cudaDeviceProp device_properties{};
-    const cudaError_t properties_error = cudaGetDeviceProperties(
-        &device_properties, static_cast<int>(cuda_device_));
-    if (properties_error != cudaSuccess) {
-        return Status(StatusCode::DEVICE_ERROR,
-                      std::string("cudaGetDeviceProperties failed: ") +
-                          cudaGetErrorString(properties_error));
-    }
-    if (threads_per_block_ >
-        static_cast<std::uint32_t>(device_properties.maxThreadsPerBlock)) {
-        return Status(StatusCode::INVALID_ARGUMENT,
-                      "threads_per_block exceeds device maximum");
-    }
     if (device_descs_.empty()) {
         return Status(StatusCode::INVALID_ARGUMENT, "no devices configured");
     }
@@ -416,22 +397,6 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
                          "queue group creation failed for device " +
                          std::to_string(i) + ": " + e.what());
         }
-        if (threads_per_block_ > slot.queue_group->n_qps()) {
-            // Round-robin sharing: QueueAcquireHelper::acquire_queue()
-            // maps threads onto queues with % num_queues, and the
-            // nvm_parallel_queue (atomic cid tickets, per-slot locks,
-            // atomic head/tail advance) supports multiple concurrent
-            // submitters per queue.  Warn instead of failing so a
-            // daemon-side quota clamp (e.g. max_per_client) doesn't
-            // kill the run.
-            std::fprintf(
-                stderr,
-                "[striped-local-nvme] warning: threads_per_block (%u) > "
-                "granted queues (%u) for device %u; threads will share "
-                "queues round-robin\n",
-                threads_per_block_, slot.queue_group->n_qps(), i);
-        }
-
         devices_.push_back(std::move(slot));
     }
 
@@ -583,12 +548,13 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
 
     // Worker-pool kernel model: DEFAULT.  A fixed pool of 2048 worker threads
     // pulls entries from a per-batch atomic cursor (see
-    // fused_submit_kernel.cuh for the model).  Equal throughput to the
-    // legacy one-thread-per-entry kernel, but 4-16x fewer GPU threads and
-    // ~2.4x shallower per-command device queueing.  Env TUTTI_POOL_WORKERS
-    // overrides: 0 selects the legacy kernel, N>0 selects N workers.
+    // fused_submit_kernel.cuh for the model).  256 workers (8 one-warp
+    // blocks) drive 4 drives at ~12 GiB/s from one GPU -- the same as 2048
+    // workers -- with 16x fewer blocks.  Env
+    // TUTTI_POOL_WORKERS overrides: 0 selects the legacy kernel, N>0 selects
+    // N workers.
     {
-        long pool_val = 2048;
+        long pool_val = 256;
         if (const char* pool_env = std::getenv("TUTTI_POOL_WORKERS")) {
             pool_val = std::atol(pool_env);
         }
@@ -643,6 +609,19 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     bool any_timeout = timeout_prp_retained_;
     for (const auto& [tok, op] : ops_) {
         if (op.has_timeout) { any_timeout = true; break; }
+    }
+    if (io_timing_enabled_ && timing_acc_entries_ != 0) {
+        const double e = static_cast<double>(timing_acc_entries_);
+        std::fprintf(stderr,
+                     "[striped-io-timing-final] %llu batches / %llu entries | "
+                     "setup avg=%.2fus max=%.2fus | exec avg=%.2fus max=%.2fus | "
+                     "reclaim avg=%.2fus max=%.2fus | lifetime avg=%.2fus max=%.2fus\n",
+                     static_cast<unsigned long long>(timing_acc_batches_),
+                     static_cast<unsigned long long>(timing_acc_entries_),
+                     timing_acc_ns_[0] / e / 1000.0, timing_max_ns_[0] / 1000.0,
+                     timing_acc_ns_[1] / e / 1000.0, timing_max_ns_[1] / 1000.0,
+                     timing_acc_ns_[2] / e / 1000.0, timing_max_ns_[2] / 1000.0,
+                     timing_acc_ns_[3] / e / 1000.0, timing_max_ns_[3] / 1000.0);
     }
     arena_.shutdown();
     for (auto& pc : prp_caches_) if (pc) pc->shutdown(any_timeout);
@@ -1663,16 +1642,11 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
 
-    // Match local: pending must be fail-closed if an entry never executes.
-    ce = cudaMemsetAsync(d_status, 0xFF,
-                        total_entries * sizeof(EntryCompletionStatus),
-                        ctx.stream);
-    if (ce != cudaSuccess) {
-        release_cache_refs();
-        arena_.release(lease.slot_index);
-        reject_all(StatusCode::DEVICE_ERROR, "cudaMemset d_status failed");
-        return outcome;
-    }
+    // No pending-sentinel memset on d_status: the kernel writes every entry's
+    // status on every path (each index is claimed exactly once; dev_idx and
+    // all submit_*_one exits write it). A kernel that dies mid-way fails the
+    // whole launch through the CUDA error on its completion event. The memset
+    // was itself a kernel and waited for a free SM before the IO kernel could.
 
     const NvtxIoStyle nvtx_style = nvtx_io_style(requests, count);
     nvtx_push_io(nvtx_style);
@@ -1682,7 +1656,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     cudaError_t launch_err = launch_fused_submit(
         d_entries, d_status,
         reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
-        total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
+        total_entries, total_dev_table, cq_poll_budget_,
         0,
         (io_timing_enabled_ && total_entries <= timing_capacity_entries_)
             ? d_timing_ : nullptr,

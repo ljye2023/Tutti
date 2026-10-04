@@ -23,26 +23,23 @@ no `csrc/include/tutti/**` or Runtime source file was modified.
 
 If you find you must change a core file, stop and record it as a gap.
 
-## A second example: striped (multi-device, fused-kernel submission)
+## A second example: multi-device NVMe (fused-kernel submission)
 
-`csrc/data_paths/striped_local_nvme/` (+ `csrc/resolvers/striped_file/` +
-`csrc/payloads/striped_local_nvme/`) is a second, more advanced community
-extension: it fans a single logical `striped://name?devs=<m1,m2,...>&unit=<bytes>`
-target out across N local NVMe devices with unit-granularity round-robin
-striping, submitted through exactly **one** `cudaLaunchKernel` per
-`rt.submit()` call (a device table of N `DeviceTargetHandle*` lets one fused
-kernel dispatch entries to whichever device each stripe unit landed on).
-Like memfs, it was added with **zero core changes** — callers see a plain
-`TargetHandle` from `rt.open("striped://...")` and never reference a
-`Striped*` type; see `tests/striped_local_nvme_contract/` (tests 87/90) for
-the "zero striped-awareness at the call site" proof and the fault/partial-
-commit contract. It shares the `nvme_submit_primitives.cuh` device-side
-primitives with `csrc/data_paths/local_nvme/` (extracted once, unchanged)
-rather than reimplementing `resolve_lba`/doorbell/CQ-poll logic. See the
-package's own header comments (`striped_data_path.h`,
-`resolvers/striped_file/resolver.h`,
-`payloads/striped_local_nvme/payload.h`)
-for the full design.
+`csrc/data_paths/striped_local_nvme/` (with
+`csrc/resolvers/local_file/multi_mount_resolver.{h,cpp}`) is a second, more
+advanced extension. Targets are ordinary `file://` paths; each file lives on
+exactly one of N local NVMe devices, and the resolver picks the device by the
+longest matching mount prefix. There is no striping: a single IO never spans
+disks, and multi-disk bandwidth comes from many files in one batch landing on
+different disks. One `rt.submit()` is exactly **one** `cudaLaunchKernel`: a
+device table with one `DeviceTargetHandle*` row per opened target lets the
+fused kernel dispatch each entry to its device. Like memfs, it was added with
+**zero core changes** — callers see a plain `TargetHandle` and never reference
+a `Striped*` type; see `tests/striped_local_nvme_contract/` for the fault and
+partial-commit contract. It shares the `nvme_submit_primitives.cuh` device-side
+primitives with `csrc/data_paths/local_nvme/` rather than reimplementing
+`resolve_lba`/doorbell/CQ-poll logic. See `striped_data_path.h` and
+`multi_mount_resolver.h` for the full design.
 
 ## Step-by-step (memfs example)
 

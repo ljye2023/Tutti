@@ -712,7 +712,7 @@ public:
     // submit().
     //
     // Mixed schemes work: each URI is routed by its scheme (file://,
-    // striped://, ...), so a batch may span multiple resolvers and
+    // memfs://, ...), so a batch may span multiple resolvers and
     // DataPaths.  Handle-cache dedup (when cache is ON) happens inside
     // data_path->open() as usual; concurrent opens of the same extent
     // signature are serialized by datapath_open_mutex_ so the cache's

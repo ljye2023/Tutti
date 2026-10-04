@@ -59,37 +59,29 @@ private:
 };
 
 // -------------------------------------------------------------------------
-// materialise_slot
+// Segment files
 //
-// Creates each shard file at exactly `bytes_per_shard` and writes REAL ZEROS
-// over the whole extent, then fsyncs the file and its directory.
-//
-// Real zeros, not fallocate or a sparse hole: the resolver maps a file to
-// physical extents via FIEMAP and fail-closed rejects UNWRITTEN and DELALLOC
-// extents, because DMA cannot target blocks the filesystem has not actually
-// allocated. This is the single reason materialisation costs real time --
-// measured at roughly 225 MB/s per rank, so a terabyte of prewarm is an hour,
-// not a moment. Callers must treat it as such.
-//
-// Idempotent: a file already at the right size with allocated extents is left
-// alone, so restarting into an existing pool does not rewrite it.
-Status materialise_slot(const std::vector<std::string>& paths,
-                        std::uint64_t bytes_per_shard);
+// materialise_segment_file creates `path` at exactly `file_bytes` and writes
+// REAL ZEROS over it, fsyncs, verifies FIEMAP (no holes/unwritten extents, at
+// most 124 extents -- the resolver's limit) and then publishes `<path>.ready`
+// (file_bytes, st_dev, st_ino). Real zeros, not fallocate: the resolver
+// fail-closed rejects UNWRITTEN extents because DMA cannot target them.
+// Creation is serialised per mount (flock on <mount>/.tutti_segment_precreate.lock):
+// concurrent large allocations on ext4 fragment far beyond the extent limit.
+// Idempotent: a ready file is left alone.
+Status materialise_segment_file(const std::string& path, std::uint64_t file_bytes);
 
-// Probe only: whether every shard already occupies `bytes_per_shard` on media.
-// Creates nothing -- unlike materialise_slot this does not even O_CREAT, so it
-// can be used to prove that a slot is reusable without touching the media.
-// A missing shard is (*out = false), not an error: the caller leaves the slot
-// to the grower. Real IO errors are reported, so an unreadable pool fails
-// loudly instead of looking like an empty one.
-Status slot_is_precreated(const std::vector<std::string>& paths,
-                            std::uint64_t bytes_per_shard, bool* out);
+// Probe only (never creates): *out = true iff `path` is `file_bytes` long and
+// its ready marker matches. A missing file is (*out = false), not an error.
+Status segment_file_is_ready(const std::string& path, std::uint64_t file_bytes,
+                             bool* out);
 
-// Rewrite zeros over a slot's payload region, for reclamation. Does NOT resize.
-// The header region is zeroed too, which is what actually invalidates the
-// object: a zero magic decodes as "never written" rather than as corruption.
-Status zero_slot(const std::vector<std::string>& paths,
-                 std::uint64_t bytes_per_shard);
+// Rewrite zeros over [offset, offset + bytes) of an existing file, for
+// reclamation. Zeroing the header is what invalidates the object: a zero magic
+// decodes as "never written" rather than as corruption.
+Status zero_file_range(const std::string& path,
+                       std::uint64_t offset,
+                       std::uint64_t bytes);
 
 // -------------------------------------------------------------------------
 // Header IO

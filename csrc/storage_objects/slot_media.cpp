@@ -3,13 +3,19 @@
 #include "csrc/storage_objects/slot_media.h"
 
 #include <fcntl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <sys/file.h>
+#include <sys/statvfs.h>
 #include <utility>
 
 namespace tutti::storage_objects {
@@ -95,6 +101,113 @@ std::string parent_of(const std::string& path) {
     return path.substr(0, slash);
 }
 
+Status filesystem_lock_root(const std::string& path, std::string* root) {
+    std::string dir = parent_of(path);
+    struct stat current{};
+    if (::stat(dir.c_str(), &current) != 0)
+        return errno_status("stat segment directory", dir);
+    while (dir != "/") {
+        const std::string parent = parent_of(dir);
+        struct stat above{};
+        if (::stat(parent.c_str(), &above) != 0)
+            return errno_status("stat segment parent", parent);
+        if (above.st_dev != current.st_dev) break;
+        dir = parent;
+        current = above;
+    }
+    *root = dir;
+    return {};
+}
+
+struct SegmentReadyRecord {
+    std::uint64_t file_bytes;
+    std::uint64_t device;
+    std::uint64_t inode;
+};
+
+// The ready record of this very inode, if one was published.
+bool read_ready_record(const std::string& path, const struct stat& data_stat,
+                       SegmentReadyRecord* out) {
+    const std::string marker = path + ".ready";
+    const Fd fd(::open(marker.c_str(), O_RDONLY | O_CLOEXEC));
+    if (!fd.valid()) return false;
+    return ::read(fd.get(), out, sizeof(*out)) ==
+               static_cast<ssize_t>(sizeof(*out)) &&
+           out->device == static_cast<std::uint64_t>(data_stat.st_dev) &&
+           out->inode == static_cast<std::uint64_t>(data_stat.st_ino);
+}
+
+bool segment_ready(const std::string& path, const struct stat& data_stat,
+                   std::uint64_t file_bytes) {
+    SegmentReadyRecord recorded{};
+    return read_ready_record(path, data_stat, &recorded) &&
+           recorded.file_bytes == file_bytes;
+}
+
+Status publish_segment_ready(const std::string& path, const struct stat& data_stat,
+                             std::uint64_t file_bytes) {
+    const std::string pending = path + ".ready.pending";
+    const std::string marker = path + ".ready";
+    const Fd fd(::open(pending.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+                       0644));
+    if (!fd.valid()) return errno_status("open segment ready marker", pending);
+    const SegmentReadyRecord recorded{
+        file_bytes, static_cast<std::uint64_t>(data_stat.st_dev),
+        static_cast<std::uint64_t>(data_stat.st_ino)};
+    if (::write(fd.get(), &recorded, sizeof(recorded)) !=
+        static_cast<ssize_t>(sizeof(recorded))) {
+        return errno_status("write segment ready marker", pending);
+    }
+    if (::fsync(fd.get()) != 0) return errno_status("fsync segment ready marker", pending);
+    if (::rename(pending.c_str(), marker.c_str()) != 0) {
+        return errno_status("publish segment ready marker", marker);
+    }
+    return sync_directory(parent_of(path));
+}
+
+Status verify_segment_extents(int fd, const std::string& path,
+                              std::uint64_t file_bytes) {
+    constexpr std::size_t kBatch = 256;
+    constexpr std::size_t kMaxExtents = 124;
+    std::vector<std::uint8_t> bytes(sizeof(fiemap) + kBatch * sizeof(fiemap_extent));
+    auto* map = reinterpret_cast<fiemap*>(bytes.data());
+    std::uint64_t cursor = 0;
+    std::uint64_t physical_end = 0;
+    std::size_t extents = 0;
+    while (cursor < file_bytes) {
+        std::memset(bytes.data(), 0, bytes.size());
+        map->fm_start = cursor;
+        map->fm_length = file_bytes - cursor;
+        map->fm_flags = FIEMAP_FLAG_SYNC;
+        map->fm_extent_count = kBatch;
+        if (::ioctl(fd, FS_IOC_FIEMAP, map) != 0)
+            return errno_status("fiemap segment file", path);
+        if (map->fm_mapped_extents == 0)
+            return Status(StatusCode::DATA_LOSS, "segment file has a hole: " + path);
+        for (std::uint32_t i = 0; i < map->fm_mapped_extents; ++i) {
+            const fiemap_extent& e = map->fm_extents[i];
+            constexpr std::uint32_t bad = FIEMAP_EXTENT_UNKNOWN |
+                FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNWRITTEN |
+                FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_SHARED |
+                FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_ENCRYPTED |
+                FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_DATA_TAIL;
+            if ((e.fe_flags & bad) || e.fe_logical != cursor ||
+                e.fe_length == 0 || e.fe_length > file_bytes - cursor ||
+                !is_aligned(e.fe_physical) || !is_aligned(e.fe_length) ||
+                e.fe_physical > UINT64_MAX - e.fe_length)
+                return Status(StatusCode::DATA_LOSS,
+                              "segment file has unsafe or missing extents: " + path);
+            if (extents == 0 || e.fe_physical != physical_end) ++extents;
+            if (extents > kMaxExtents)
+                return Status(StatusCode::RESOURCE_EXHAUSTED,
+                              "segment file exceeds resolver extent limit: " + path);
+            cursor += e.fe_length;
+            physical_end = e.fe_physical + e.fe_length;
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 // -------------------------------------------------------------------------
@@ -176,94 +289,111 @@ Status sync_directory(const std::string& path) {
 // Materialisation
 // -------------------------------------------------------------------------
 
-Status materialise_slot(const std::vector<std::string>& paths,
-                        std::uint64_t bytes_per_shard) {
-    if (paths.empty()) {
-        return Status(StatusCode::INVALID_ARGUMENT, "no shard paths");
-    }
-    if (bytes_per_shard == 0 || !is_aligned(bytes_per_shard)) {
+Status materialise_segment_file(const std::string& path, std::uint64_t file_bytes) {
+    if (file_bytes == 0 || !is_aligned(file_bytes)) {
         return Status(StatusCode::INVALID_ARGUMENT,
-                      "shard size must be nonzero and 4096-aligned");
+                      "segment file size must be nonzero and 4096-aligned");
     }
-
-    for (const std::string& path : paths) {
-        const std::string dir = parent_of(path);
-        const Status dir_status = ensure_directory(dir);
-        if (!dir_status.ok()) return dir_status;
-
-        const Fd fd(::open(path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644));
-        if (!fd.valid()) return errno_status("open slot for materialise", path);
-
-        struct stat st{};
-        if (::fstat(fd.get(), &st) != 0) {
-            return errno_status("fstat slot", path);
-        }
-
-        // Idempotent: an existing file already at the right size is assumed
-        // materialised. Rewriting it on every restart would make bringing up an
-        // existing terabyte pool as expensive as creating it.
-        if (static_cast<std::uint64_t>(st.st_size) == bytes_per_shard) {
-            continue;
-        }
-
-        if (::ftruncate(fd.get(), static_cast<off_t>(bytes_per_shard)) != 0) {
-            return errno_status("ftruncate slot", path);
-        }
-        // ftruncate only sets the size; the extents are still holes. Writing
-        // real zeros is what allocates them, which FIEMAP-based resolution
-        // requires.
-        const Status zeroed = write_zeros(fd.get(), path, 0, bytes_per_shard);
-        if (!zeroed.ok()) return zeroed;
-        if (::fsync(fd.get()) != 0) return errno_status("fsync slot", path);
-
-        // The file's own fsync does not make its directory entry durable.
-        const Status dir_synced = sync_directory(dir);
-        if (!dir_synced.ok()) return dir_synced;
+    const std::string parent = parent_of(path);
+    const Status dir = ensure_directory(parent);
+    if (!dir.ok()) return dir;
+    // Coordinate all ranks under the same mount, not only workers sharing one
+    // file. Concurrent 20 GiB allocations on ext4 fragmented into >2000
+    // extents on this deployment, far beyond the resolver's 124-extent cap.
+    std::string mount;
+    const Status located = filesystem_lock_root(path, &mount);
+    if (!located.ok()) return located;
+    const std::string lock_path = mount + "/.tutti_segment_precreate.lock";
+    const Fd disk_lock(::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644));
+    if (!disk_lock.valid()) return errno_status("open segment disk lock", lock_path);
+    if (::flock(disk_lock.get(), LOCK_EX) != 0)
+        return errno_status("lock segment disk", lock_path);
+    const Fd fd(::open(path.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644));
+    if (!fd.valid()) return errno_status("open segment file", path);
+    // A second precreate worker must not observe a partially zero-filled file
+    // as complete merely because ftruncate already set its final size.
+    if (::flock(fd.get(), LOCK_EX) != 0) return errno_status("lock segment file", path);
+    struct stat st{};
+    if (::fstat(fd.get(), &st) != 0) return errno_status("fstat segment file", path);
+    const std::uint64_t old_size = static_cast<std::uint64_t>(st.st_size);
+    if (old_size > file_bytes) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "segment file exceeds configured size: " + path);
     }
-    return {};
+    SegmentReadyRecord recorded{};
+    if (read_ready_record(path, st, &recorded)) {
+        if (recorded.file_bytes == file_bytes && old_size == file_bytes) return {};
+        // A published file of another size belongs to a different geometry.
+        // Extending it would silently corrupt that pool; refuse instead.
+        if (recorded.file_bytes != file_bytes) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "segment file was built for another geometry: " + path);
+        }
+    }
+    if (old_size < file_bytes) {
+        struct statvfs fs{};
+        if (::fstatvfs(fd.get(), &fs) != 0) {
+            return errno_status("statvfs segment file", path);
+        }
+        const std::uint64_t free_bytes =
+            static_cast<std::uint64_t>(fs.f_bavail) * fs.f_frsize;
+        const std::uint64_t remaining = file_bytes - old_size;
+        // A shared file costs its full size at the first slot, so the hard
+        // check must cover the whole extension rather than one slot. Avoid a
+        // mount-capacity-derived reserve here: deployments may intentionally
+        // use a mostly-full volume, and the caller already controls the
+        // configured capacity. The kernel's available-block check remains the
+        // non-negotiable guard against overshooting the filesystem.
+        if (free_bytes < remaining) {
+            return Status(StatusCode::RESOURCE_EXHAUSTED,
+                          "insufficient free space to materialise segment file: " + path);
+        }
+        // FIEMAP-backed DMA rejects unwritten/hole extents. Materialise the
+        // newly appended range, not just the requested slot, so one shared
+        // file is valid for every slot as soon as it is exposed to resolver.
+        const Status extended = write_zeros(fd.get(), path, old_size,
+                                            file_bytes - old_size);
+        if (!extended.ok()) return extended;
+    }
+    if (::fsync(fd.get()) != 0) return errno_status("fsync segment file", path);
+    const Status verified = verify_segment_extents(fd.get(), path, file_bytes);
+    if (!verified.ok()) return verified;
+    return publish_segment_ready(path, st, file_bytes);
 }
 
-Status slot_is_precreated(const std::vector<std::string>& paths,
-                            std::uint64_t bytes_per_shard, bool* out) {
-    if (out == nullptr) {
-        return Status(StatusCode::INVALID_ARGUMENT, "no output flag");
-    }
+Status segment_file_is_ready(const std::string& path, std::uint64_t file_bytes,
+                             bool* out) {
+    if (out == nullptr) return Status(StatusCode::INVALID_ARGUMENT, "out must not be null");
     *out = false;
-    if (paths.empty()) {
-        return Status(StatusCode::INVALID_ARGUMENT, "no shard paths");
+    if (file_bytes == 0 || !is_aligned(file_bytes)) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "segment file size must be nonzero and 4096-aligned");
     }
-    for (const std::string& path : paths) {
-        struct stat st{};
-        if (::stat(path.c_str(), &st) != 0) {
-            if (errno == ENOENT || errno == ENOTDIR) return {};
-            return errno_status("stat slot", path);
-        }
-        if (!S_ISREG(st.st_mode) ||
-            static_cast<std::uint64_t>(st.st_size) != bytes_per_shard) {
-            return {};
-        }
+    const Fd fd(::open(path.c_str(), O_RDONLY | O_DIRECT));
+    if (!fd.valid()) {
+        if (errno == ENOENT) return {};
+        return errno_status("open segment file for probe", path);
     }
-    *out = true;
+    if (::flock(fd.get(), LOCK_SH) != 0) return errno_status("lock segment file probe", path);
+    struct stat st{};
+    if (::fstat(fd.get(), &st) != 0) return errno_status("fstat segment file", path);
+    if (static_cast<std::uint64_t>(st.st_size) != file_bytes) return {};
+    *out = segment_ready(path, st, file_bytes);
     return {};
 }
 
-Status zero_slot(const std::vector<std::string>& paths,
-                 std::uint64_t bytes_per_shard) {
-    if (paths.empty()) {
-        return Status(StatusCode::INVALID_ARGUMENT, "no shard paths");
-    }
-    if (bytes_per_shard == 0 || !is_aligned(bytes_per_shard)) {
+Status zero_file_range(const std::string& path,
+                       std::uint64_t offset,
+                       std::uint64_t bytes) {
+    if (!is_aligned(offset) || !is_aligned(bytes)) {
         return Status(StatusCode::INVALID_ARGUMENT,
-                      "shard size must be nonzero and 4096-aligned");
+                      "unaligned zero file range");
     }
-
-    for (const std::string& path : paths) {
-        const Fd fd(::open(path.c_str(), O_RDWR | O_DIRECT));
-        if (!fd.valid()) return errno_status("open slot for zeroing", path);
-        const Status zeroed = write_zeros(fd.get(), path, 0, bytes_per_shard);
-        if (!zeroed.ok()) return zeroed;
-        if (::fsync(fd.get()) != 0) return errno_status("fsync zeroed slot", path);
-    }
+    const Fd fd(::open(path.c_str(), O_RDWR | O_DIRECT));
+    if (!fd.valid()) return errno_status("open segment file for zero", path);
+    const Status written = write_zeros(fd.get(), path, offset, bytes);
+    if (!written.ok()) return written;
+    if (::fsync(fd.get()) != 0) return errno_status("fsync zero segment file", path);
     return {};
 }
 

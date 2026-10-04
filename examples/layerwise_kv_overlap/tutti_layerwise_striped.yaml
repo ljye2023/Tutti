@@ -40,11 +40,10 @@ storage:
         device_ids: [0, 1, 2, 3]
         # queues_per_controller: 每块盘申请的用户队列数，单位：队列对（QP）
         #   上限：daemon queue_pool.max_per_client（超了会被钳制或拒绝）
-        #   约束：datapaths 的 threads_per_block 不得超过实际获批的队列数
         queues_per_controller: 32
 
   # -------------------------------------------------------------------------
-  # resolvers —— URI 解析器（file:// 或 striped:// 由谁解析）
+  # resolvers —— URI 解析器（多盘时 file:// 按挂载点分派到各盘）
   # -------------------------------------------------------------------------
   resolvers:
     - id: layerwise-striped-file-resolver
@@ -76,7 +75,6 @@ storage:
                                      #   x 1 键/盘）；0=关闭（走 arena 兜底）
         handle_cache_l2_capacity: 0  # L2 host-pinned 句柄缓存，槽位；
                                      #   0=自动取 4×L1。（striped 暂未生效，见上）
-        threads_per_block: 32        # 每次提交的 GPU 线程数（个）；≤ 获批队列数
         # —— 批次的两层结构 ——
         # 一次 submit() = 1 个「操作」(op) = 1 次 fused kernel 发射，批内请求并行下发：
         #   max_batch_entries        单批内并行下发的 IO 条目数 —— 「一堆请求」

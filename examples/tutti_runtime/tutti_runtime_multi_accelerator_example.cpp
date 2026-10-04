@@ -46,7 +46,6 @@ struct Options {
     };
     std::array<std::vector<std::string>, kRuntimeCount> directories;
     std::array<std::vector<std::int32_t>, kRuntimeCount> device_ids;
-    std::array<std::uint64_t, kRuntimeCount> stripe_units{{0, 0}};
     std::array<bool, kRuntimeCount> striped{{false, false}};
     std::uint64_t io_size = kDefaultIoSize;
     bool keep_files = false;
@@ -389,7 +388,6 @@ bool create_scratch_file(std::size_t worker, const std::string& path,
 struct ScratchTarget {
     std::string uri;
     std::vector<std::string> files;
-    std::vector<std::string> created_directories;
 };
 
 bool cleanup_scratch_target(std::size_t worker,
@@ -402,15 +400,6 @@ bool cleanup_scratch_target(std::size_t worker,
             ok = false;
         }
     }
-    for (auto directory = target.created_directories.rbegin();
-         directory != target.created_directories.rend(); ++directory) {
-        if (::rmdir(directory->c_str()) != 0 && errno != ENOENT &&
-            errno != ENOTEMPTY) {
-            log_worker(worker, stderr, "rmdir(%s) failed: %s",
-                       directory->c_str(), std::strerror(errno));
-            ok = false;
-        }
-    }
     return ok;
 }
 
@@ -420,70 +409,12 @@ bool create_scratch_target(std::size_t worker, const Options& options,
         "tutti_runtime_multi_accelerator_example." +
         std::to_string(::getpid()) + ".runtime" +
         std::to_string(worker) + ".bin";
-    const auto& directories = options.directories[worker];
-    if (!options.striped[worker]) {
-        const std::string path = join_path(directories.front(), name);
-        if (!create_scratch_file(worker, path, options.io_size)) return false;
-        target.files.push_back(path);
-        target.uri = "file://" + path;
-        return true;
-    }
-
-    const std::uint64_t device_count = directories.size();
-    const std::uint64_t stripe_unit = options.stripe_units[worker];
-    if (stripe_unit == 0 ||
-        stripe_unit > std::numeric_limits<std::uint64_t>::max() /
-                          device_count) {
-        log_worker(worker, stderr, "invalid striped geometry");
-        return false;
-    }
-    const std::uint64_t logical_cycle = stripe_unit * device_count;
-    if (options.io_size >
-        std::numeric_limits<std::uint64_t>::max() - (logical_cycle - 1)) {
-        log_worker(worker, stderr, "striped I/O size rounding overflows");
-        return false;
-    }
-    const std::uint64_t shard_size =
-        ((options.io_size + logical_cycle - 1) / logical_cycle) *
-        stripe_unit;
-
-    std::string mounts;
-    for (std::size_t index = 0; index < directories.size(); ++index) {
-        if (index != 0) mounts.push_back(',');
-        mounts += directories[index];
-
-        const std::string striped_directory =
-            join_path(directories[index], "striped");
-        if (::mkdir(striped_directory.c_str(), 0755) == 0) {
-            target.created_directories.push_back(striped_directory);
-        } else if (errno != EEXIST) {
-            log_worker(worker, stderr, "mkdir(%s) failed: %s",
-                       striped_directory.c_str(), std::strerror(errno));
-            (void)cleanup_scratch_target(worker, target);
-            return false;
-        } else {
-            struct stat status {};
-            if (::stat(striped_directory.c_str(), &status) != 0 ||
-                !S_ISDIR(status.st_mode)) {
-                log_worker(worker, stderr,
-                           "%s exists but is not a directory",
-                           striped_directory.c_str());
-                (void)cleanup_scratch_target(worker, target);
-                return false;
-            }
-        }
-
-        const std::string shard_path = join_path(
-            striped_directory,
-            name + ".shard" + std::to_string(index));
-        if (!create_scratch_file(worker, shard_path, shard_size)) {
-            (void)cleanup_scratch_target(worker, target);
-            return false;
-        }
-        target.files.push_back(shard_path);
-    }
-    target.uri = "striped://" + name + "?devs=" + mounts +
-                 "&unit=" + std::to_string(stripe_unit);
+    // One file, one device. A multi-device runtime resolves file:// URIs by
+    // mount prefix, so the first configured directory works for both forms.
+    const std::string path = join_path(options.directories[worker].front(), name);
+    if (!create_scratch_file(worker, path, options.io_size)) return false;
+    target.files.push_back(path);
+    target.uri = "file://" + path;
     return true;
 }
 

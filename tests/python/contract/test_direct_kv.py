@@ -473,11 +473,45 @@ def test_direct_target_plan_generation_change_fails_closed():
     key = b"g" * 16
     store._live.update(derive_io_key(key, layer) for layer in range(3))
     completion = backend.get_paged_batch([key], 0, [[3, 1]])
-    uri = store._layout.target_uri(key)
-    store._targets[uri].generation += 1
+    # 槽位被回收再分配：对象层换了 generation，计划里的旧记录必须失效。
+    store._layout.generations[key] = store._layout.target_generation(key) + 1
     with pytest.raises(RuntimeError, match="generation mismatch"):
         backend.get_paged_batch([key], 1, [[3, 1]])
     completion.wait()
+    backend.close()
+
+
+def test_direct_shared_segment_file_reuses_ticket_and_checks_each_chunk():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    store._layout.target_uri = lambda _chunk: "file:///shared.seg"
+    store._layout.target_offset = lambda chunk: (
+        32768 if chunk == b"a" * 16 else 32768 + 3 * 8192 + 32768
+    )
+    store._layout.generations[b"a" * 16] = 1
+    store._layout.generations[b"b" * 16] = 2
+    store._ensure_targets = lambda entries: TuttiKVStore._ensure_targets(store, entries)
+    store._close_cached_targets = lambda uris: TuttiKVStore._close_cached_targets(store, uris)
+    store._targets_lock = threading.RLock()
+
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    keys = [b"a" * 16, b"b" * 16]
+    store._live.update(derive_io_key(key, layer) for key in keys for layer in range(3))
+    backend.begin_target_plan(keys, "read")
+    assert len(runtime.open_batch_calls) == 1
+    assert runtime.open_batch_calls[0] == ("file:///shared.seg",)
+    plan = backend._target_plans["read"]
+    assert [entry.target_generation for entry in plan.entries] == [1, 2]
+    assert plan.entries[0].target_ticket == plan.entries[1].target_ticket
+    backend.get_paged_batch(keys, 0, [[3, 1], [7, 0]]).wait()
+    store._layout.generations[keys[1]] = 3
+    with pytest.raises(RuntimeError, match="generation mismatch"):
+        backend.get_paged_batch(keys, 1, [[3, 1], [7, 0]])
+    assert len(runtime.open_batch_calls) == 1
     backend.close()
 
 
@@ -533,7 +567,7 @@ def test_direct_clean_root_first_write_materializes_target(tmp_path):
     runtime = FakeRuntime()
     store = TuttiKVStore(
         root=tmp_path / "clean-root", num_chunks=2, segment_bytes=8192,
-        runtime=runtime, allocator_enabled=False,
+        runtime=runtime, allocator_enabled=False, segment_file_slots=4,
     )
     store.open()
     store._read_stream = 11
@@ -548,9 +582,9 @@ def test_direct_clean_root_first_write_materializes_target(tmp_path):
     completion = backend.put_paged_batch([key], 0, [[3, 1]])
     uri = store._layout.target_uri(key)
     target_path = Path(uri[len("file://"):])
-    # 预留即物化：对象文件是 对象头 + 全部层的段（层数 × 段大小）。
+    # 段文件在 open 时整体建好：每槽位 = 前缀 + 全部层的段（层数 × 段大小）。
     assert target_path.exists()
-    assert target_path.stat().st_size == 4096 + 3 * 8192
+    assert target_path.stat().st_size == 4 * (32768 + 3 * 8192)
     assert len(runtime.open_batch_calls) == 1
     assert completion._watcher is None
     completion.wait()

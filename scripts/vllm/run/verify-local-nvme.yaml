@@ -31,7 +31,6 @@ storage:
         handle_cache_capacity: 4096
         prp_cache_capacity: 4096
         handle_cache_l2_capacity: 0
-        threads_per_block: 16
         max_in_flight_operations: 4
         max_batch_entries: 4096
         io_granularity: 0

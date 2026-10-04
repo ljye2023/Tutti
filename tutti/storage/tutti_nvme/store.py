@@ -22,7 +22,11 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .object_layout import ObjectLayout
+from .object_layout import (
+    DEFAULT_SEGMENT_FILE_SLOTS,
+    DEFAULT_SEGMENT_HEADER_BYTES,
+    ObjectLayout,
+)
 from .preset_derive import derive_device_fields
 from .runtime_factory import (
     build_runtime,
@@ -594,21 +598,11 @@ class TuttiDirectBackend:
         ):
             target_tickets = self._store._ensure_targets(entries)
         plan_entries = []
+        layout = self._store._layout
         for chunk_id in chunk_ids:
-            uri = self._store._layout.target_uri(chunk_id)
-            cached = getattr(self._store, "_targets", {}).get(uri)
-            target_size = getattr(cached, "size", None)
-            target_generation = getattr(cached, "generation", None)
-            if target_size is None:
-                size = getattr(self._store._layout, "target_size", None)
-                target_size = int(size(chunk_id)) if callable(size) else 0
-            if target_generation is None:
-                generation = getattr(
-                    self._store._layout, "target_generation", None
-                )
-                target_generation = (
-                    int(generation(chunk_id)) if callable(generation) else 0
-                )
+            uri = layout.target_uri(chunk_id)
+            target_size = int(layout.target_size(chunk_id))
+            target_generation = int(layout.target_generation(chunk_id))
             plan_entries.append(DirectTargetPlanEntry(
                 chunk_id=chunk_id,
                 target_ticket=int(target_tickets[uri]),
@@ -675,9 +669,8 @@ class TuttiDirectBackend:
     def _validate_plan_entry(self, entry: DirectTargetPlanEntry) -> None:
         """Check the current cache record for one submitted chunk.
 
-        槽位路径稳定 ⇒ 票据按 URI 长驻；槽位被回收再分配时对象层会换
-        generation，`_ensure_targets` 据此关闭旧票据并重开，所以这里的
-        「票据 + 大小 + generation 三者一致」就是完整判据。
+        票据按段文件长驻（文件不随槽位回收重建）；槽位被回收再分配时对象层
+        会换 generation，所以「票据仍在缓存 + generation 一致」就是完整判据。
         """
         cached = getattr(self._store, "_targets", {}).get(entry.target_uri)
         if cached is None:
@@ -688,9 +681,8 @@ class TuttiDirectBackend:
             raise RuntimeError(
                 f"direct target ticket invalid for chunk {entry.chunk_id!r}"
             )
-        if (int(getattr(cached, "size", entry.target_size)) != entry.target_size
-                or int(getattr(cached, "generation", entry.target_generation))
-                != entry.target_generation):
+        # 票据按段文件共享；槽位是否被回收再分配由对象层的 generation 判定。
+        if int(self._store._layout.target_generation(entry.chunk_id)) != entry.target_generation:
             raise RuntimeError(
                 f"direct target generation mismatch for chunk {entry.chunk_id!r}"
             )
@@ -1164,21 +1156,21 @@ class TuttiKVStore:
 
     def __init__(self, root, num_chunks: int, segment_bytes: int,
                  runtime=None, io_stream=None, preset=None,
-                 layout="file_per_chunk", mounts=None,
-                 initial_slots=None, low_watermark=None,
-                 high_watermark=None, max_slots=None,
-                 pool_wait_timeout_s: float = 5.0,
+                 mounts=None,
+                 segment_file_slots: int = DEFAULT_SEGMENT_FILE_SLOTS,
+                 segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
                  allocator_enabled: bool = True,
                  rank_id: int = 0, tp_size: int = 1,
-                 defer_writes_after_reads: bool | None = None,
-                 precreate_threads: int | None = None):
+                 defer_writes_after_reads: bool | None = None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
         的数字字符串由此归一，如 device_id / gpu_id）。
 
-        ``layout="striped"`` 选择多盘布局：一个槽位一个文件，槽位号在
-        ``mounts`` 间轮转；默认 file_per_chunk（单 mount）不变。
+        数据布局只有一种：槽位号在 ``mounts``（缺省取 preset 的
+        devices[].mount_path，再缺省为 root）间轮转，每盘连续
+        ``segment_file_slots`` 个槽位打包进一个固定大段文件，槽位前缀
+        ``segment_header_bytes``（须 4096 对齐）。
         """
         if num_chunks <= 0:
             raise ValueError(f"num_chunks 必须为正数，得到 {num_chunks}")
@@ -1192,55 +1184,37 @@ class TuttiKVStore:
             raise ValueError(
                 f"tp_size must be greater than rank_id: {tp_size!r} <= {rank_id!r}"
             )
+        if int(segment_file_slots) <= 0:
+            raise ValueError("segment_file_slots must be positive")
+        if int(segment_header_bytes) < 4096 or int(segment_header_bytes) % 4096:
+            raise ValueError("segment_header_bytes must be 4096-aligned and >= 4096")
         self._root = Path(root)
         self._rank_id = rank_id
         self._tp_size = tp_size
-        # 容量与预热都以 chunk（对象）为单位，对象层在打开时按对象几何折算成
-        # 字节。旧的池水位（initial/low/high/max）没有对应物：物化按需发生、
-        # 回收在后台进行，不再需要水位驱动的扩容，也不会阻塞前向线程。
-        self._num_chunks = (
-            min(num_chunks, max_slots) if max_slots is not None else num_chunks
-        )
-        warm_chunks = (
-            min(32, self._num_chunks) if initial_slots is None
-            else min(int(initial_slots), self._num_chunks)
-        )
-        if high_watermark is not None:
-            warm_chunks = min(int(high_watermark), self._num_chunks)
+        self._num_chunks = num_chunks
         self._segment_bytes = segment_bytes
         self._runtime = runtime
         self._own_runtime = runtime is None
         self._preset = _normalize_preset(preset) if preset is not None else None
         if self._preset is not None and "daemon_config" in self._preset:
-            # layout 构造需要设备字段（striped 的 mounts 来自 devices[].mount_path），
-            # 在构造 layout 前先按 daemon 配置推导一次；_build_runtime 的推导
-            # 幂等，重复调用不改变结果。
+            # mounts 来自 devices[].mount_path，构造 layout 前先按 daemon 配置
+            # 推导一次；_build_runtime 的推导幂等，重复调用不改变结果。
             import yaml
             self._preset = derive_device_fields(self._preset, yaml)
         self._key_namespace: bytes | None = None
-        if layout in (None, "file_per_chunk", "file"):
-            layout_mounts = [str(self._root)]
-        elif layout == "striped":
-            if mounts is None:
-                mounts = _preset_mounts(self._preset)
-            layout_mounts = [str(mount) for mount in mounts]
-        else:
-            raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
-        # 预建/预热口径必须在对象层打开（set_layer_span）之前定下来：它决定
-        # open 是"建出缺失的预热槽位"（旧同步语义）还是"只走查已存在的槽位、
-        # 把差量交给后台"（异步增长）。
-        self._parse_precreate_options(precreate_threads)
+        if mounts is None:
+            mounts = _preset_mounts(self._preset) or [str(self._root)]
         # 文件系统的全部职责（槽位分配、对象头、检查点、恢复、容量）都在
         # 这一层之下：本类只保留内存簿记与 runtime 票据缓存。
         self._layout = ObjectLayout(
             self._root,
             segment_bytes,
-            mounts=layout_mounts,
+            mounts=[str(mount) for mount in mounts],
             capacity_chunks=self._num_chunks,
-            prewarm_chunks=warm_chunks,
             rank_id=rank_id,
             background_reclaim=bool(allocator_enabled),
-            warmup_probe_only=self._precreate_threads > 0,
+            segment_file_slots=int(segment_file_slots),
+            segment_header_bytes=int(segment_header_bytes),
         )
         self._opened = False
         self._live: set[bytes] = set()
@@ -1305,29 +1279,6 @@ class TuttiKVStore:
         except ValueError:
             self._checkpoint_interval_s = 60.0
         self._checkpoint_last_ns = time.monotonic_ns()
-
-    def _parse_precreate_options(self, precreate_threads: int | None) -> None:
-        # 后台预建线程数。**默认 0（关闭）**：一旦启用，open 就只走查已存在的
-        # 槽位，写路径也不再自己 create+fsync（拿不到就绪槽位时裁剪，与容量
-        # 耗尽同一契约）——这是行为变更，必须由部署显式选择。大容量冷启动/
-        # 扩容的部署在 serve 脚本里设 TUTTI_PRECREATE_THREADS（如 4）；测试与
-        # 小池保持旧的同步建槽语义。
-        if precreate_threads is None:
-            raw = os.environ.get("TUTTI_PRECREATE_THREADS")
-            precreate_threads = int(raw) if raw and raw.isdigit() else 0
-        if not isinstance(precreate_threads, int) or precreate_threads < 0:
-            raise ValueError(
-                "precreate_threads 须为非负整数，"
-                f"got {precreate_threads!r}"
-            )
-        self._precreate_threads = precreate_threads
-        # 就绪余量（槽位）：预建只跟随分配前沿保持这一段就绪，容量只是上限
-        # （曾有一个"一路补到容量上限"的口径，已删除——盘占用 ∝ 容量而非
-        # 工作集，且会与在线 KV 争带宽/写满盘）。
-        raw_headroom = os.environ.get("TUTTI_PRECREATE_HEADROOM")
-        self._precreate_headroom = (
-            int(raw_headroom) if raw_headroom and raw_headroom.isdigit() else 0
-        )
 
     # ---------- 生命周期 ----------
 
@@ -1875,7 +1826,7 @@ class TuttiKVStore:
             chunk_ids.add(chunk_id)
         released = self._layout.releasable_chunks(io_keys)
         self._wait_chunk_io(released)
-        self._close_cached_targets(self._chunk_target_uris_to_close(released))
+        # 票据按段文件长驻：回收只是就地零化槽位前缀，文件与 extent 不变。
         self._layout.drop(io_keys)
         self._live.difference_update(io_keys)
         # 对象被回收 ⇒ 该 chunk 的全部层一起离开在场集合（按对象提交 ⇒
@@ -1962,21 +1913,15 @@ class TuttiKVStore:
     def set_layer_span(self, num_layers: int) -> None:
         """定层宽并打开对象层：对象几何（段数 × 段大小 + 对象头）由此确定。
 
-        对象层在此打开——它承担槽位物化（含预热）、检查点加载与崩溃恢复，
-        恢复出的已提交 chunk 立即进入内存视图（`_live`）。本调用发生在
-        worker 初始化期，不在请求路径上。
+        对象层在此打开——它承担检查点加载、崩溃恢复，冷池时同步建出首个
+        文件组（启动多约 1 分钟，换来开服即可写），恢复出的已提交 chunk 立即
+        进入内存视图（`_live`）。本调用发生在 worker 初始化期，不在请求路径上。
+        之后的文件组由后台线程在分配前沿逼近时建（写路径永不建文件）。
         """
         self._layout.set_layer_span(num_layers)
         self._live = self._layout.scan()
         self._preopen_ready_targets()
-        # 对象层已打开、几何已定：把"容量增长"整体交给后台线程——既避免大容量
-        # 冷启动在 open 期写实零，也避免写路径按需 create+fsync（详见
-        # object_layout.start_background_precreate 的契约说明）。
-        if self._precreate_threads > 0:
-            self._layout.start_background_precreate(
-                self._precreate_threads,
-                headroom=self._precreate_headroom,
-            )
+        self._layout.start_background_precreate()
 
     def object_pool_snapshot(self) -> dict | None:
         return self._layout.object_pool_snapshot()
@@ -1992,7 +1937,7 @@ class TuttiKVStore:
         """
         chunks = tuple(dict.fromkeys(bytes(chunk_id) for chunk_id in chunk_ids))
         self._wait_chunk_io(chunks)
-        self._close_cached_targets(self._layout.reserved_uris(chunks))
+        # 票据按段文件共享（同文件其他 chunk 可能正在飞），回滚不关票据。
         self._layout.abort_uncommitted(chunks)
 
     # ---------- 内部 ----------
@@ -2039,6 +1984,8 @@ class TuttiKVStore:
         if not ready:
             return
         size = self._layout.slot_payload_bytes
+        # 票据按段文件开（同文件的全部槽位共用），generation 按 chunk 校验。
+        ready = list(dict.fromkeys((uri, 0) for uri, _ in ready))
         try:
             with nvtx_range(
                 f"tutti.direct.preopen_ready|slots={len(ready)}"
@@ -2061,11 +2008,9 @@ class TuttiKVStore:
         不会被误判为失效而重开。
         """
         with self._targets_lock:
-            missing = [
-                (uri, generation)
-                for uri, generation in entries
-                if uri not in self._targets
-            ]
+            missing = list({uri: (uri, generation)
+                            for uri, generation in entries
+                            if uri not in self._targets}.values())
         if not missing:
             return
         tickets = self._runtime.open_batch([uri for uri, _ in missing])
@@ -2088,24 +2033,14 @@ class TuttiKVStore:
         """
         descriptors = []
         seen = set()
-        stale = []
         for io_key, _, _ in entries:
             chunk_id, _ = decode_io_key(io_key)
             uri = self._layout.target_uri(chunk_id)
             if uri in seen:
                 continue
             seen.add(uri)
-            size = self._layout.target_size(chunk_id)
-            generation = self._layout.target_generation(chunk_id)
-            cached = self._targets.get(uri)
-            if cached is not None and (
-                cached.size != size or cached.generation != generation
-            ):
-                stale.append(uri)
-                cached = None
-            descriptors.append((uri, size, generation))
-        if stale:
-            self._close_cached_targets(stale)
+            # 票据按段文件共享：文件本身不随槽位回收重建，不做失效判定。
+            descriptors.append((uri, self._layout.target_size(chunk_id), 0))
         with self._targets_lock:
             missing = [item for item in descriptors if item[0] not in self._targets]
         if missing:
@@ -2121,17 +2056,6 @@ class TuttiKVStore:
                     )
         with self._targets_lock:
             return {uri: self._targets[uri].ticket for uri, _, _ in descriptors}
-
-    def _chunk_target_uris_to_close(self, chunk_ids) -> list[str]:
-        """解绑/中止/失败时应当关闭票据的 chunk 目标 URI。
-
-        对象池模式下票据是**槽位级**的：槽位路径稳定、文件不随解绑消失
-        （回收只是就地零化，extent 不变），因此解绑不应关闭票据——否则
-        每次回收后再次使用都要重跑 open（resolve + 句柄构建 + 每 URI 一
-        个线程），正是推理路径上要消除的开销。槽位文件真被重建时，
-        `target_generation` 会在 `_ensure_targets` 里判定失效并关闭。
-        """
-        return []
 
     def _close_cached_targets(self, uris) -> None:
         records = [(uri, self._targets[uri]) for uri in dict.fromkeys(uris)
@@ -2219,7 +2143,6 @@ class TuttiKVStore:
         chunk_ids = tuple(dict.fromkeys(
             decode_io_key(io_key)[0] for io_key in io_keys
         ))
-        self._close_cached_targets(self._chunk_target_uris_to_close(chunk_ids))
         self._layout.abort_uncommitted(chunk_ids)
 
     def _on_direct_put_settled(self, ok: bool, io_keys, completion) -> None:
@@ -2258,15 +2181,12 @@ class TuttiKVStore:
             self.finalize_direct_failures()
 
     def finalize_direct_failures(self) -> None:
-        """Close failed write targets after all direct completions drain."""
+        """Roll back failed direct writes after all direct completions drain."""
         chunks = tuple(self._direct_failed_chunks)
         if not chunks:
             return
         self._direct_failed_chunks.difference_update(chunks)
         try:
-            self._close_cached_targets(
-                self._chunk_target_uris_to_close(chunks)
-            )
             self._layout.abort_uncommitted(chunks)
             self._live = {
                 io_key for io_key in self._live

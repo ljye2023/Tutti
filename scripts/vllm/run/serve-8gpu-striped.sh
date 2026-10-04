@@ -10,10 +10,10 @@
 #   RUN_DIR=/mnt/nvme4/tutti-profile/online/<tag> \
 #     nohup bash scripts/vllm/run/serve-8gpu-striped.sh > $RUN_DIR/server.log 2>&1 &
 #
-# 容量推导（与 offline driver 同一规则，缺少它会踩两类坑）：
-#   * initial_slots 必须覆盖单请求整波 chunk，否则 PoolResourceExhausted；
-#   * high_watermark 必须覆盖整个工作集，否则请求中途扩容（实零写 + fsync）
-#     会阻塞前向线程。
+# 数据布局：每 rank 的槽位在 4 盘间轮转，打包进固定大段文件
+# <mount>/r<rank>/segments/<id>.seg（每文件 2048 槽 ≈ 20 GiB）。冷池启动时
+# 每 rank 同步建首个文件组（每盘一个段文件，约 1 分钟），之后由后台线程在
+# 分配前沿逼近时补建下一组；写路径永不建文件。
 #
 set -euo pipefail
 
@@ -68,16 +68,6 @@ NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 # 换算示例：8 TiB 总量 → 每 rank 1 TiB → 每盘（8 rank / 4 盘）2 TiB。
 TOTAL_CAPACITY_BYTES="${TOTAL_CAPACITY_BYTES:-$(( 8 * 1024 * 1024 * 1024 * 1024 ))}"
 CAPACITY_BYTES=$(( TOTAL_CAPACITY_BYTES / TP_SIZE ))
-# 同步预热槽位数：open() 期只付这一份（首个请求 + 头几秒的工作集）。
-# 之后的增长由后台线程按需跟随（TUTTI_PRECREATE_*），写路径永不 create+fsync
-# 槽位——容量因此不再等于几十分钟启动或 44ms/槽的前向停顿。
-HIGH_WATERMARK="${HIGH_WATERMARK:-4096}"
-# 后台预建：线程数（0 = 关闭，退回写路径按需建槽）。
-# 余量 = 保持"分配前沿之前"多少个槽位已就绪；跟不上需求时写入被裁剪（不阻塞）。
-# 预建只跟随分配前沿（盘上占用 ∝ 真实 KV），容量仅作硬上限——"铺满容量"的
-# 口径已从代码里删除（2026-09-22：盘占用 ∝ 容量会把盘写满并与在线 KV 争带宽）。
-export TUTTI_PRECREATE_THREADS="${TUTTI_PRECREATE_THREADS:-4}"
-export TUTTI_PRECREATE_HEADROOM="${TUTTI_PRECREATE_HEADROOM:-4096}"
 # 工作集（仅用于日志展示）
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 WORKING_SET=$(( SAMPLES * CHUNKS_PER_REQ ))
@@ -94,9 +84,8 @@ echo "[serve] IO 几何: block_size=$BLOCK_SIZE tokens/block" \
      "blocks_per_chunk=$(( CHUNK_TOKENS / BLOCK_SIZE ))" \
      "device_groups=[[0,1,2,3]] (8 rank 共享 4 盘，槽位轮转)"
 echo "[serve] pool: 服务级总量 $(( TOTAL_CAPACITY_BYTES / 1024 / 1024 / 1024 / 1024 )) TiB" \
-     "(每 rank $(( CAPACITY_BYTES / 1024 / 1024 / 1024 )) GiB)" \
-     "prewarm_slots=$HIGH_WATERMARK headroom=$TUTTI_PRECREATE_HEADROOM"
-echo "[serve] pool_tag=$POOL_TAG (换 tag = 全新冷池，脚本不删旧池)"
+     "(每 rank $(( CAPACITY_BYTES / 1024 / 1024 / 1024 )) GiB，容量仅为上限)"
+echo "[serve] pool_tag=$POOL_TAG (换 tag = 全新索引；段文件按 rank 共享，脚本不删)"
 
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/profile-env.sh"
@@ -118,9 +107,8 @@ else
 fi
 echo "[serve] load_format=$LOAD_FORMAT phxloader_dir=$PHXLOADER_DIR"
 
-# rank0-3 -> 盘 {0,1}，rank4-7 -> 盘 {2,3}；每 rank 自己的池根（多 rank 共用
-# 一个 root 会互相追加同名文件）。{LOCAL_RANK} 由 connector 的
-# expand_placeholders 展开（大括号、无 $）。
+# 8 rank 共享 4 盘（device_groups=[[0,1,2,3]]）；每 rank 自己的池根（检查点/
+# 元数据）。{LOCAL_RANK} 由 connector 的 expand_placeholders 展开（大括号、无 $）。
 read -r -d '' KV_CONFIG <<JSON || true
 {
   "kv_connector": "TuttiConnectorV1",
@@ -135,9 +123,7 @@ read -r -d '' KV_CONFIG <<JSON || true
       "options": {
         "root": "/mnt/nvme0/tutti-kv-online-${POOL_TAG}-{LOCAL_RANK}",
         "capacity_bytes": $CAPACITY_BYTES,
-        "high_watermark": $HIGH_WATERMARK,
         "io_stream": "auto",
-        "layout": "striped",
         "preset": {
           "type": "striped",
           "daemon_config": "$REPO_ROOT/config/local/tutti_daemon.yaml",

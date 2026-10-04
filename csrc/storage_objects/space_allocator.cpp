@@ -28,7 +28,6 @@ bool SpaceAllocator::configure(const SpaceAllocatorConfig& config) {
 
     total_slots_ = derived;
     slot_bytes_ = config.slot_bytes;
-    prewarm_slots_ = std::min(config.prewarm_slots, derived);
     high_water_ = 0;
 
     states_.assign(static_cast<std::size_t>(derived), SlotState::kFree);
@@ -49,9 +48,9 @@ std::uint64_t SpaceAllocator::slot_bytes() const {
     return slot_bytes_;
 }
 
-std::uint64_t SpaceAllocator::prewarm_slots() const {
+void SpaceAllocator::set_ready_limit(std::uint64_t limit) {
     std::lock_guard<std::mutex> guard(mutex_);
-    return prewarm_slots_;
+    ready_limit_ = limit;
 }
 
 // Prefers recycled slots over never-used ones so the working set stays compact:
@@ -63,7 +62,7 @@ std::uint64_t SpaceAllocator::next_free_locked() {
         free_list_.pop_front();
         return slot;
     }
-    if (high_water_ < total_slots_) return high_water_++;
+    if (high_water_ < std::min(total_slots_, ready_limit_)) return high_water_++;
     return total_slots_;  // sentinel: exhausted
 }
 

@@ -6,7 +6,7 @@ target, or data-transfer API.
 
 The persistent one is a **read-only view of the object layer**: the worker is
 the sole writer of a namespace, the scheduler opens the same namespace read-only
-(no directory creation, no prewarming, no materialisation) and reads the
+(no directory creation, no file creation) and reads the
 committed key set from the checkpoint. Everything after that first read is
 in-memory: residency is published by the worker's per-step increments, so the
 scheduler never touches the filesystem on the request path.
@@ -28,6 +28,11 @@ from .registry import (
 )
 from .tutti_nvme.preset_derive import derive_device_fields
 from .tutti_nvme.runtime_factory import preset_mounts as _preset_mounts
+from .tutti_nvme.object_layout import (
+    DEFAULT_SEGMENT_FILE_SLOTS,
+    DEFAULT_SEGMENT_HEADER_BYTES,
+    layout_fingerprint,
+)
 
 
 _LOG = logging.getLogger(__name__)
@@ -94,9 +99,10 @@ class TuttiMetadataStore:
         num_chunks: int,
         segment_bytes: int,
         *,
-        layout="file_per_chunk",
         mounts=None,
         preset=None,
+        segment_file_slots: int = DEFAULT_SEGMENT_FILE_SLOTS,
+        segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
         rank_options=None,
         tp_size: int = 1,
         layer_span: int | None = None,
@@ -118,12 +124,14 @@ class TuttiMetadataStore:
         if rank_options is None:
             rank_options = [{
                 "root": root,
-                "layout": layout,
                 "mounts": mounts,
                 "preset": preset,
+                "segment_file_slots": segment_file_slots,
+                "segment_header_bytes": segment_header_bytes,
             }]
         if len(rank_options) != self._tp_size:
             raise ValueError("rank_options must contain one entry per TP rank")
+        self._rank_options = [dict(options) for options in rank_options]
         self._roots = [
             str(options.get("root")) for options in rank_options
         ]
@@ -131,20 +139,19 @@ class TuttiMetadataStore:
             raise ValueError("every TP rank requires a distinct metadata root")
         self._views: list[ObjectStore] = []
         self._live: set[bytes] = set()
-        # 多盘布局（挂载点集合）与数据面必须完全一致：对象层的槽位路径由它
-        # 推导，不一致就会指向别的文件。
-        self._mounts: list[str] | None = None
-        if rank_options[0].get("layout") == "striped":
-            mounts = rank_options[0].get("mounts")
-            preset = rank_options[0].get("preset")
-            if mounts is None and isinstance(preset, dict):
-                if "daemon_config" in preset:
-                    import yaml
-                    preset = derive_device_fields(preset, yaml)
-                mounts = _preset_mounts(preset)
-            if not mounts:
-                raise ValueError("striped metadata store requires mounts")
-            self._mounts = [str(mount) for mount in mounts]
+        # 挂载点集合与数据面必须完全一致（同一套缺省链：mounts → preset
+        # devices[].mount_path → root）：对象层的槽位路径由它推导，不一致就会
+        # 指向别的文件。
+        mounts = rank_options[0].get("mounts")
+        preset = rank_options[0].get("preset")
+        if mounts is None and isinstance(preset, dict):
+            if "daemon_config" in preset:
+                import yaml
+                preset = derive_device_fields(preset, yaml)
+            mounts = _preset_mounts(preset)
+        self._mounts: list[str] | None = (
+            [str(mount) for mount in mounts] if mounts else None
+        )
         # 冷启动对账需要层宽（对象几何 = 段数 × 段大小 + 对象头），未声明时
         # scan() 返回空（fail-closed）。worker 侧在 bind 后由引擎注入；调度侧
         # 没有 bind 阶段，必须在构造时给出——否则复用已有池时永远恢复不到任何
@@ -228,21 +235,34 @@ class TuttiMetadataStore:
     def _open_views(self) -> list[ObjectStore]:
         stores = []
         for rank, root in enumerate(self._roots):
+            rank_options = self._rank_options[rank]
+            # 缺省值与数据面（TuttiKVStore）同源；worker 显式配置的非默认
+            # 几何必须原样带过来，否则指纹不一致、视图打开 fail-closed。
+            slots = int(
+                rank_options.get("segment_file_slots") or DEFAULT_SEGMENT_FILE_SLOTS
+            )
+            header = int(
+                rank_options.get("segment_header_bytes") or DEFAULT_SEGMENT_HEADER_BYTES
+            )
             options = {
                 "scheme": (
                     SCHEME_STRIPED_NVME_FILE
-                    if self._mounts else SCHEME_LOCAL_NVME_FILE
+                    if self._mounts and len(self._mounts) > 1
+                    else SCHEME_LOCAL_NVME_FILE
                 ),
                 "uri": root,
                 "capacity_slots": self._num_chunks,
                 "segment_bytes": self._segment_bytes,
                 "segment_count": self._layer_span,
-                "namespace_fingerprint": _fingerprint_bytes(self._key_namespace),
+                "segment_file_slots": slots,
+                "segment_header_bytes": header,
+                "namespace_fingerprint": layout_fingerprint(
+                    _fingerprint_bytes(self._key_namespace), slots, header,
+                ),
                 "devices": self._devices_for(rank),
-                "prewarm_bytes": 0,
                 "background_reclaim": False,
-                # 多盘布局的槽位文件按 rank 分目录（chunks/r<rank>/），必须用
-                # 与 worker 相同的 rank 才能对上同一批文件。
+                # 段文件按 rank 分目录（<mount>/r<rank>/segments/），必须用与
+                # worker 相同的 rank 才能对上同一批文件。
                 "rank_id": rank,
                 "rank_count": 1,
                 "read_only": True,
@@ -254,8 +274,7 @@ class TuttiMetadataStore:
         return stores
 
     def _devices_for(self, rank: int) -> list[dict]:
-        del rank
-        mounts = self._mounts or [self._roots[0]]
+        mounts = self._mounts or [self._roots[rank]]
         return [{"mount_path": mount} for mount in mounts]
 
     def _require_open(self) -> None:

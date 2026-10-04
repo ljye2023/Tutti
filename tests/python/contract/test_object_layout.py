@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 pytest.importorskip("tutti_runtime._core")
@@ -18,7 +16,9 @@ from tutti.storage.tutti_nvme.object_layout import ObjectLayout
 
 SPAN = 3
 SEGMENT = 4096
-SLOT_BYTES = 4096 + SEGMENT * SPAN
+HEADER = 32 * 1024
+SLOTS_PER_FILE = 4
+SLOT_BYTES = HEADER + SEGMENT * SPAN
 
 
 def _io_key(chunk: bytes, layer: int) -> bytes:
@@ -37,10 +37,11 @@ def _layout(tmp_path, *, mounts=None, rank_id=0):
         SEGMENT,
         mounts=[str(m) for m in mounts],
         capacity_chunks=8,
-        prewarm_chunks=4,
         rank_id=rank_id,
         background_reclaim=False,
         namespace=b"test-namespace",
+        segment_file_slots=SLOTS_PER_FILE,
+        segment_header_bytes=HEADER,
     )
     layout.set_layer_span(SPAN)
     return layout
@@ -69,16 +70,17 @@ def test_commit_is_per_object_not_per_layer(tmp_path):
     assert layout.releasable_chunks([_io_key(a, 0)]) == {a}
 
 
-def test_placement_is_stable_single_file(tmp_path):
-    """槽位 URI 稳定、段 0 跳过对象头、payload 覆盖全部层。"""
+def test_placement_packs_slots_into_segment_file(tmp_path):
+    """槽位打包进段文件：URI 稳定、段 0 跳过槽位前缀、payload 覆盖全部层。"""
     layout = _layout(tmp_path)
-    chunk = b"c" * 16
-    layout.prepare_put([_io_key(chunk, 0)], capacity_chunks=8)
+    chunk, other = b"c" * 16, b"C" * 16
+    layout.prepare_put([_io_key(chunk, 0), _io_key(other, 0)], capacity_chunks=8)
 
     uri = layout.target_uri(chunk)
-    assert uri.startswith("file://")
-    assert layout.target_uri(chunk) == uri  # 稳定：不随分配改名
-    assert layout.target_offset(chunk) == 4096
+    assert uri == f"file://{tmp_path}/dev0/r0/segments/0.seg"
+    assert layout.target_uri(other) == uri  # 同一段文件
+    assert layout.target_offset(chunk) == HEADER
+    assert layout.target_offset(other) == SLOT_BYTES + HEADER
     assert layout.target_size(chunk) == SEGMENT * SPAN
     assert layout.target_generation(chunk) == 0
 
@@ -128,12 +130,8 @@ def test_release_removes_object_from_recovery_set(tmp_path):
     assert _layout(tmp_path).committed_chunks() == set()
 
 
-def test_striped_uri_carries_geometry(tmp_path):
-    """多盘布局的 URI 由 local-file resolver 消费：路径即文件。
-
-    槽位号在 mounts 间轮转——连续 chunk（一个 prompt 的相邻槽位）摊到
-    每块盘上；payload 无整除约束（无条带几何）。
-    """
+def test_slots_rotate_over_mounts(tmp_path):
+    """槽位号在 mounts 间轮转：相邻 chunk 落到不同盘的段文件上。"""
     mounts = [tmp_path / "d0", tmp_path / "d1"]
     for mount in mounts:
         mount.mkdir(parents=True, exist_ok=True)
@@ -144,27 +142,24 @@ def test_striped_uri_carries_geometry(tmp_path):
         8192,
         mounts=[str(m) for m in mounts],
         capacity_chunks=8,
-        prewarm_chunks=4,
         background_reclaim=False,
         namespace=b"test-namespace",
+        segment_file_slots=SLOTS_PER_FILE,
+        segment_header_bytes=HEADER,
     )
     layout.set_layer_span(4)
-    chunk = b"h" * 16
-    layout.prepare_put([_io_key(chunk, 0)], capacity_chunks=8)
-
-    uri = layout.target_uri(chunk)
-    assert uri.startswith("file://")
-    from urllib.parse import urlsplit
-    path = urlsplit(uri).netloc + urlsplit(uri).path
-    # 文件恰好落在其中一块盘的 rank 子目录下。
-    assert path.startswith(str(mounts[0])) or path.startswith(str(mounts[1]))
-    assert f"/r0/{int(Path(path).stem)}.obj" in path
+    first, second = b"h" * 16, b"H" * 16
+    layout.prepare_put([_io_key(first, 0), _io_key(second, 0)], capacity_chunks=8)
+    assert layout.target_uri(first) == f"file://{mounts[0]}/r0/segments/0.seg"
+    assert layout.target_uri(second) == f"file://{mounts[1]}/r0/segments/0.seg"
+    assert layout.target_offset(first) == layout.target_offset(second) == HEADER
 
 
 def test_commit_before_layer_span_is_impossible(tmp_path):
     """层宽未定案时不允许提交：对象几何未知，无法判定"写齐"。"""
     root = tmp_path / "ns"
     root.mkdir(parents=True, exist_ok=True)
-    layout = ObjectLayout(root, SEGMENT, mounts=[str(tmp_path)])
+    layout = ObjectLayout(root, SEGMENT, mounts=[str(tmp_path)],
+                          segment_file_slots=SLOTS_PER_FILE)
     with pytest.raises(RuntimeError, match="set_layer_span"):
         layout.prepare_put([_io_key(b"i" * 16, 0)], capacity_chunks=4)

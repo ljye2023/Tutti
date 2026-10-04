@@ -12,7 +12,7 @@
 // StripedArena — zero per-op cudaMalloc.
 //
 // Placement model (2026-09-22): every target is ONE file living entirely on
-// ONE of the N devices; the placement layer (RotatingFilePlacement) decides
+// ONE of the N devices; the placement layer (FixedSegmentFilePlacement) decides
 // which device by the slot number, and this DataPath finds the device by
 // matching the payload's controller PCI address.  A request is NEVER split
 // across devices -- long prompts get their N-way parallelism from having many
@@ -122,8 +122,6 @@ public:
     // max_in_flight_operations: cap on concurrent IN_FLIGHT ops.
     // prp_cache_capacity: 0 = OFF (default); >0 = PRP LIST page cache slots.
     //   (Round 16 S5: aligned to LocalNvmeDataPath's prp_cache_capacity.)
-    // threads_per_block: fused submit kernel block size (1..1024, default 16).
-    //   Must not exceed any device's actual queue count.
     //
     // 注：本 DataPath 没有 HandleWorkspaceCache 实例，故不接受
     // handle_cache_capacity（S1）——同一配置键只对 LocalNvmeDataPath 生效。
@@ -133,8 +131,7 @@ public:
                     std::uint32_t cq_poll_budget = 2000000,
                     std::uint32_t max_batch_entries = 256,
                     std::uint32_t max_in_flight_operations = 16,
-                    std::uint32_t prp_cache_capacity = 0,
-                    std::uint32_t threads_per_block = 16);
+                    std::uint32_t prp_cache_capacity = 0);
     ~StripedDataPath() override;
 
     StripedDataPath(const StripedDataPath&) = delete;
@@ -176,9 +173,6 @@ public:
     }
     std::uint64_t test_device_effective_mdts(std::uint32_t device) const {
         return device_effective_mdts_(device);
-    }
-    std::uint32_t test_threads_per_block() const {
-        return threads_per_block_;
     }
     std::uint64_t test_submit_call_count() const { return test_submit_call_count_; }
     std::uint64_t test_kernel_launch_count() const { return test_kernel_launch_count_; }
@@ -363,7 +357,6 @@ private:
     std::uint32_t cq_poll_budget_ = 0;
     std::uint32_t max_batch_entries_ = 0;
     std::uint64_t max_in_flight_operations_ = 0;
-    std::uint32_t threads_per_block_ = 16;
     // Round 16 S5: cache capacity (default OFF, aligned to LocalNvme).
     std::uint32_t prp_cache_capacity_ = 0;
     std::uint32_t block_size_ = 0;         // uniform across all shards

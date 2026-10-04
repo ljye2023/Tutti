@@ -16,7 +16,6 @@ cudaError_t launch_submit_one(
     EntryCompletionStatus*   d_status,
     std::uint32_t            count,
     std::uint32_t            cq_poll_budget,
-    std::uint32_t            threads_per_block,
     std::uint32_t            inject_flag,
     void*                    stream,
     std::uint32_t            pool_workers,
@@ -27,8 +26,8 @@ cudaError_t launch_submit_one(
     if (pool_workers == 0 || d_task_counter == nullptr) {
         // Legacy model: one thread per entry.
         const std::uint32_t blocks = count == 0
-            ? 1 : 1 + (count - 1) / threads_per_block;
-        submit_one_kernel<<<blocks, threads_per_block, 0, s>>>(
+            ? 1 : 1 + (count - 1) / kSubmitBlockThreads;
+        submit_one_kernel<<<blocks, kSubmitBlockThreads, 0, s>>>(
             d_entries, d_status, count, cq_poll_budget, inject_flag);
         return cudaGetLastError();
     }
@@ -41,8 +40,8 @@ cudaError_t launch_submit_one(
     if (me != cudaSuccess) {
         return me;
     }
-    const std::uint32_t tpb = pool_workers < threads_per_block
-        ? (pool_workers ? pool_workers : 1u) : threads_per_block;
+    const std::uint32_t tpb = pool_workers < kSubmitBlockThreads
+        ? (pool_workers ? pool_workers : 1u) : kSubmitBlockThreads;
     const std::uint32_t blocks = 1 + (pool_workers - 1) / tpb;
     submit_one_kernel_pool<<<blocks, tpb, 0, s>>>(
         d_entries, d_status, count, cq_poll_budget, inject_flag,

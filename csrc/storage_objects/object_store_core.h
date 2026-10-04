@@ -8,7 +8,7 @@
 // Assembles the six units of this layer into one store:
 //
 //   space_allocator        slot numbers, states, generations
-//   slot_placement_policy  slot -> paths/URI (the only striping-aware seam)
+//   slot_placement_policy  slot -> segment file path/URI/offsets
 //   slot_media             O_DIRECT materialisation and metadata IO
 //   object_header_codec    the validity statement, one header per object
 //   checkpoint_region      mirrored index snapshots
@@ -61,14 +61,9 @@ struct RecoveryReport {
 
 class ObjectStoreCore final : public StorageObjectStore {
 public:
-    // Deferred form, used by create_storage_object_store(): the placement policy
-    // is built during open() from StoreConfig::devices, because until then the
-    // mount paths are not known.
+    // The placement is built during open() from StoreConfig::devices, because
+    // until then the mount paths are not known.
     ObjectStoreCore();
-
-    // Injected form: the core takes its placement policy directly. Keeps it
-    // testable and lets a deployment supply its own layout.
-    explicit ObjectStoreCore(std::unique_ptr<SlotPlacementPolicy> placement);
     ~ObjectStoreCore() override;
 
     // ---- StorageObjectStore ----
@@ -101,17 +96,11 @@ public:
     Result<std::vector<ObjectKey>> recover() override;
     Status checkpoint() override;
 
-    // ---- asynchronous growth: precreate (see the SPI contract for 术语) ----
+    // ---- growth: file-group precreate (see the SPI contract) ----
 
-    // Advance the precreated prefix by at most `max_slots` slots, stopping
-    // early once `headroom` slots exist beyond the allocation frontier. The
-    // lock is held only to claim a slot and to publish its completion, so a
-    // concurrent reserve/commit never waits for more than one slot's IO.
-    Result<std::uint64_t> precreate_step(std::uint64_t max_slots,
-                                        std::uint64_t headroom) override;
+    Result<std::uint64_t> precreate_step(std::uint64_t headroom) override;
     std::uint64_t precreated_slots() const override;
     std::uint64_t precreate_target() const override;
-    void set_precreate_on_write(bool enabled) override;
 
     // ---- test seams ----
 
@@ -136,17 +125,16 @@ private:
     static std::string index_key(const ObjectKey& key);
 
     Status ensure_layout_locked();
-    // Build the placement policy from config_.devices when it was not injected.
-    // No-op for the injected form.
+    // Build the placement from config_.devices and the segment geometry.
     Status build_backend_locked();
-    // Adopt the prefix of slots already on media (probe only, writes nothing),
-    // stopping at the first one that is missing. Used at open(): a pool being
-    // reused is proven reusable without any IO, and a pool being grown keeps
-    // the precreate cost off the open() path.
-    Status adopt_existing_through_locked(std::uint64_t slot_exclusive_end);
-    // Precreate every slot below `slot_exclusive_end`. Only the write path uses
-    // this, and only when precreate_on_write_ is enabled.
-    Status precreate_through_locked(std::uint64_t slot_exclusive_end);
+    // Adopt the leading file groups already on media (probe only, writes
+    // nothing), stopping at the first group with a missing or unready file.
+    Status adopt_existing_groups_locked();
+    // Paths of the files forming the group that contains `slot`.
+    Status group_paths_locked(std::uint64_t slot,
+                              std::vector<std::string>* out) const;
+    // Zero-fill, fsync and verify every file of `paths` (no lock held).
+    Status materialise_group(const std::vector<std::string>& paths) const;
     ObjectPlacement placement_locked(std::uint64_t slot,
                                      std::uint64_t generation) const;
     Status write_header_locked(std::uint64_t slot, const ObjectKey& key,
@@ -163,26 +151,19 @@ private:
 
     mutable std::mutex mutex_;
 
-    std::unique_ptr<SlotPlacementPolicy> placement_;
+    std::unique_ptr<FixedSegmentFilePlacement> placement_;
 
     StoreConfig config_;
     bool opened_ = false;
 
     std::uint64_t slot_bytes_ = 0;        // header + payload, per slot
-    std::uint64_t shard_bytes_ = 0;       // per shard file
     std::uint64_t precreated_ = 0;        // slots [0, precreated_) are ready
-    // Asynchronous growth. Claims come from `precreate_cursor_` and the prefix
-    // only advances in order, so [0, precreated_) stays "on media" even with
-    // several precreate threads; `precreate_done_` holds slots that finished
-    // out of order.
-    std::uint64_t precreate_cursor_ = 0;
-    std::unordered_set<std::uint64_t> precreate_done_;
-    // 最近一次 precreate_step() 算出的前沿（就绪到这个数就算追上需求）。
+    // Slots per file group (segment_file_slots x devices). A group is the
+    // precreate unit and is published only when all its files are ready.
+    std::uint64_t group_slots_ = 0;
+    // True while a precreate_step() is materialising a group outside the lock.
+    bool precreate_busy_ = false;
     std::uint64_t precreate_target_ = 0;
-    // True = the write path may create+fsync a slot itself (the historical
-    // behaviour). False = growth belongs to precreate_step() and reserve()
-    // rejects a slot that is not ready yet instead of blocking on it.
-    bool precreate_on_write_ = true;
     std::uint64_t commit_seq_ = 0;        // monotonic, shared with checkpoints
     std::uint64_t checkpoint_seq_ = 0;
     std::uint64_t container_bytes_ = 0;

@@ -50,8 +50,6 @@ struct SpaceAllocatorConfig {
     std::uint64_t capacity_bytes = 0;
     // On-media bytes per slot, header included.
     std::uint64_t slot_bytes = 0;
-    // Slots to materialise up front. Clamped to the derived slot count.
-    std::uint64_t prewarm_slots = 0;
 };
 
 struct SpaceAllocatorStats {
@@ -60,7 +58,7 @@ struct SpaceAllocatorStats {
     std::uint64_t reserved_slots = 0;
     std::uint64_t committed_slots = 0;
     std::uint64_t reclaiming_slots = 0;
-    // Slots never handed out yet: materialisation is lazy beyond prewarm.
+    // Slots never handed out yet (the allocation frontier is below them).
     std::uint64_t unmaterialised_slots = 0;
 };
 
@@ -91,8 +89,10 @@ public:
     std::uint64_t total_slots() const;
     std::uint64_t slot_bytes() const;
 
-    // Slots that should be materialised before serving traffic.
-    std::uint64_t prewarm_slots() const;
+    // Never-used slots at or above `limit` are not handed out: their backing
+    // file does not exist yet. Recycled slots are unaffected. Unlimited by
+    // default.
+    void set_ready_limit(std::uint64_t limit);
 
     // Reserve up to `count` slots. Takes what is available and reports the
     // remainder in `rejected`. Never blocks, never fails as a whole.
@@ -132,11 +132,11 @@ private:
     mutable std::mutex mutex_;
     std::uint64_t total_slots_ = 0;
     std::uint64_t slot_bytes_ = 0;
-    std::uint64_t prewarm_slots_ = 0;
 
     // Slots beyond this have never been handed out. Materialisation is lazy so
     // a large ceiling does not imply a long open().
     std::uint64_t high_water_ = 0;
+    std::uint64_t ready_limit_ = UINT64_MAX;
 
     std::vector<SlotState> states_;
     std::vector<std::uint64_t> generations_;

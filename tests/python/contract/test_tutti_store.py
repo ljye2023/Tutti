@@ -31,6 +31,9 @@ from tutti.storage.tutti_nvme.store import (
 import json
 
 SEG = 4096
+# 小段文件：每文件 8 槽，避免每个用例零填充一个默认 2048 槽的大文件。
+SLOTS_PER_FILE = 8
+HEADER = 32 * 1024
 
 
 def io_key(chunk: bytes, layer: int) -> bytes:
@@ -170,7 +173,8 @@ def register_factory(register) -> None:
     def make_store() -> TuttiKVStore:
         root = tempfile.mkdtemp(prefix="tutti-nvme-contract-")
         store = TuttiKVStore(
-            root=root, num_chunks=8, segment_bytes=4096, runtime=FakeRuntime()
+            root=root, num_chunks=8, segment_bytes=4096, runtime=FakeRuntime(),
+            segment_file_slots=SLOTS_PER_FILE,
         )
         # 对象几何（段数 × 段大小 + 对象头）必须定案才能落盘。通用契约的
         # key 是不带层号的短 key（每 key 自成一个对象），故层宽取 1。
@@ -193,6 +197,7 @@ def make_store(tmp_path, num_chunks=8, runtime=None, layers=4) -> TuttiKVStore:
         num_chunks=num_chunks,
         segment_bytes=SEG,
         runtime=runtime or FakeRuntime(),
+        segment_file_slots=SLOTS_PER_FILE,
     )
     # 对象几何必须定案（对象头 + 每层一个段）才能分配槽位。
     store.set_layer_span(layers)
@@ -644,7 +649,7 @@ def _slot_path(store, chunk_id) -> Path:
 
 
 def test_layer_segments_share_one_object(tmp_path):
-    """同 chunk 各层共用一个对象文件；段 offset = 对象头 + layer × segment。"""
+    """同 chunk 各层共用一个槽位；段 offset = 槽位前缀 + layer × segment。"""
     store = make_store(tmp_path, layers=6)
     store.open()
     src = bytearray(SEG)
@@ -658,23 +663,25 @@ def test_layer_segments_share_one_object(tmp_path):
     path = _slot_path(store, chunk)
     data = path.read_bytes()
     payload = store._layout.target_offset(chunk)
-    assert payload == 4096                      # 自描述对象头
-    assert len(data) == payload + 6 * SEG       # 几何按层宽定型，不是"用多少长多少"
+    assert payload == HEADER                    # 槽位 0：前缀后即段 0
+    # 段文件按几何整体定型：每文件 SLOTS_PER_FILE 个 (前缀 + 6 段) 槽位。
+    assert len(data) == SLOTS_PER_FILE * (HEADER + 6 * SEG)
     for layer in layers:
         segment = data[payload + layer * SEG:payload + (layer + 1) * SEG]
         assert segment == bytes([0x40 + layer]) * SEG
 
 
 def test_slot_materialisation_is_physical(tmp_path):
-    """预留即物化：整槽位实写零（物理块就位），非稀疏跳写。"""
+    """段文件整体实写零（物理块就位），非稀疏文件。"""
     store = make_store(tmp_path, layers=4)
     store.open()
     src_id = store.register_buffer(bytearray(SEG), SEG)
     chunk = b"\x22" * 16
     store.put_batch([(io_key(chunk, 3), src_id, 0)]).wait()
     path = _slot_path(store, chunk)
-    assert path.stat().st_size == 4096 + 4 * SEG
-    assert path.stat().st_blocks * 512 >= 4096 + 4 * SEG
+    file_bytes = SLOTS_PER_FILE * (HEADER + 4 * SEG)
+    assert path.stat().st_size == file_bytes
+    assert path.stat().st_blocks * 512 >= file_bytes
 
 
 def test_incomplete_object_is_unreadable(tmp_path):
@@ -715,9 +722,9 @@ def test_capacity_exhaustion_trims_batch(tmp_path, caplog):
     assert len(resident) == 2                  # 容量只允许两个对象
     assert set(resident) <= set(keys)
     assert any("ADMISSION_SHORTFALL" in r.message for r in caplog.records)
-    # 未受理的 chunk 不进驻留集合、也不产出对象文件
-    slots = _slot_path(store, bytes(resident[0][:16])).parent
-    assert len(list(slots.glob("*.obj"))) <= 2
+    # 未受理的 chunk 不进驻留集合；盘上只有一个段文件（容量 2 < 一个文件组）
+    segments = _slot_path(store, bytes(resident[0][:16])).parent
+    assert sorted(p.name for p in segments.glob("*.seg")) == ["0.seg"]
     rejected = [key for key in keys if key not in set(resident)]
     for key in rejected:
         assert not store._layout.is_committed(bytes(key[:16]))
@@ -849,8 +856,8 @@ def test_write_leaves_object_files_only(tmp_path):
         runtime=FakeRuntime(),
         rank_id=2,
         tp_size=4,
-        max_slots=2,
         allocator_enabled=False,
+        segment_file_slots=SLOTS_PER_FILE,
     )
     store.set_key_namespace(namespace)
     store.open()
@@ -865,7 +872,7 @@ def test_write_leaves_object_files_only(tmp_path):
 
     # 对象有效 ⇔ 全部段都写过；归属与几何都在对象头里
     assert store._layout.is_committed(chunk)
-    assert store._layout.target_offset(chunk) == 4096
+    assert store._layout.target_offset(chunk) == HEADER
     assert store._layout.target_size(chunk) == 2 * SEG
 
     names = {path.name for path in root.rglob("*")}
@@ -1098,7 +1105,6 @@ def test_preset_optional_fields_parse(tmp_path):
         "num_queues",
         "max_batch_entries",
         "max_in_flight_operations",
-        "threads_per_block",
         "handle_cache_capacity",
         "prp_cache_capacity",
     ],
@@ -1287,12 +1293,8 @@ def test_derive_striped_devices_from_daemon(tmp_path):
             == "/custom")
 
 
-def test_striped_store_derives_mounts_from_preset(tmp_path):
-    """striped store：mounts 从 preset.devices 的 daemon 推导结果取得。
-
-    （原 test_striped_store_rejects_stripe_unit_mismatch 已删除：stripe_unit
-    随条带化一起移除，"options 与 preset 不一致"的守卫失去了对象。）
-    """
+def test_store_derives_mounts_from_preset(tmp_path):
+    """未显式给 mounts 时，mounts 从 preset.devices 的 daemon 推导结果取得。"""
     import yaml
 
     nvme0 = tmp_path / "nvme0"
@@ -1310,8 +1312,7 @@ def test_striped_store_derives_mounts_from_preset(tmp_path):
         "devices": [{"device_id": 0}, {"device_id": 2}],
     }
     store = TuttiKVStore(
-        tmp_path / "meta-root", 8, SEG,
-        layout="striped", preset=preset,
+        tmp_path / "meta-root", 8, SEG, preset=preset,
     )
     assert store._layout.mounts == (
         str(nvme0.resolve()), str(nvme2.resolve())

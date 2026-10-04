@@ -126,11 +126,12 @@ struct StoreDevice {
 // -------------------------------------------------------------------------
 // StoreConfig
 //
-// capacity_bytes is a CEILING declaration; prewarm_bytes is how much space is
-// materialised during open(). They are separate because materialisation costs
-// real time: extents must be genuinely written (FIEMAP-backed DMA cannot use
-// sparse or preallocated holes), measured at roughly 225 MB/s per rank, so a
-// terabyte-scale ceiling must not imply an hour-scale open().
+// capacity_bytes / capacity_slots is a CEILING declaration. Media is
+// materialised one file group at a time (one fixed-size segment file per
+// device): open() makes the first group ready, precreate_step() adds later
+// groups. Materialisation writes real zeros (FIEMAP-backed DMA cannot use
+// sparse or preallocated holes), so the ceiling never implies an up-front
+// write of the whole capacity.
 // -------------------------------------------------------------------------
 struct StoreConfig {
     // Namespace root: where this store's metadata (checkpoint, residency
@@ -150,27 +151,21 @@ struct StoreConfig {
 
     ObjectLayout layout;
 
+    // Fixed-size shared file geometry; a file holds segment_file_slots slots.
+    // These must be nonzero. A change to either value requires a new namespace.
+    std::uint64_t segment_file_slots = 0;
+
+    // Reserved prefix within each slot. The object header remains in its first
+    // 4096 bytes; the payload starts at this 4096-aligned offset.
+    std::uint64_t segment_header_bytes = 0;
+
     // Geometry/model fingerprint. A mismatch against persisted state is
     // fail-closed (open() returns INVALID_ARGUMENT and preserves the data).
     std::vector<std::uint8_t> namespace_fingerprint;
 
-    // Backing devices. One device: every slot is a file under its mount. Two or
-    // more: slots rotate over them by slot number, one file per slot on one
-    // device (see RotatingFilePlacement).
+    // Backing devices. Slots rotate over them by slot number; each device holds
+    // this rank's fixed-size segment files under <mount_path>/r<rank>/segments.
     std::vector<StoreDevice> devices;
-
-    // Bytes of usable space to materialise before open() returns. 0 = none.
-    // Slot-count form of prewarm_bytes (non-zero wins). See capacity_slots.
-    std::uint64_t prewarm_slots = 0;
-    std::uint64_t prewarm_bytes = 0;
-
-    // 预热只走查（probe）已存在的槽位，不创建缺失的。默认 false = 旧的
-    // 同步语义：open() 把缺失的预热槽位建出来。
-    //
-    // 置 true 用于"增长由后台预建驱动"的部署（配 set_precreate_on_write(false)）：
-    // 那样 open() 只证明已有槽位可用，容量差量在后台补——大容量的冷启动因此
-    // 不在 open 期付建文件的代价。
-    bool warmup_probe_only = false;
 
     // Background space reclamation. When false, reclamation runs
     // synchronously on the calling thread (single-threaded tests).
@@ -445,8 +440,8 @@ public:
 
     // ---- Bind-time warm-up ----
     //
-    // Slots whose backing files exist on media right now (materialised by
-    // prewarm, by recovery, or by an earlier reservation). A caller that wants
+    // Slots whose backing files exist on media right now: the ready file-group
+    // prefix, [0, ready_slots()). A caller that wants
     // to warm the runtime's target and peer-memory registration caches before
     // serving traffic needs real URIs to open: the first IO on a slot otherwise
     // pays resolve() plus registration -- hundreds of milliseconds per device,
@@ -506,55 +501,37 @@ public:
     // schedule; this exists for shutdown and for tests.
     virtual Status checkpoint() = 0;
 
-    // ---- Asynchronous growth: precreate ----
+    // ---- Growth: file-group precreate ----
     //
-    // 术语（这一节只用这三个词，避免与对象层/mmap 的“物化”撞车）：
-    //   预热 warmup     open() 期同步做掉调用方声明的那一份（首个请求的工作集）；
-    //   预建 precreate  把一个槽位建成“尺寸正确、内容为零”的可用状态。这是本层
-    //                   唯一的批量 IO（写实零 + fsync，~44ms/槽），所以**只允许
-    //                   在后台做**：放在 open 期＝大容量起不来，放在写路径＝每个
-    //                   新槽位卡住前向线程。
-    //   就绪 ready      已预建、可被分配。写路径只认可就绪槽位。
+    // The unit of precreation is a file group: one fixed-size segment file per
+    // device, i.e. segment_file_slots x devices consecutive slots. A group is
+    // published only after every one of its files is zero-filled, fsynced and
+    // FIEMAP-verified, so [0, precreated_slots()) is always backed by media.
     //
-    // 复用与增长共用同一条前沿：容量以内的槽位若已存在，open 只做走查（probe，
-    // 一个字节都不写）就登记为就绪；只在“容量 > 盘上已有”时，差量才由后台预建。
-    //
-    // 旧叫法对照：本文件其他段落与 slot_media 里的 materialise/materialisation
-    // （如 prewarm_bytes 的说明、materialise_slot()）指的是同一件事——单槽的
-    // precreate 实现。新代码一律用上面三个词，旧名待统一。
-    //
-    // 契约分两半：
-    //   * open() 只走查/预热声明的前缀，不越界创建；
-    //   * 后台调用者用 precreate_step() 推进前沿；一旦调用过
-    //     set_precreate_on_write(false)，写路径遇到未就绪槽位就**拒绝**而不是自己
-    //     建（与容量耗尽同一契约——调用方本来就会裁剪），且自愈：后台追上后
-    //     同一笔写即成功。
+    //   * open() adopts every group already on media and, for a writer,
+    //     materialises the first group before returning. Service startup
+    //     therefore waits for the first files once; nothing is created lazily.
+    //   * reserve() never creates media. A slot beyond precreated_slots() is
+    //     rejected like capacity exhaustion (the caller trims its write).
+    //   * precreate_step() is the only growth path and runs on a background
+    //     thread.
 
-    // 至多预建 `max_slots` 个槽位，并在“分配前沿之后已有 `headroom` 个就绪槽位”
-    // 时提前收工。返回本次预建了多少个；0 表示无事可做。
-    //
-    // 实现不得跨槽位持锁做 IO：并发的 reserve/commit/read 因此最多等一个槽位的
-    // 时间。可被多线程调用——认领不得重叠，前沿只能按序推进。
-    virtual Result<std::uint64_t> precreate_step(std::uint64_t max_slots,
-                                                 std::uint64_t headroom) {
-        (void)max_slots;
+    // Materialises the next file group when fewer than `headroom` ready slots
+    // remain past the allocation frontier. Returns the number of slots
+    // published (0 = nothing to do, or another call is already building).
+    // No store lock is held during the file IO.
+    virtual Result<std::uint64_t> precreate_step(std::uint64_t headroom) {
         (void)headroom;
         return Result<std::uint64_t>::Failure(
             Status(StatusCode::UNSUPPORTED, "precreate_step unsupported"));
     }
 
-    // 已被证明存在于介质上的槽位：[0, precreated_slots()) 是就绪的。返回 0
-    // 表示“未知”，调用方必须当作“尚未就绪”。
+    // Slots [0, precreated_slots()) are ready. 0 means "unknown/none".
     virtual std::uint64_t precreated_slots() const { return 0; }
 
-    // 上一次 precreate_step() 计算出的前沿：预建到它就算追上需求，再往前
-    // 没有工作。调用方用它区分“暂时被在飞认领挡住”和“真的无事可做”——
-    // 两者都返回 0 个新建槽位，但前者该立刻重试，后者该让出 CPU。
+    // Target computed by the last precreate_step(): growth has caught up when
+    // precreated_slots() reaches it.
     virtual std::uint64_t precreate_target() const { return 0; }
-
-    // 写路径是否允许自己 create+fsync 一个即将使用的槽位。False 用于“增长由
-    // precreate_step() 驱动”的部署。
-    virtual void set_precreate_on_write(bool enabled) { (void)enabled; }
 };
 
 // -------------------------------------------------------------------------

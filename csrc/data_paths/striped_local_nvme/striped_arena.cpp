@@ -74,6 +74,15 @@ bool StripedArena::init(const Config& cfg) {
                                     (cfg_.max_entries_per_slot + 1) *
                                     sizeof(EntryCompletionStatus);
     ce = cudaMalloc(reinterpret_cast<void**>(&d_status_pool_), status_pool_bytes);
+    if (ce == cudaSuccess) {
+        // Task cursors start at zero; afterwards the pool kernel resets its
+        // own cursor on exit, so no per-launch memset is needed.
+        ce = cudaMemset(d_status_pool_, 0, status_pool_bytes);
+        if (ce != cudaSuccess) {
+            cudaFree(d_status_pool_);
+            d_status_pool_ = nullptr;
+        }
+    }
     if (ce != cudaSuccess) {
         cudaFree(d_entries_pool_);
         d_entries_pool_ = nullptr;

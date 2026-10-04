@@ -1,6 +1,7 @@
 // tests/storage_objects_media_contract/storage_objects_media_contract_test.cpp
 //
-// Contract test for the placement policy and the physical media layer.
+// Contract test for the physical media layer (placement is covered by the
+// segment-files test).
 //
 // Needs a real filesystem that supports O_DIRECT. That is not incidental: the
 // whole layer exists to keep KV data out of the page cache, so a test on a
@@ -16,7 +17,6 @@
 #include "csrc/storage_objects/checkpoint_region.h"
 #include "csrc/storage_objects/object_header_codec.h"
 #include "csrc/storage_objects/slot_media.h"
-#include "csrc/storage_objects/slot_placement_policy.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -84,8 +84,6 @@ bool o_direct_supported(const std::string& dir) {
 constexpr std::uint64_t kSegmentBytes = 131072;   // 128 KiB, as deployed
 constexpr std::uint32_t kSegmentCount = 80;       // 80 layers
 constexpr std::uint64_t kPayload = kSegmentBytes * kSegmentCount;  // 10 MiB
-// A slot's space is the placement's payload prefix plus the payload.
-constexpr std::uint64_t kSlotBytes = ObjectHeaderLayout::kHeaderBytes + kPayload;
 
 ObjectKey key_of(std::uint8_t tag, std::size_t len = 18) {
     ObjectKey k;
@@ -94,153 +92,7 @@ ObjectKey key_of(std::uint8_t tag, std::size_t len = 18) {
 }
 
 // ======================================================================
-// 1. SingleFilePlacement
-// ======================================================================
-void test_single_file_placement() {
-    SingleFilePlacement policy("/mnt/nvme0/ns");
-
-    CHECK(policy.shard_count() == 1);
-    CHECK(policy.header_shard() == 0);
-    CHECK(policy.header_offset_in_shard() == 0);
-    // Segment 0 starts right after the header.
-    CHECK(policy.payload_offset() == ObjectHeaderLayout::kHeaderBytes);
-
-    std::vector<std::string> paths;
-    CHECK(policy.paths_for_slot(7, &paths).ok());
-    REQUIRE(paths.size() == 1);
-    CHECK(paths[0] == "/mnt/nvme0/ns/slots/7.obj");
-
-    // Slot files are named by NUMBER, not by key. This is what makes the layout
-    // rename-free: binding a key to a slot is a metadata event, so a slot's path
-    // never changes across reuse and path-keyed caches upstream stay warm.
-    std::vector<std::string> again;
-    CHECK(policy.paths_for_slot(7, &again).ok());
-    CHECK(again == paths);
-
-    CHECK(policy.shard_file_bytes(kSlotBytes) == kSlotBytes);
-    // The URI format is dictated by the local-file resolver, which requires the
-    // "file://" prefix followed by an absolute path and takes that path verbatim
-    // as the backing file.
-    CHECK(policy.resolver_scheme() == "file");
-    CHECK(policy.uri_for_slot(7) == "file:///mnt/nvme0/ns/slots/7.obj");
-    CHECK(policy.uri_for_slot(0).rfind("file:///", 0) == 0);
-    // The URI's path must be exactly the path that gets materialised, or
-    // materialisation and resolution would touch different files.
-    CHECK(policy.uri_for_slot(7) == "file://" + paths[0]);
-
-    // Distinct slots never collide.
-    std::vector<std::string> a, b;
-    CHECK(policy.paths_for_slot(1, &a).ok());
-    CHECK(policy.paths_for_slot(2, &b).ok());
-    CHECK(a != b);
-
-    CHECK(!policy.paths_for_slot(0, nullptr).ok());
-
-    // A root with a trailing slash must not produce a doubled separator.
-    SingleFilePlacement trailing("/mnt/nvme0/ns/");
-    std::vector<std::string> tp;
-    CHECK(trailing.paths_for_slot(3, &tp).ok());
-    REQUIRE(tp.size() == 1);
-    CHECK(tp[0] == "/mnt/nvme0/ns/slots/3.obj");
-}
-
-// ======================================================================
-// 2. RotatingFilePlacement
-// ======================================================================
-void test_rotating_file_placement() {
-    const std::vector<std::string> mounts = {"/mnt/nvme0/kv", "/mnt/nvme1/kv"};
-    RotatingFilePlacement policy(mounts);
-
-    // A slot is one file, so there is no shard set and no stripe geometry.
-    CHECK(policy.shard_count() == 1);
-    CHECK(policy.header_shard() == 0);
-    CHECK(policy.header_offset_in_shard() == 0);
-    CHECK(policy.payload_offset() == ObjectHeaderLayout::kHeaderBytes);
-
-    std::vector<std::string> paths;
-    CHECK(policy.paths_for_slot(5, &paths).ok());
-    REQUIRE(paths.size() == 1);
-    // 5 % 2 == 1 -> mount 1, and the file is the slot: one path, verbatim what
-    // the local-file resolver will take from the URI.
-    CHECK(paths[0] == "/mnt/nvme1/kv/chunks/5.obj");
-    CHECK(paths[0].rfind("/mnt/nvme1/", 0) == 0);
-
-    // A slot occupies exactly one file of exactly the slot size -- the whole
-    // object, header included.
-    const std::uint64_t slot_bytes = policy.payload_offset() + kPayload;
-    CHECK(policy.shard_file_bytes(slot_bytes) == slot_bytes);
-
-    // --- the rotation is what spreads a prompt across devices ---
-    //
-    // Consecutive slot numbers are consecutive chunks of a prompt, so with N
-    // mounts each device owns one slot in every N. If this ever degenerated to
-    // a constant (the bug the striped layout had: every chunk's layer L landed
-    // on device L % N) the whole prompt would queue behind one device.
-    {
-        std::vector<int> per_mount(mounts.size(), 0);
-        for (std::uint64_t slot = 0; slot < 40; ++slot) {
-            std::vector<std::string> p;
-            REQUIRE(policy.paths_for_slot(slot, &p).ok());
-            REQUIRE(p.size() == 1);
-            const std::uint64_t dev = policy.device_for_slot(slot);
-            CHECK(p[0].rfind(mounts[dev] + "/", 0) == 0);
-            per_mount[dev] += 1;
-        }
-        // 40 slots over 2 mounts: 20 each, so load is even, not merely legal.
-        for (int count : per_mount) CHECK(count == 20);
-    }
-
-    // --- empty mount list is a configuration error, reported not crashed ---
-    RotatingFilePlacement empty({});
-    CHECK(!empty.geometry_valid());
-    std::vector<std::string> none;
-    CHECK(!empty.paths_for_slot(0, &none).ok());
-    CHECK(!policy.paths_for_slot(0, nullptr).ok());
-
-    // --- the URI is the exact file the resolver will map ---
-    //
-    // Any divergence between uri_for_slot() and paths_for_slot() would have
-    // materialisation write one file while resolution maps another, leaving DMA
-    // pointed at unallocated extents. Both are asserted byte-for-byte above.
-    CHECK(policy.resolver_scheme() == "file");
-    const std::string uri = policy.uri_for_slot(4);
-    CHECK(uri == "file:///mnt/nvme0/kv/chunks/4.obj");
-    CHECK(uri.rfind("file://", 0) == 0);
-    // A pure function of the slot number, so targets can be cached by slot.
-    CHECK(policy.uri_for_slot(4) == uri);
-    CHECK(policy.uri_for_slot(5) != uri);
-
-    // --- four mounts, the deployed shape ---
-    RotatingFilePlacement four({"/a", "/b", "/c", "/d"});
-    CHECK(four.shard_count() == 1);
-    std::vector<std::string> fp;
-    CHECK(four.paths_for_slot(9, &fp).ok());
-    REQUIRE(fp.size() == 1);
-    // 9 % 4 == 1 -> second mount.
-    CHECK(fp[0] == "/b/chunks/9.obj");
-    CHECK(four.paths_for_slot(11, &fp).ok());
-    CHECK(fp[0] == "/d/chunks/11.obj");
-
-    // --- a custom subdirectory is honoured by both paths and URIs ---
-    RotatingFilePlacement sub(mounts, "objects");
-    CHECK(sub.paths_for_slot(2, &fp).ok());
-    CHECK(fp[0] == "/mnt/nvme0/kv/objects/2.obj");
-    CHECK(sub.uri_for_slot(2) == "file://" + fp[0]);
-
-    // --- the two policies agree on what they must agree on ---
-    // Both put the header at file 0 offset 0 and start the payload right after
-    // it: a rotating slot and a single-root slot are the same object shape, and
-    // only the mount decision differs.
-    SingleFilePlacement single("/mnt/nvme0/ns");
-    CHECK(single.header_shard() == policy.header_shard());
-    CHECK(single.header_offset_in_shard() == policy.header_offset_in_shard());
-    CHECK(single.payload_offset() == policy.payload_offset());
-    CHECK(single.shard_count() == policy.shard_count());
-    CHECK(single.resolver_scheme() == policy.resolver_scheme());
-}
-
-// ======================================================================
-// 3. AlignedBuffer
+// 1. AlignedBuffer
 // ======================================================================
 void test_aligned_buffer() {
     AlignedBuffer buf(4096);
@@ -287,7 +139,7 @@ void test_aligned_buffer() {
 }
 
 // ======================================================================
-// 4. Directory helpers
+// 2. Directory helpers
 // ======================================================================
 void test_directories(const std::string& dir) {
     const std::string nested = dir + "/a/b/c";
@@ -311,140 +163,83 @@ void test_directories(const std::string& dir) {
 }
 
 // ======================================================================
-// 5. Materialisation -- must allocate REAL blocks, not a sparse file
+// 3. Materialisation -- must allocate REAL blocks, not a sparse file
 // ======================================================================
 void test_materialisation(const std::string& dir) {
-    const std::string root = dir + "/mat";
-    SingleFilePlacement policy(root);
-
-    std::vector<std::string> paths;
-    REQUIRE(policy.paths_for_slot(0, &paths).ok());
-
-    // Use a small slot so the test stays fast; the property under test is
-    // block allocation, not size.
+    const std::string path = dir + "/mat/0.seg";
+    // Two small slots; the property under test is block allocation, not size.
     constexpr std::uint64_t kSmallSlot = 4096 * 16;  // 64 KiB
-    CHECK(materialise_slot(paths, kSmallSlot).ok());
+    constexpr std::uint64_t kFile = 2 * kSmallSlot;
+    CHECK(materialise_segment_file(path, kFile).ok());
 
     struct stat st{};
-    REQUIRE(::stat(paths[0].c_str(), &st) == 0);
-    CHECK(static_cast<std::uint64_t>(st.st_size) == kSmallSlot);
-
+    REQUIRE(::stat(path.c_str(), &st) == 0);
+    CHECK(static_cast<std::uint64_t>(st.st_size) == kFile);
     // THE point of materialisation: blocks must actually be allocated. The
     // resolver maps files to physical extents via FIEMAP and fail-closed rejects
     // UNWRITTEN/DELALLOC extents, because DMA cannot target blocks the
-    // filesystem has not committed. A sparse file would pass a size check and
-    // then fail at resolve time -- or worse, DMA into nothing.
-    const std::uint64_t allocated = static_cast<std::uint64_t>(st.st_blocks) * 512;
-    CHECK(allocated >= kSmallSlot);
+    // filesystem has not committed.
+    CHECK(static_cast<std::uint64_t>(st.st_blocks) * 512 >= kFile);
+    bool ready = false;
+    CHECK(segment_file_is_ready(path, kFile, &ready).ok());
+    CHECK(ready);
 
-    // Idempotent: an existing file at the right size is left alone. Rewriting on
-    // every restart would make bringing up an existing terabyte pool as
-    // expensive as creating it -- and, worse, would destroy the objects in it.
-    //
-    // Tested by the CONSEQUENCE rather than by mtime: mtime has one-second
-    // granularity, so a rewrite within the same second is invisible to it. What
-    // actually matters is that re-materialising preserves committed data.
-    {
-        const ObjectKey survivor = key_of(0x7E);
-        const std::uint64_t payload = kSmallSlot - ObjectHeaderLayout::kHeaderBytes;
-        std::vector<std::uint8_t> header(ObjectHeaderLayout::kHeaderBytes);
-        REQUIRE(encode_object_header(header.data(), header.size(), survivor,
-                                     payload, 5, 55));
-        REQUIRE(write_object_header(paths[0], 0, header.data(), header.size()).ok());
+    // Idempotent: a ready file is left alone, so re-materialising preserves a
+    // committed object (tested by consequence rather than mtime).
+    const ObjectKey survivor = key_of(0x7E);
+    const std::uint64_t payload = kSmallSlot - ObjectHeaderLayout::kHeaderBytes;
+    std::vector<std::uint8_t> header(ObjectHeaderLayout::kHeaderBytes);
+    REQUIRE(encode_object_header(header.data(), header.size(), survivor,
+                                 payload, 5, 55));
+    REQUIRE(write_object_header(path, kSmallSlot, header.data(), header.size()).ok());
+    CHECK(materialise_segment_file(path, kFile).ok());
+    std::vector<std::uint8_t> readback(ObjectHeaderLayout::kHeaderBytes);
+    CHECK(read_object_header(path, kSmallSlot, readback.data(), readback.size()).ok());
+    HeaderExpectation still;
+    still.key = &survivor;
+    still.payload_bytes = payload;
+    still.generation = 5;
+    CHECK(decode_object_header(readback.data(), readback.size(), still,
+                               nullptr) == HeaderRejection::kNone);
 
-        // Re-materialise the same slot at the same size.
-        CHECK(materialise_slot(paths, kSmallSlot).ok());
+    // Unaligned or zero sizes are refused rather than silently rounded.
+    CHECK(!materialise_segment_file(path, 0).ok());
+    CHECK(!materialise_segment_file(path, 1000).ok());
+    // A file larger than configured is a geometry mismatch, not reusable.
+    CHECK(!materialise_segment_file(path, kSmallSlot).ok());
+    bool absent_ready = true;
+    CHECK(segment_file_is_ready(dir + "/mat/absent.seg", kFile, &absent_ready).ok());
+    CHECK(!absent_ready);
 
-        std::vector<std::uint8_t> readback(ObjectHeaderLayout::kHeaderBytes);
-        CHECK(read_object_header(paths[0], 0, readback.data(), readback.size()).ok());
-        HeaderExpectation still;
-        still.key = &survivor;
-        still.payload_bytes = payload;
-        still.generation = 5;
-        // The object must still be there. A non-idempotent materialise would
-        // have zeroed it, and the header would decode as kEmptySlot.
-        CHECK(decode_object_header(readback.data(), readback.size(), still,
-                                   nullptr) == HeaderRejection::kNone);
-    }
+    // --- zeroing one slot invalidates its object and only its object ---
+    const ObjectKey first = key_of(0x42);
+    REQUIRE(encode_object_header(header.data(), header.size(), first, payload, 1, 1));
+    CHECK(write_object_header(path, 0, header.data(), header.size()).ok());
+    ObjectHeaderFields fields;
+    CHECK(read_object_header(path, 0, readback.data(), readback.size()).ok());
+    CHECK(peek_object_header(readback.data(), readback.size(), &fields) ==
+          HeaderRejection::kNone);
 
-    struct stat after{};
-    REQUIRE(::stat(paths[0].c_str(), &after) == 0);
-    CHECK(static_cast<std::uint64_t>(after.st_size) == kSmallSlot);
+    CHECK(zero_file_range(path, 0, kSmallSlot).ok());
+    CHECK(read_object_header(path, 0, readback.data(), readback.size()).ok());
+    CHECK(peek_object_header(readback.data(), readback.size(), &fields) ==
+          HeaderRejection::kEmptySlot);
+    CHECK(read_object_header(path, kSmallSlot, readback.data(), readback.size()).ok());
+    CHECK(decode_object_header(readback.data(), readback.size(), still,
+                               nullptr) == HeaderRejection::kNone);
 
-    // Unaligned or zero sizes are refused rather than silently rounded: the
-    // caller's geometry is wrong and should be fixed, not papered over.
-    CHECK(!materialise_slot(paths, 0).ok());
-    CHECK(!materialise_slot(paths, 1000).ok());
-    CHECK(!materialise_slot({}, kSmallSlot).ok());
-
-    // --- rotating materialisation puts each slot on exactly one mount ---
-    //
-    // A slot is one file on one device; the mount rotates with the slot number
-    // so consecutive slots (consecutive chunks of a prompt) spread over the
-    // devices. Materialising slot 3 twice must be idempotent and must produce
-    // one file, not a shard set.
-    ::mkdir((dir + "/st0").c_str(), 0755);
-    ::mkdir((dir + "/st1").c_str(), 0755);
-    RotatingFilePlacement rotating({dir + "/st0", dir + "/st1"});
-    std::vector<std::string> placed;
-
-    REQUIRE(rotating.paths_for_slot(3, &placed).ok());
-    REQUIRE(placed.size() == 1);
-    // 3 % 2 == 1 -> second mount; 4 % 2 == 0 -> first.
-    CHECK(placed[0].rfind(dir + "/st1", 0) == 0);
-    REQUIRE(rotating.paths_for_slot(4, &placed).ok());
-    CHECK(placed[0].rfind(dir + "/st0", 0) == 0);
-
-    REQUIRE(rotating.paths_for_slot(4, &placed).ok());
-    CHECK(materialise_slot(placed, kSmallSlot).ok());
-    struct stat ss{};
-    CHECK(::stat(placed[0].c_str(), &ss) == 0);
-    CHECK(static_cast<std::uint64_t>(ss.st_size) == kSmallSlot);
-    CHECK(static_cast<std::uint64_t>(ss.st_blocks) * 512 >= kSmallSlot);
-    // No shard siblings: the slot is one contiguous file, so there is nothing
-    // else to materialise and nothing that could be left behind on crash.
-    struct stat sibling{};
-    CHECK(::stat((dir + "/st0/chunks/4.obj.shard1").c_str(), &sibling) != 0);
-
-    // --- zeroing invalidates an object by erasing its header ---
-    // A zeroed header decodes as "never written" rather than as corruption,
-    // which is what makes a reclaimed slot indistinguishable from a fresh one.
-    {
-        std::vector<std::uint8_t> header(ObjectHeaderLayout::kHeaderBytes);
-        const ObjectKey key = key_of(0x42);
-        REQUIRE(encode_object_header(header.data(), header.size(), key,
-                                     kSmallSlot - ObjectHeaderLayout::kHeaderBytes,
-                                     1, 1));
-        CHECK(write_object_header(paths[0], 0, header.data(), header.size()).ok());
-
-        std::vector<std::uint8_t> readback(ObjectHeaderLayout::kHeaderBytes);
-        CHECK(read_object_header(paths[0], 0, readback.data(), readback.size()).ok());
-        ObjectHeaderFields fields;
-        CHECK(peek_object_header(readback.data(), readback.size(), &fields) ==
-              HeaderRejection::kNone);
-
-        CHECK(zero_slot(paths, kSmallSlot).ok());
-        CHECK(read_object_header(paths[0], 0, readback.data(), readback.size()).ok());
-        CHECK(peek_object_header(readback.data(), readback.size(), &fields) ==
-              HeaderRejection::kEmptySlot);
-    }
-
-    CHECK(!zero_slot(paths, 999).ok());
-    CHECK(!zero_slot({dir + "/absent.obj"}, kSmallSlot).ok());
+    CHECK(!zero_file_range(path, 1, kSmallSlot).ok());
+    CHECK(!zero_file_range(dir + "/absent.seg", 0, kSmallSlot).ok());
 }
 
 // ======================================================================
-// 6. Header IO round trip through real media
+// 4. Header IO round trip through real media
 // ======================================================================
 void test_header_io(const std::string& dir) {
-    const std::string root = dir + "/hdr";
-    SingleFilePlacement policy(root);
-    std::vector<std::string> paths;
-    REQUIRE(policy.paths_for_slot(11, &paths).ok());
-
+    const std::string path = dir + "/hdr/0.seg";
     constexpr std::uint64_t kSmallSlot = 4096 * 8;
-    REQUIRE(materialise_slot(paths, kSmallSlot).ok());
-
+    REQUIRE(materialise_segment_file(path, 2 * kSmallSlot).ok());
+    const std::vector<std::string> paths = {path};
     const ObjectKey key = key_of(0xC7);
     const std::uint64_t payload = kSmallSlot - ObjectHeaderLayout::kHeaderBytes;
 
@@ -469,10 +264,7 @@ void test_header_io(const std::string& dir) {
 
     // A never-written slot reads as empty, not as an error: this is the expected
     // state of free space and must not look like corruption.
-    std::vector<std::string> fresh;
-    REQUIRE(policy.paths_for_slot(12, &fresh).ok());
-    REQUIRE(materialise_slot(fresh, kSmallSlot).ok());
-    CHECK(read_object_header(fresh[0], 0, readback.data(), readback.size()).ok());
+    CHECK(read_object_header(paths[0], kSmallSlot, readback.data(), readback.size()).ok());
     CHECK(peek_object_header(readback.data(), readback.size(), &fields) ==
           HeaderRejection::kEmptySlot);
 
@@ -508,7 +300,7 @@ void test_header_io(const std::string& dir) {
 }
 
 // ======================================================================
-// 7. Checkpoint IO round trip, including the crash-recovery sequence
+// 5. Checkpoint IO round trip, including the crash-recovery sequence
 // ======================================================================
 void test_checkpoint_io(const std::string& dir) {
     const std::string path = dir + "/meta/checkpoint.bin";
@@ -629,9 +421,7 @@ void test_checkpoint_io(const std::string& dir) {
 } // namespace
 
 int main() {
-    // Placement policies are pure computation: always run.
-    test_single_file_placement();
-    test_rotating_file_placement();
+    // Pure computation: always run.
     test_aligned_buffer();
 
     const std::string dir = temp_dir();

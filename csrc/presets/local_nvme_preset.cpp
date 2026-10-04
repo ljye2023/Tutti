@@ -108,8 +108,7 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
         /*max_batch_requests=*/0,
         /*max_request_bytes_override=*/0,
         /*handle_cache_l2_capacity=*/0,
-        p.device.pci_bdf,
-        p.threads_per_block);
+        p.device.pci_bdf);
 
     auto* resolver = new LocalFileResolver(
         p.device.pci_bdf,
@@ -162,7 +161,7 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
         std::move(sdevs), (std::uint32_t)p.accel_id,
         /*mdts_override=*/0, /*cq_poll_budget=*/0,
         p.max_batch_entries, p.max_in_flight_operations,
-        p.prp_cache_capacity, p.threads_per_block);
+        p.prp_cache_capacity);
 
     // One "file" resolver dispatching by mount: a slot's file path already
     // names the device it lives on (placement rotated slots across mounts),

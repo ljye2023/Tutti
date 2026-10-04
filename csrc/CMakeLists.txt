@@ -460,6 +460,10 @@ if(BUILD_TESTING)
         "${TUTTI_REPOSITORY_ROOT}/tests/storage_object_store_e2e"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_object_store_e2e"
     )
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_object_store_segment_files"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_object_store_segment_files"
+    )
     message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime_contract")
 
     # Additional hardware-free contract tests (status, memory_types,

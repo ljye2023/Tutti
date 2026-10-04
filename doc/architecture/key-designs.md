@@ -105,20 +105,24 @@ Code: `tutti/include/tutti/storage_runtime.h` (`open_batch`),
 `tests/batch_open_perf/batch_open_perf.cpp`,
 `tutti/data_paths/local_nvme/metadata/metadata_arena.cpp`
 
-## 5. Multi-device striping
+## 5. Multi-device placement
 
-A striped target spans up to 4 NVMe devices in **tensor-sized units**: one
-K/V tensor lands whole on one drive, round-robin by tensor index — balance
-comes from statistical spread over many tensors, and a single IO is never
-fragmented across drives. Inside a tensor, splitting happens only at the
-MDTS layer (contiguous LBA ranges on the same device). A single fused
-kernel submits to all drives: a device table of per-device targets lets
-one launch fan a batch out across the whole fleet.
+KV lives in fixed segment files spread over up to 4 NVMe devices. A chunk is one
+slot; slot numbers rotate over the devices (`slot % N`) and each device packs
+2048 of its slots into one segment file. A chunk's layers are one contiguous
+region on one drive, so a single IO is never fragmented across drives; inside a
+chunk, splitting happens only at the MDTS layer (contiguous LBA ranges on the
+same device). Balance comes from consecutive chunks of a prompt rotating over
+the drives. A single fused kernel submits to all drives: a device table of
+per-target rows lets one launch fan a batch out across the whole fleet. Each
+slot reserves a 32 KiB header prefix so every payload starts 16 KiB-aligned —
+with a 4 KiB prefix the same reads were ~20% slower (the SSD's parallelism
+follows the LBA pattern).
 
-Measured (layerwise KV workload, 128 KiB tensors): **25.0 GB/s read on
-4 drives** — 98% of near-saturated per-drive bandwidth (single drive
-5.09 GB/s; dual drive 7.23 GB/s scaling-limited by workload shape).
+Measured (8-GPU HY3 TP8, 4 drives, 32 KiB per-layer reads): **26.6 GiB/s**
+aggregate read, close to fio on the raw block devices.
 
-Code: `tutti/data_paths/striped_local_nvme/fused_submit_kernel.cu`,
-`tutti/data_paths/striped_local_nvme/striped_data_path.cpp`,
-`tutti/resolvers/striped_file/resolver.h`
+Code: `csrc/data_paths/striped_local_nvme/fused_submit_kernel.cu`,
+`csrc/data_paths/striped_local_nvme/striped_data_path.cpp`,
+`csrc/storage_objects/slot_placement_policy.h`,
+`csrc/resolvers/local_file/multi_mount_resolver.h`

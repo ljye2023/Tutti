@@ -64,16 +64,16 @@ struct StripedDeviceSubmitEntry {
 //   count       — number of entries
 //   num_devs    — number of devices in the table (N)
 //   cq_poll_budget — max CQ poll iterations before timeout
-//   threads_per_block — configured CUDA block size
+//   (block size is kSubmitBlockThreads, one warp)
 //   inject_flag — test seam bitmask (0 = normal production)
 //   d_timing    — 4 x count globaltimer stamps, or nullptr
 //   stream      — CUDA stream
 //   pool_workers — 0 = one thread per entry (legacy); >0 = worker-pool
 //                  model with exactly this many worker threads
 //   d_task_counter — device atomic task cursor for the pool model; must
-//                  be a valid allocation whenever pool_workers > 0 (the
-//                  launcher resets it to 0 on the same stream before the
-//                  launch). Ignored when pool_workers == 0.
+//                  be a valid allocation whenever pool_workers > 0, zero
+//                  before the first launch (the kernel's last worker resets
+//                  it for the next one). Ignored when pool_workers == 0.
 // Returns cudaError_t from cudaGetLastError() after the launch.
 cudaError_t launch_fused_submit(
     const StripedDeviceSubmitEntry* d_entries,
@@ -82,7 +82,6 @@ cudaError_t launch_fused_submit(
     std::uint32_t                   count,
     std::uint32_t                   num_devs,
     std::uint32_t                   cq_poll_budget,
-    std::uint32_t                   threads_per_block,
     std::uint32_t                   inject_flag,
     unsigned long long*             d_timing,   // 4 x count, or nullptr
     void*                           stream,
@@ -186,14 +185,23 @@ void fused_submit_kernel_pool(const StripedDeviceSubmitEntry* entries,
 
     for (;;) {
         const std::uint32_t idx = atomicAdd(next_task, 1u);
-        if (idx >= count) return;
+        if (idx >= count) {
+            // Every worker ends with exactly one failing add, so the cursor
+            // stops at count + total_workers. The worker whose add returned
+            // the last value is the final one to touch it: it resets the
+            // cursor for the next launch on this arena slot, which replaces
+            // a per-launch cudaMemsetAsync (that memset is a kernel and has
+            // to wait for a free SM like any other).
+            if (idx == count + total_workers - 1u) atomicExch(next_task, 0u);
+            return;
+        }
 
         const StripedDeviceSubmitEntry e = entries[idx];
         EntryCompletionStatus* s = status ? &status[idx] : nullptr;
         unsigned long long* t = timing ? timing + 4u * idx : nullptr;
 
         if (e.dev_idx >= num_devs) {
-            if (s) { s->result = 1; }  // treat as resolve failure
+            if (s) { s->result = 1; s->nvme_status_dword3 = 0; }  // resolve failure
             continue;
         }
 

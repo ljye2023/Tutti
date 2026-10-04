@@ -109,8 +109,7 @@ eval "$(scripts/tutti-env.sh env)"
 python scripts/vllm/vllm_profile_offline.py \
     --model /path/to/model --tensor-parallel-size 8 --block-size 64 \
     --tokens 10000 --reuse-pct 90 --rounds 2 \
-    --kv-layout striped --stripe-unit 65536 \
-    --device-groups "0,1;2,3" --num-queues 8 \
+    --device-groups "0,1,2,3" --num-queues 8 \
     --kv-root '/mnt/nvme0/tutti-kv-{LOCAL_RANK}' \
     --kv-load-failure-policy fail --direct-transfer-strict
 ```
@@ -166,8 +165,8 @@ Skills/               this skill
 ```
 
 `references/architecture.md` covers layer responsibilities, the control flow of
-one request, why the index is memory-authoritative, KV layouts, the object pool
-and lazy registration.
+one request, why the index is memory-authoritative, the segment-file layout and
+its precreation, and lazy registration.
 
 ## Diagnostics
 

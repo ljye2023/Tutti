@@ -50,7 +50,7 @@ std::string local_yaml(const std::string& backend_config = "{}") {
         "  datapaths:\n"
         "    - id: datapath-0\n"
         "      type: local-nvme\n"
-        "      config: {handle_cache_capacity: 7, prp_cache_capacity: 8, handle_cache_l2_capacity: 9, threads_per_block: 64, max_in_flight_operations: 10, max_batch_entries: 11, io_granularity: 12}\n"
+        "      config: {handle_cache_capacity: 7, prp_cache_capacity: 8, handle_cache_l2_capacity: 9, max_in_flight_operations: 10, max_batch_entries: 11, io_granularity: 12}\n"
         "  backends:\n"
         "    - id: backend-0\n"
         "      contract: ext4-local-nvme\n"
@@ -86,7 +86,6 @@ int main() {
                 CHECK(datapath->handle_cache_capacity == 7);
                 CHECK(datapath->prp_cache_capacity == 8);
                 CHECK(datapath->handle_cache_l2_capacity == 9);
-                CHECK(datapath->threads_per_block == 64);
                 CHECK(datapath->max_in_flight_operations == 10);
                 CHECK(datapath->max_batch_entries == 11);
                 CHECK(datapath->io_granularity == 12);

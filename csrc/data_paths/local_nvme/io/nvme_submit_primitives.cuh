@@ -42,6 +42,13 @@ struct EntryCompletionStatus {
     std::uint32_t nvme_status_dword3 = 0;
 };
 
+// Block size of every NVMe submit kernel: one warp. Not configurable -- the
+// number of IO threads is set by the worker count, and a block of one warp
+// wastes no lanes. On a device whose SMs are all held by a full-device GEMM,
+// 8 one-warp blocks and 1 block of 256 threads cost that GEMM the same
+// (any resident IO block forces it into a second wave).
+constexpr std::uint32_t kSubmitBlockThreads = 32;
+
 } // namespace tutti::data_paths::local_nvme
 
 // =========================================================================
@@ -63,14 +70,17 @@ struct EntryCompletionStatus {
 namespace tutti::data_paths::local_nvme {
 
 // -------------------------------------------------------------------------
-// QueueAcquireHelper — ported verbatim from main.
+// QueueAcquireHelper — ported from main.
 // -------------------------------------------------------------------------
 
 class QueueAcquireHelper {
 public:
+    // Global thread index modulo the queue count. (main used
+    // blockDim * 32 + threadIdx, which ignores blockIdx: every block's
+    // thread t landed on the same queue.)
     TUTTI_DEVICE TUTTI_FORCEINLINE
     static std::uint32_t acquire_queue(std::uint32_t num_queues) {
-        return (TUTTI_BLOCK_DIM_X * 32u + TUTTI_THREAD_IDX_X) % num_queues;
+        return (TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X + TUTTI_THREAD_IDX_X) % num_queues;
     }
 
     TUTTI_DEVICE TUTTI_FORCEINLINE

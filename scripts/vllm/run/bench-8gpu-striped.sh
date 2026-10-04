@@ -25,8 +25,9 @@
 #   --reuse-pct N     shared prefix percentage, default 80
 #   --rounds N        rounds of (A,B), default 2
 #   --tag NAME        label for output files
-#   --pool-tag NAME   pool root suffix; use a new one for a guaranteed-cold
-#                     pool instead of deleting the old one
+#   --pool-tag NAME   pool root suffix (checkpoint/metadata root). Segment
+#                     files live under <mount>/r<rank>/segments and are shared
+#                     across pool tags; a new tag only gives a fresh index.
 #
 # Everything lands under $TUTTI_PROFILE_ROOT (/mnt/nvme4/tutti-profile).
 
@@ -70,7 +71,7 @@ while [[ $# -gt 0 ]]; do
         --tag)         TAG="$2"; shift 2 ;;
         --pool-tag)    POOL_TAG="$2"; shift 2 ;;
         --model)       MODEL="$2"; shift 2 ;;
-        -h|--help)     sed -n '2,32p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)     sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -83,14 +84,14 @@ source "$SCRIPT_DIR/profile-env.sh"
 PYTHON="${TUTTI_PYTHON:?profile-env.sh did not set TUTTI_PYTHON}"
 DRIVER="$REPO_ROOT/scripts/vllm/vllm_profile_offline.py"
 
-# phxsafetensors 的 python 侧 (phxloader) 不在 vllm-env 里，是 Phoenix 仓库的
-# namespace 包：phoenix 模式下把适配器目录前置到 PYTHONPATH。
+# phxsafetensors 的 python 侧 (phxloader) 不在 vllm-env 里，是 Phoenix 仓库里
+# 构建出的包（与 serve-8gpu-striped.sh 同一路径）：前置到 PYTHONPATH。
 if [[ "$LOAD_FORMAT" == "phxsafetensors" ]]; then
-    PHX_VLLM_ADAPTER="${PHX_VLLM_ADAPTER:-/data/home/ryeqiu/phoenix/adapters/vLLM}"
-    [[ -d "$PHX_VLLM_ADAPTER/phxloader" ]] || {
-        echo "phxloader missing: $PHX_VLLM_ADAPTER/phxloader (set PHX_VLLM_ADAPTER)" >&2; exit 1;
+    PHXLOADER_DIR="${PHXLOADER_DIR:-/data/home/ryeqiu/phoenix/adapters/vLLM/phxloader}"
+    [[ -f "$PHXLOADER_DIR/phxloader/__init__.py" ]] || {
+        echo "phxloader missing: $PHXLOADER_DIR/phxloader (set PHXLOADER_DIR)" >&2; exit 1;
     }
-    export PYTHONPATH="$PHX_VLLM_ADAPTER${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH="$PHXLOADER_DIR${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
 [[ -x "$PYTHON" ]] || { echo "interpreter missing: $PYTHON" >&2; exit 1; }
@@ -103,15 +104,10 @@ NAME="8gpu-${MODE}-${TOKENS}-reuse${REUSE_PCT}${TAG:+-$TAG}-$STAMP"
 LOG="$TUTTI_PROFILE_ROOT/logs/$NAME.log"
 
 # --- capacity sizing -------------------------------------------------------
-# Pool capacity is NOT set here: the driver derives it itself
-# (vllm_profile_offline.py:319 sizes num_chunks from tokens and rounds, with a
-# floor of 10000, and separately raises the high watermark to cover the whole
-# run). Passing a capacity from outside would fight that logic.
-#
-# The sizing rule it implements matters, so recording it here: the pool must
-# hold every distinct chunk the whole run touches. Sizing to one request's worth
-# is the classic mistake -- the pool then grows mid-request, and growth writes
-# real zeros plus fsync, which blocks the forward thread.
+# Pool capacity is NOT set here: the driver derives it from tokens and rounds
+# (floor 10000). Capacity is only an upper bound -- segment files are built one
+# file group at a time (first group at open, the rest in the background), and
+# the forward thread never creates files.
 CHUNKS_PER_REQUEST=$(( (TOKENS + 255) / 256 ))
 
 ARGS=(
@@ -144,8 +140,8 @@ else
     # 于是极易误判为"直连读很快"。
     ARGS+=( --reset-local-prefix-between-requests )
     # 8 ranks share one rotating group of 4 disks (slot i % 4 round-robin;
-    # placement layer does the per-rank subdirectory).  --kv-layout striped
-    # is mandatory here, not cosmetic: without it the driver takes its
+    # placement layer does the per-rank subdirectory).  --device-groups is
+    # mandatory here, not cosmetic: without it the driver takes its
     # single-device branch and derives device_id={LOCAL_RANK}, so rank 5
     # asks the daemon for NVMe device 5 on a 4-disk host and every worker
     # dies with "daemon 配置无 device_id=5 的 NVMe 条目".
@@ -154,7 +150,6 @@ else
     # spelling like '[[0,1],[2,3]]' parses to nonsense and silently falls back
     # to the same failure.
     ARGS+=(
-        --kv-layout striped
         --device-groups '0,1,2,3'
         # {LOCAL_RANK} 是 driver 的占位符（大括号、无 $）。写成 shell 的
         # ${LOCAL_RANK} 会被转义成字面量 "$0"，于是 8 个 rank 全写进同一个名为
@@ -178,11 +173,8 @@ if [[ -n "${MAX_IN_FLIGHT:-}" ]]; then
     echo "[bench] 显式覆盖 max_in_flight_operations=$MAX_IN_FLIGHT"
 fi
 
-# No deletion path on purpose. A populated pool holds ~10k slot files per rank,
-# and bulk removal is intercepted by a safe-delete shim -- which silently killed
-# this script on its first run, leaving the pools intact and no log behind.
-# Switching POOL_TAG gives a guaranteed-cold pool without deleting anything, and
-# keeps the previous run's data available for comparison.
+# No deletion path on purpose: bulk removal is intercepted by a safe-delete
+# shim. Switching POOL_TAG gives a fresh index without deleting anything.
 
 echo "[bench] mode=$MODE tokens=$TOKENS reuse=${REUSE_PCT}% rounds=$ROUNDS tp=$TP_SIZE"
 [[ "$BASELINE" == 1 ]] || echo "[bench] chunks_per_request=$CHUNKS_PER_REQUEST pool_tag=$POOL_TAG (pool sized by driver)"

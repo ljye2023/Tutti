@@ -20,8 +20,8 @@ storage:
 
   resolvers:
     - id: example-striped-file-resolver
-      type: striped-file
-      scheme: striped
+      type: local-file
+      scheme: file
       config: {}
 
   datapaths:
@@ -31,7 +31,6 @@ storage:
         handle_cache_capacity: 0
         prp_cache_capacity: 0
         handle_cache_l2_capacity: 0
-        threads_per_block: 32
         max_in_flight_operations: 0
         max_batch_entries: 0
         io_granularity: 0
@@ -42,5 +41,4 @@ storage:
       resolver: example-striped-file-resolver
       datapath: example-striped-local-nvme-datapath
       resource: example-striped-nvme
-      config:
-        stripe_unit: 65536
+      config: {}

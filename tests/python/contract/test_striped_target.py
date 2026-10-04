@@ -1,12 +1,12 @@
-"""多盘轮转布局契约：对象层 + 文件 resolver 替身。
+"""多盘段文件布局契约：对象层 + 文件 resolver 替身。
 
 替身按 C++ local-file resolver 的同一语义（``file://<绝对路径>``，路径即
-文件、文件即对象）把每个请求落到真实文件上，因此这些用例覆盖真实文件
-读写，却不需要 daemon 或 NVMe 硬件。
+文件）把每个请求落到真实文件上，因此这些用例覆盖真实文件读写，却不需要
+daemon 或 NVMe 硬件。
 
-多盘放置的槽位路径在对象层（C++）：一个槽位是一个文件
-``<mount>/<r<rank_id>>/<slot>.obj``，槽位号在 mounts 间轮转，段 0 从对象
-头之后开始。
+放置在对象层（C++）：槽位号在 mounts 间轮转（slot % N），每盘连续
+``segment_file_slots`` 个槽位打包进 ``<mount>/r<rank_id>/segments/<id>.seg``，
+槽位 i 的段 0 从 ``i × slot_bytes + header`` 开始。
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from tutti.storage.tutti_nvme.store import TuttiKVStore
 
 SEGMENT = 16 * 1024
 MOUNTS = 3
-HEADER = 4096
-# 多盘几何不再有 unit 整除约束（无条带）：payload 只需 4096 对齐。
+HEADER = 32 * 1024
+SLOTS_PER_FILE = 4
 SPAN = 2
 
 
@@ -112,15 +112,17 @@ def _object_layout(tmp_path, *, mounts, layers=SPAN, segment=SEGMENT,
     layout = ObjectLayout(
         root, segment, mounts=[str(mount) for mount in mounts],
         capacity_chunks=capacity,
-        prewarm_chunks=min(capacity, 4), rank_id=rank_id, rank_count=rank_count,
+        rank_id=rank_id, rank_count=rank_count,
         namespace=b"rotating-contract",
+        segment_file_slots=SLOTS_PER_FILE, segment_header_bytes=HEADER,
     )
     layout.set_layer_span(layers)
     return layout
 
 
-def _slot_path(mount, rank_id, slot):
-    return Path(mount) / f"r{rank_id}" / f"{slot}.obj"
+def _uri_path(uri):
+    parsed = urlsplit(uri)
+    return Path(unquote(parsed.netloc + parsed.path))
 
 
 def test_rotating_store_roundtrip_and_drop(tmp_path):
@@ -128,7 +130,7 @@ def test_rotating_store_roundtrip_and_drop(tmp_path):
     mounts = [tmp_path / ("nvme" + str(i)) for i in range(2)]
     store = TuttiKVStore(
         tmp_path / "meta-root", 2, SEGMENT, runtime=RotatingFakeRuntime(),
-        layout="striped", mounts=mounts,
+        mounts=mounts, segment_file_slots=SLOTS_PER_FILE,
     )
     store.open()
     store.set_layer_span(SPAN)
@@ -154,29 +156,27 @@ def test_rotating_store_roundtrip_and_drop(tmp_path):
     store.close()
 
 
-def test_rotating_uri_and_slot_files(tmp_path):
-    """URI 是 file://<mount>/r<rank>/<slot>.obj；槽位文件是整个对象。"""
+def test_rotating_uri_and_segment_files(tmp_path):
+    """URI 是 file://<mount>/r<rank>/segments/<id>.seg；段文件整组预建。"""
     mounts = [tmp_path / ("nvme" + str(i)) for i in range(MOUNTS)]
-    layout = _object_layout(tmp_path, mounts=mounts, layers=MOUNTS)
-    chunk = _key(5)[:16]
-    admitted, rejected = layout.prepare_put([_key(5, 1)], capacity_chunks=8)
-    assert admitted and rejected == 0
+    layout = _object_layout(tmp_path, mounts=mounts, layers=MOUNTS, capacity=16)
+    slot_bytes = HEADER + MOUNTS * SEGMENT
+    chunks = [_key(value)[:16] for value in range(MOUNTS + 1)]
+    admitted, rejected = layout.prepare_put(
+        [chunk + (1).to_bytes(2, "little") for chunk in chunks], capacity_chunks=16
+    )
+    assert len(admitted) == len(chunks) and rejected == 0
 
-    uri = layout.target_uri(chunk)
-    parsed = urlsplit(uri)
-    assert uri.startswith("file://")
-    # 对象头紧贴 payload：无条带轮对齐预留。
-    offset = layout.target_offset(chunk)
-    assert offset == HEADER
-    assert layout.target_size(chunk) == MOUNTS * SEGMENT
-
-    # 槽位文件按 URI 的路径命名，恰好一个文件承载整个对象。
-    slot = int(Path(unquote(parsed.netloc + parsed.path)).stem)
-    mount = mounts[slot % MOUNTS]
-    path = _slot_path(mount, 0, slot)
-    assert path.exists()
-    size = path.stat().st_size
-    assert size >= HEADER + MOUNTS * SEGMENT
+    # 槽位 0..2 轮转到三块盘的 0.seg 开头；槽位 3 回到盘 0、同文件第二个槽位。
+    for slot, chunk in enumerate(chunks):
+        path = _uri_path(layout.target_uri(chunk))
+        assert path == mounts[slot % MOUNTS] / "r0" / "segments" / "0.seg"
+        assert layout.target_offset(chunk) == (slot // MOUNTS) * slot_bytes + HEADER
+        assert layout.target_size(chunk) == MOUNTS * SEGMENT
+    for mount in mounts:
+        seg = mount / "r0" / "segments" / "0.seg"
+        assert seg.stat().st_size == SLOTS_PER_FILE * slot_bytes
+    layout.close_object_pool()
 
 
 def test_rotating_slots_spread_over_mounts(tmp_path):
@@ -193,7 +193,7 @@ def test_rotating_slots_spread_over_mounts(tmp_path):
             if str(path).startswith(str(mount))
         )
         per_mount[mount_index] += 1
-    # 8 槽 × 2 盘 = 每盘 4：轮转必须均匀，不能退化成常量映射。
+    # 8 槽 × 2 盘 = 每盘 4（首个文件组恰好 8 槽）：轮转必须均匀。
     assert per_mount == {0: 4, 1: 4}
     layout.close_object_pool()
 
@@ -262,18 +262,20 @@ def test_rotating_rank_slots_are_isolated(tmp_path):
         urlsplit(rank4.target_uri(_key(7)[:16])).path))
     # 同一槽位号、同一组盘，但 rank 子目录不同 ⇒ 互不覆盖
     assert path0.parent != path4.parent
-    assert path0.parent.name == "r0"
-    assert path4.parent.name == "r4"
+    assert path0.parent.parent.name == "r0"
+    assert path4.parent.parent.name == "r4"
     assert path0.exists() and path4.exists()
     assert path0 != path4
     rank0.close_object_pool()
     rank4.close_object_pool()
 
 
-def test_invalid_rotating_options(tmp_path):
-    """未知 layout 拒绝；多盘无其它几何约束（unit 已不存在）。"""
-    with pytest.raises(ValueError):
-        TuttiKVStore(
-            tmp_path, 1, SEGMENT, runtime=RotatingFakeRuntime(),
-            layout="other",
-        )
+def test_invalid_segment_options(tmp_path):
+    """段文件几何非法时构造即拒绝；旧布局选择开关已不存在。"""
+    for kwargs in ({"segment_file_slots": 0}, {"segment_header_bytes": 1000},
+                   {"segment_header_bytes": 0}):
+        with pytest.raises(ValueError):
+            TuttiKVStore(tmp_path, 1, SEGMENT, runtime=RotatingFakeRuntime(), **kwargs)
+    with pytest.raises(TypeError):
+        TuttiKVStore(tmp_path, 1, SEGMENT, runtime=RotatingFakeRuntime(),
+                     layout="striped")

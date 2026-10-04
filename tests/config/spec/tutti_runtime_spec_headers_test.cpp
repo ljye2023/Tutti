@@ -24,7 +24,6 @@ static_assert(std::is_default_constructible_v<tutti::config::ResolverSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::DataPathSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::BackendSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::TuttiRuntimeSpec>);
-static_assert(tutti::config::NvmeDataPathTuning::kDefaultThreadsPerBlock == 16);
 
 int main() {
     // 2026-09-22: the multi-device backend has no knobs left (stripe_unit was

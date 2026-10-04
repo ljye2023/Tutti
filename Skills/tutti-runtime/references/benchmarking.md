@@ -17,9 +17,7 @@ Flags that change behaviour materially:
 
 | Flag | Effect |
 |---|---|
-| `--kv-layout {file_per_chunk,striped}` | single-device vs multi-device striping |
-| `--stripe-unit` | striping granularity; must not fragment a tensor |
-| `--device-groups "0,1;2,3"` | which ranks share which devices |
+| `--device-groups "0,1,2,3"` | which ranks share which devices (omit = one device per rank) |
 | `--num-queues` | per-rank queues; oversubscription causes `EAGAIN` |
 | `--kv-load-failure-policy {fail,recompute}` | `fail` surfaces bugs; `recompute` masks them as silent full recompute |
 | `--rounds`, `--reset-local-prefix-between-{requests,rounds}` | steady-state measurement |
@@ -31,16 +29,16 @@ distinct root.
 
 ## Sizing Rules That Cause Hangs When Wrong
 
-- **Pool capacity / watermark** must cover the entire workload's unique chunk set
-  (`per_request_chunks × (rounds + 2) + margin`). Too low and the pool grows
-  mid-request — writing real zeros and fsyncing while the forward thread waits.
+- **Pool capacity** is only an upper bound; the driver sizes it from tokens and
+  rounds. Growth happens one file group at a time in the background and never
+  blocks the forward thread — but while a group is being zero-filled it competes
+  with KV IO for disk bandwidth, and writes beyond the published groups are
+  trimmed. A cold pool pays ~1 min at start-up for the first group.
 - **Queues**: `ranks_per_device × num_queues` must fit the device's user
   queue-ID pool (≈119 here). The striped preset default is too high for 4 ranks
   per device.
-- **Stripe unit** should keep a layer segment whole or split it across few
-  devices; per-tensor placement is the design intent, not sub-tensor interleaving.
-- **Striped data files must be per-rank** (`<mount>/striped/r<rank>/`), otherwise
-  ranks append to identically named files.
+- **Segment files are per rank** (`<mount>/r<rank>/segments/`); ranks sharing a
+  set of disks never touch each other's files.
 
 ## Run Isolation — Non-Obvious and Bites Hard
 

@@ -74,6 +74,33 @@ def _tokens(model: str, length: int, reuse_pct: int) -> tuple[list[int], list[in
     return request_a, request_a[:shared] + suffix_b
 
 
+def _concurrent_batch(
+    base: list[int],
+    batch_idx: int,
+    batch_size: int,
+    vocab_floor: int = 1000,
+) -> list[list[int]]:
+    """Derive ``batch_size`` shape-identical but KV-distinct prompts.
+
+    存在的理由：线上峰值读计划的 ``chunks`` 是「同一批所有请求的 chunk 数之和」
+    （实测 3110 = 6 x 512，而单请求上限受 ``max_model_len`` 与
+    ``max_chunks_per_wave`` 双重约束）。单请求串行永远复现不出该量级，必须在
+    一个 ``llm.generate`` 批次里同时提交多个请求，让调度器把它们合并进同一个
+    读计划。
+
+    与 ``_distinct_pair`` 同一手法（首 token 扰动）：chunk key 由前缀链派生，
+    改首 token 即令全部下游 chunk key 失效，从而保证各请求各自独立读盘；而
+    token 序列长度不变，所以每个 GEMM/kernel 的 shape 完全一致，性能可比。
+    """
+    prompts: list[list[int]] = []
+    for offset in range(batch_size):
+        marker = vocab_floor + batch_idx * 16 + offset
+        prompt = list(base)
+        prompt[0] = marker
+        prompts.append(prompt)
+    return prompts
+
+
 def _distinct_pair(base_a: list[int], base_b: list[int], round_idx: int,
                    vocab_floor: int = 1000) -> tuple[list[int], list[int]]:
     """Derive a round-specific (A, B) pair with identical shapes.
@@ -119,7 +146,7 @@ def _start_bench_range() -> None:
 
 def _generate(
     llm: LLM,
-    prompt_token_ids: list[int],
+    prompt_token_ids: list[int] | list[list[int]],
     sampling_params: SamplingParams,
     request_id: str,
 ) -> float:
@@ -127,25 +154,41 @@ def _generate(
     # the report shows a clear request boundary (start/end wall, sub-trees
     # for compute vs transfer). Domain "tutti.request" is what the nsys
     # --nvtx-capture filter matches on; other vLLM NVTX is filtered out.
+    #
+    # prompt_token_ids 可以是单条，也可以是一批（同一次 llm.generate 提交多个
+    # 请求）。批量形态用于复现线上「一批请求合并进同一读计划」的 chunks 量级：
+    # 调度器把同批请求合并后，读计划的 chunks 是各请求之和。
+    if prompt_token_ids and isinstance(prompt_token_ids[0], int):
+        prompts = [prompt_token_ids]
+    else:
+        prompts = list(prompt_token_ids)  # type: ignore[arg-type]
     start = time.perf_counter()
     _annotate_request = _make_request_annotate(request_id)
     with _annotate_request:
         outputs = llm.generate(
-            [{"prompt_token_ids": prompt_token_ids}],
+            [{"prompt_token_ids": prompt} for prompt in prompts],
             sampling_params,
             use_tqdm=False,
         )
         elapsed = time.perf_counter() - start
-        completion_tokens = len(outputs[0].outputs[0].token_ids)
-        token_ids = list(outputs[0].outputs[0].token_ids)
-        finish_reason = outputs[0].outputs[0].finish_reason
+        total_prompt_tokens = sum(
+            len(output.prompt_token_ids) for output in outputs
+        )
+        total_completion_tokens = sum(
+            len(output.outputs[0].token_ids) for output in outputs
+        )
+        finish_reasons = {
+            output.outputs[0].finish_reason for output in outputs
+        }
         print(
-            f"[{request_id}] prompt_tokens={len(outputs[0].prompt_token_ids)} "
-            f"completion_tokens={completion_tokens} finish_reason={finish_reason} "
-            f"token_ids={token_ids} wall={elapsed:.3f}s",
+            f"[{request_id}] requests={len(prompts)} "
+            f"prompt_tokens={total_prompt_tokens} "
+            f"completion_tokens={total_completion_tokens} "
+            f"finish_reason={sorted(finish_reasons)} wall={elapsed:.3f}s "
+            f"token_ids={list(outputs[0].outputs[0].token_ids)}",
             flush=True,
         )
-        if finish_reason == "error":
+        if "error" in finish_reasons:
             raise RuntimeError(
                 f"request {request_id} failed explicitly (finish_reason=error)"
             )
@@ -198,6 +241,19 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "number of shape-identical requests submitted in ONE llm.generate "
+            "call. The scheduler merges a batch into a single read plan, so the "
+            "plan's chunk count is the sum over requests: this is how the "
+            "production peak (chunks=3110 = 6 x 512) is reproduced. Each "
+            "request gets a perturbed first token so their KV stays distinct "
+            "and every one of them actually reads from the Tutti path."
+        ),
+    )
+    parser.add_argument(
         "--reset-local-prefix-between-rounds",
         action="store_true",
         help="clear vLLM's local prefix cache between rounds as well",
@@ -211,6 +267,7 @@ def main() -> int:
             "this profile only"
         ),
     )
+
     parser.add_argument(
         "--kv-load-failure-policy",
         choices=("recompute", "fail"),
@@ -237,19 +294,10 @@ def main() -> int:
         default="/mnt/nvme{LOCAL_RANK}/tutti-kv-profile-rank{LOCAL_RANK}",
     )
     parser.add_argument(
-        "--kv-layout",
-        choices=("file_per_chunk", "striped"),
-        default="file_per_chunk",
-        help=(
-            "KV 落盘布局：file_per_chunk（默认，chunk 整块落单盘）或 "
-            "striped（多盘，槽位轮转，需配 --device-groups）"
-        ),
-    )
-    parser.add_argument(
         "--device-groups",
         default=None,
         help=(
-            "striped 的 rank→盘组映射：分号分组、逗号列设备号，如 "
+            "多盘 rank→盘组映射（不给则每 rank 单盘）：分号分组、逗号列设备号，如 "
             "'0,1;2,3'（前一半 rank 用盘 0-1、后一半用盘 2-3）；"
             "组数必须整除 tensor_parallel_size"
         ),
@@ -327,32 +375,17 @@ def main() -> int:
 
     kv_transfer_config = None
     if not args.without_tutti:
-        # 对象池初始 slot 数必须覆盖单请求一整波 chunk（否则
-        # PoolResourceExhausted：默认 initial_slots=32 < tokens/256）。
         chunk_tokens = 256
         per_request_chunks = -(-(args.tokens + args.max_tokens) // chunk_tokens)
-        # 池容量（槽位上限）：测试规模 1w 槽位。槽位文件是稳定身份，
-        # 复用不重跑 resolve（open+fstat+fsync+FIEMAP）。
-        num_chunks = max(10000, per_request_chunks * 2 * args.rounds + 16)
-        # 预建槽位数只覆盖单请求工作集：全量预建 1w × 20MiB ≈ 200GiB
-        # 的实零写入会把 bind 变成分钟级；其余由启动期预热补齐。
-        initial_slots = min(num_chunks, per_request_chunks + 8)
-        # 水位必须覆盖整个 workload 的唯一 chunk 集合，否则后台分配器会在
-        # 请求中途扩容：建槽位是磁盘实零写 + fsync（32k 实测 64 槽位
-        # 2.85s），会直接阻塞前向线程（allocate 等就绪槽位）。
-        # 唯一 chunk 上界 = 每轮(A 整请求 + B 新增部分) × 轮数
-        #              ≈ per_request_chunks × (1 + (1 - reuse)) × rounds；
-        # 再留一整轮 + 余量，保证分配完仍高于 low_watermark（否则触发补货）。
-        high_watermark = min(
-            num_chunks, per_request_chunks * (args.rounds + 2) + 16
-        )
-        low_watermark = max(1, per_request_chunks // 2)
+        # 池容量（槽位上限）：测试规模 1w 槽位。容量只是上限：段文件按文件组
+        # （每盘一个段文件）在 open 时建首组、之后由后台跟随分配前沿补建。
+        # batch_size 会放大唯一 chunk 集：一批 N 个请求各占 per_request_chunks
+        # （首 token 扰动保证互不共享前缀）。
+        per_round_chunks = per_request_chunks * max(1, args.batch_size)
+        num_chunks = max(10000, per_round_chunks * 2 * args.rounds + 16)
         store_options = {
             "root": args.kv_root,
             "num_chunks": num_chunks,
-            "initial_slots": initial_slots,
-            "high_watermark": high_watermark,
-            "low_watermark": low_watermark,
             "io_stream": "auto",
             "preset": {
                 "daemon_config": (
@@ -362,9 +395,8 @@ def main() -> int:
                 "gpu_id": "{LOCAL_RANK}",
             },
         }
-        if args.kv_layout == "striped":
-            if not args.device_groups:
-                parser.error("--kv-layout striped 需要 --device-groups")
+        if args.device_groups:
+            # 多盘：每 rank 的槽位在其盘组间轮转（数据盘目录来自 daemon 配置）。
             groups = [
                 [int(item) for item in group.split(",") if item.strip()]
                 for group in args.device_groups.split(";")
@@ -372,7 +404,6 @@ def main() -> int:
             ]
             if not groups or any(not group for group in groups):
                 parser.error("--device-groups 解析为空，示例：'0,1;2,3'")
-            store_options["layout"] = "striped"
             store_options["preset"].update({
                 "type": "striped",
                 "device_groups": groups,
@@ -414,6 +445,9 @@ def main() -> int:
         block_size=args.block_size,
         enforce_eager=not args.enable_compile,
         max_model_len=args.tokens + args.max_tokens,
+        # 必须 >= batch_size，否则批量请求被拆成多个调度步，读计划不会合并，
+        # 复现不出线上「一批请求共享同一读计划」的 chunks 量级。
+        max_num_seqs=max(256, args.batch_size),
         load_format=args.load_format,
         enable_prefix_caching=True,
         enable_layerwise_nvtx_tracing=args.layerwise_nvtx,
@@ -459,8 +493,21 @@ def main() -> int:
     for round_idx in range(args.rounds):
         tokens_a, tokens_b = _distinct_pair(request_a, request_b, round_idx)
         suffix = "" if args.rounds == 1 else f"|r{round_idx}"
+        # batch_size > 1：把 N 个 shape 相同、KV 互不相同的请求放进同一次
+        # generate 提交，让调度器合并成单个读计划（复现线上 chunks 量级）。
+        # A/B 必须用同一组 marker（同一 round_idx）：marker 决定首 token，
+        # 从而决定整条 chunk-key 链；A 与 B 用不同 marker 会让 B 完全 miss、
+        # 读计划根本不会产生。轮与轮之间换 marker，保证轮间不在 HBM 里互蹭。
+        prompts_a = (
+            _concurrent_batch(tokens_a, round_idx, args.batch_size)
+            if args.batch_size > 1 else tokens_a
+        )
+        prompts_b = (
+            _concurrent_batch(tokens_b, round_idx, args.batch_size)
+            if args.batch_size > 1 else tokens_b
+        )
         walls_a.append(
-            _generate(llm, tokens_a, sampling_params, f"A-cold{suffix}")
+            _generate(llm, prompts_a, sampling_params, f"A-cold{suffix}")
         )
         if args.reset_local_prefix_between_requests:
             if not llm.reset_prefix_cache(reset_connector=False):
@@ -470,7 +517,7 @@ def main() -> int:
             llm.start_profile()
         try:
             walls_b.append(
-                _generate(llm, tokens_b, sampling_params, f"B-80pct{suffix}")
+                _generate(llm, prompts_b, sampling_params, f"B-80pct{suffix}")
             )
         except Exception as exc:
             if not args.expect_b_failure:

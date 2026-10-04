@@ -28,7 +28,16 @@ add_executable(tutti_nvme_bw_probe
     nvme_bw_probe.cpp
 )
 
+add_executable(tutti_nvme_segment_bw_probe
+    nvme_segment_bw_probe.cpp
+)
+
 target_link_libraries(tutti_nvme_bw_probe PRIVATE
+    tutti_runtime
+    ${TUTTI_ACCEL_RUNTIME_LIBS}
+)
+
+target_link_libraries(tutti_nvme_segment_bw_probe PRIVATE
     tutti_runtime
     ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
@@ -38,13 +47,27 @@ target_compile_definitions(tutti_nvme_bw_probe PRIVATE
     TUTTI_NVME_BW_PROBE_DEFAULT_CONFIG_STRIPED="${CMAKE_CURRENT_SOURCE_DIR}/tutti_nvme_bw_probe_striped.yaml"
 )
 
+target_compile_definitions(tutti_nvme_segment_bw_probe PRIVATE
+    TUTTI_NVME_BW_PROBE_DEFAULT_CONFIG_STRIPED="${CMAKE_CURRENT_SOURCE_DIR}/tutti_nvme_bw_probe_striped.yaml"
+)
+
 set_target_properties(tutti_nvme_bw_probe PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+set_target_properties(tutti_nvme_segment_bw_probe PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 target_compile_options(tutti_nvme_bw_probe PRIVATE
+    -Wall -Wextra
+)
+
+target_compile_options(tutti_nvme_segment_bw_probe PRIVATE
     -Wall -Wextra
 )
 

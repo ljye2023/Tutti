@@ -123,21 +123,25 @@ class TestNamespacePlumbing:
         from tutti.storage.tutti_nvme.object_layout import ObjectLayout
 
         layout = ObjectLayout(
-            root, segment_bytes=SEG, capacity_chunks=8, prewarm_chunks=1,
-            namespace=namespace,
+            root, segment_bytes=SEG, capacity_chunks=8, namespace=namespace,
+            segment_file_slots=8,
         )
         return layout
 
     def test_namespace_reaches_object_layer_config(self, tmp_path):
+        from tutti.storage.tutti_nvme.object_layout import layout_fingerprint
+
         layout = self._layout(tmp_path / "pool", NS_A)
         layout.set_layer_span(NL)
-        assert layout._config()["namespace_fingerprint"] == NS_A
+        fingerprint = layout._config()["namespace_fingerprint"]
+        assert fingerprint == layout_fingerprint(NS_A, 8, 32 * 1024)
+        assert fingerprint.startswith(NS_A + b"\0")
         layout.close_object_pool()
 
     def test_default_namespace_is_empty(self, tmp_path):
         layout = self._layout(tmp_path / "pool")
         layout.set_layer_span(NL)
-        assert layout._config()["namespace_fingerprint"] == b""
+        assert layout._config()["namespace_fingerprint"].startswith(b"\0")
         layout.close_object_pool()
 
     def test_namespace_declared_after_open_is_rejected(self, tmp_path):
@@ -148,3 +152,40 @@ class TestNamespacePlumbing:
         with pytest.raises(RuntimeError, match="命名空间"):
             layout.set_namespace(NS_A)
         layout.close_object_pool()
+
+    def test_segment_file_geometry_matches_metadata_view(self, tmp_path, monkeypatch):
+        from tutti.storage import metadata as metadata_module
+        from tutti.storage.tutti_nvme.object_layout import ObjectLayout
+
+        captured = []
+
+        class FakeView:
+            def __init__(self, options):
+                captured.append(options)
+
+            def open(self):
+                pass
+
+        monkeypatch.setattr(metadata_module, "ObjectStore", FakeView)
+        # 非默认 header 曾在调度侧视图里丢失（worker 64K、视图 32K → 指纹
+        # 不一致 → 冷启动对账静默失败），这里钉住各几何组合都原样带过去。
+        for slots, header in ((2048, 32 * 1024), (4096, 32 * 1024), (2048, 64 * 1024)):
+            root = tmp_path / f"{slots}-{header}"
+            worker = ObjectLayout(
+                root, segment_bytes=SEG, mounts=[root], capacity_chunks=8,
+                namespace=NS_A, segment_file_slots=slots,
+                segment_header_bytes=header,
+            )
+            worker._layer_span = NL
+            metadata = metadata_module.TuttiMetadataStore(
+                root, num_chunks=8, segment_bytes=SEG,
+                mounts=[root], segment_file_slots=slots, segment_header_bytes=header,
+                layer_span=NL,
+            )
+            metadata.set_key_namespace(NS_A)
+            metadata._open_views()
+            expected = worker._config()
+            actual = captured[-1]
+            for field in ("segment_file_slots", "segment_header_bytes",
+                          "namespace_fingerprint", "devices", "scheme"):
+                assert actual[field] == expected[field], field

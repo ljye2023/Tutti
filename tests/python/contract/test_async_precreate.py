@@ -1,16 +1,13 @@
-"""异步容量增长契约：预建不在请求路径上，增长由后台驱动。
+"""段文件预建契约：单位是文件组，写路径永不建文件。
 
-定案（2026-09-21，10 TB 级冷启动）：
-  1. open() 只**走查**（probe，不写）调用方声明的初始槽位：盘上已有的登记
-     为就绪（复用零 IO），缺的留给后台——大容量不再意味着几十分钟启动；
-  2. 写路径永不 create+fsync 槽位（~44ms/槽会直接打在 GPU 计算/IO 流水线
-     上）：拿不到就绪槽位时与容量耗尽同一契约——拒绝，由调用方裁剪；
-  3. 增长由后台 ``precreate_step`` 驱动，默认按容量补齐差量（容量比已有
-     的多多少就异步补多少），不超过容量上限；
-  4. 后台失败时把按需预建交还写路径：宁慢，不静默停摆。
-
-复用与容量因此合在同一条前沿上：容量 ≤ 已有 → 只走查、不建文件；容量 >
-已有 → 只补差量，已存在的部分由 C++ 的幂等探测跳过。
+定案（2026-09-30）：
+  1. 文件组 = 每盘一个段文件（``segment_file_slots × 盘数`` 个槽位），对象层
+     只整组发布；
+  2. 冷池 open() 同步建出首个文件组，开服即可写；热池 open() 只收编已就绪的
+     组，一个字节都不写；
+  3. 写路径拿不到已发布槽位时与容量耗尽同一契约——非阻塞拒绝、调用方裁剪；
+  4. 后续文件组由后台线程在最后一个已建组用过一半时建，不越过容量上限；
+     失败不发布任何槽位，稍后重试。
 """
 
 from __future__ import annotations
@@ -27,34 +24,32 @@ from tutti.storage.tutti_nvme.object_layout import ObjectLayout
 
 SPAN = 2
 SEGMENT = 4096
+SLOTS_PER_FILE = 8
 
 
 @pytest.fixture(autouse=True)
 def _neutralize_space_guard(monkeypatch):
-    """把磁盘空间护栏门限归零。
-
-    本文件测的是增长/复用/裁剪契约，不是空间策略；而 tmp_path 落在宿主根盘
-    上，根盘水位（CI/开发机常年接近满）会把预建整体卡住。护栏自身的行为由
-    ``test_space_guard_pauses_growth_and_resumes`` 显式覆盖门限来验证。
-    """
+    """把磁盘空间护栏门限归零（护栏行为由专门的用例显式覆盖）。"""
     monkeypatch.setenv("TUTTI_PRECREATE_MIN_FREE_BYTES", "0")
 
 
-def _layout(tmp_path, *, capacity=64, prewarm=4, probe_only=True):
-    """probe_only=True 即"异步增长"部署：open 只走查、不建缺失槽位。"""
+def _layout(tmp_path, *, capacity=32, mounts=1):
     root = tmp_path / "ns"
     root.mkdir(parents=True, exist_ok=True)
-    mount = tmp_path / "dev0"
-    mount.mkdir(parents=True, exist_ok=True)
+    dirs = []
+    for index in range(mounts):
+        mount = tmp_path / f"dev{index}"
+        mount.mkdir(parents=True, exist_ok=True)
+        dirs.append(str(mount))
     layout = ObjectLayout(
         root,
         SEGMENT,
-        mounts=[str(mount)],
+        mounts=dirs,
         capacity_chunks=capacity,
-        prewarm_chunks=prewarm,
         background_reclaim=False,
-        warmup_probe_only=probe_only,
         namespace=b"test-async-precreate",
+        segment_file_slots=SLOTS_PER_FILE,
+        segment_header_bytes=32 * 1024,
     )
     layout.set_layer_span(SPAN)
     return layout
@@ -68,12 +63,22 @@ def _keys(*chunks: bytes) -> list[bytes]:
     ]
 
 
+def _chunk(index: int) -> bytes:
+    return index.to_bytes(16, "little")
+
+
 def _path(uri: str) -> str:
-    """``slot_uri`` 返回的是 URI（file://…），落到文件系统要剥掉 scheme。"""
     return uri[len("file://"):] if uri.startswith("file://") else uri
 
 
-def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+def _segments(tmp_path, mount=0) -> list[str]:
+    seg_dir = tmp_path / f"dev{mount}" / "r0" / "segments"
+    if not seg_dir.exists():
+        return []
+    return sorted(name for name in os.listdir(seg_dir) if name.endswith(".seg"))
+
+
+def _wait_for(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -82,204 +87,137 @@ def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
     return predicate()
 
 
-def test_large_capacity_does_not_pay_at_open(tmp_path):
-    """冷池（盘上零文件）配 4096 槽容量：open 后盘上仍然零文件。
-
-    "大容量不等于长启动"的结构性断言：容量只是分配器的上限，open 不落盘。
-    """
-    layout = _layout(tmp_path, capacity=4096, prewarm=8)
+def test_cold_open_builds_exactly_the_first_group(tmp_path):
+    """冷池：open 同步建首个文件组（每盘一个文件），不多建。"""
+    layout = _layout(tmp_path, capacity=64, mounts=2)
     store = layout._store
-    assert store.precreated_slots() == 0
-    slots_dir = os.path.dirname(_path(store.slot_uri(0)))
-    assert not os.path.exists(slots_dir) or os.listdir(slots_dir) == []
+    assert store.precreated_slots() == 2 * SLOTS_PER_FILE
+    for mount in (0, 1):
+        assert _segments(tmp_path, mount) == ["0.seg"]
+        assert (tmp_path / f"dev{mount}" / "r0" / "segments" / "0.seg.ready").exists()
+    # 开服即可写：首个组内的写全部受理。
+    chunks = [_chunk(i) for i in range(2 * SLOTS_PER_FILE)]
+    admitted, rejected = layout.prepare_put(_keys(*chunks), capacity_chunks=64)
+    assert rejected == 0 and len(admitted) == len(chunks) * SPAN
 
 
-def test_default_warmup_still_creates_the_declared_prefix(tmp_path):
-    """未启用异步预建（默认）时保持旧语义：open 把缺失的预热槽位建出来。
+def test_warm_open_adopts_groups_without_writing(tmp_path):
+    """热池：重开收编已就绪的组，不重写任何段文件。"""
+    first = _layout(tmp_path)
+    first.prepare_put(_keys(_chunk(0)), capacity_chunks=32)
+    assert first._store.precreate_step(SLOTS_PER_FILE) == SLOTS_PER_FILE
+    first.close_object_pool()
+    seg_dir = tmp_path / "dev0" / "r0" / "segments"
+    before = {name: os.stat(seg_dir / name).st_mtime_ns for name in os.listdir(seg_dir)}
 
-    异步是显式的部署选择；默认路径的行为不该被改变（测试与小池依赖它）。
-    """
-    layout = _layout(tmp_path, capacity=64, prewarm=4, probe_only=False)
-    store = layout._store
-    assert store.precreated_slots() == 4
-    assert os.path.exists(_path(store.slot_uri(3)))
-    assert not os.path.exists(_path(store.slot_uri(4)))
-
-
-def test_open_proves_reuse_instead_of_writing(tmp_path):
-    """已有槽位（复用）：open 走查登记为就绪，一个字节都不写。"""
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
-    store = layout._store
-    store.set_precreate_on_write(True)
-    # 先让写路径把 0..3 建出来（模拟一个已经用过的池子）。
-    layout.prepare_put(
-        _keys(b"a" * 16, b"b" * 16, b"c" * 16, b"d" * 16), capacity_chunks=4
-    )
-    slots_dir = os.path.dirname(_path(store.slot_uri(0)))
-    before = {name: os.stat(os.path.join(slots_dir, name)).st_mtime_ns
-              for name in os.listdir(slots_dir)}
-
-    reopened = _layout(tmp_path, capacity=64, prewarm=4)
-    reopened_store = reopened._store
-    assert reopened_store.precreated_slots() == 4, "已有槽位应当被走查证明为就绪"
-    after = {name: os.stat(os.path.join(slots_dir, name)).st_mtime_ns
-             for name in os.listdir(slots_dir)}
-    assert before == after, "复用路径不得重写槽位文件"
+    reopened = _layout(tmp_path)
+    assert reopened._store.precreated_slots() == 2 * SLOTS_PER_FILE
+    after = {name: os.stat(seg_dir / name).st_mtime_ns for name in os.listdir(seg_dir)}
+    assert before == after, "复用路径不得重写段文件"
 
 
-def test_capacity_below_reuse_needs_no_growth(tmp_path):
-    """容量 ≤ 已有：后台增长一个文件都不建（复用立即生效，无异步工作）。"""
-    seeded = _layout(tmp_path, capacity=64, prewarm=4)
-    seeded._store.set_precreate_on_write(True)
-    seeded.prepare_put(
-        _keys(b"a" * 16, b"b" * 16, b"c" * 16, b"d" * 16), capacity_chunks=4
-    )
-    slots_dir = os.path.dirname(_path(seeded._store.slot_uri(0)))
-    before = sorted(os.listdir(slots_dir))
-    assert len(before) == 4
-
-    # 新容量 4 ≤ 盘上已有的 4 槽 ⇒ 走查即全就绪，后台无事可做。
-    smaller = _layout(tmp_path, capacity=4, prewarm=4)
-    assert smaller.start_background_precreate(threads=2)
-    time.sleep(0.4)
-    assert smaller._store.precreated_slots() == 4
-    assert sorted(os.listdir(slots_dir)) == before, "容量以内不应新建文件"
-    smaller.stop_background_precreate()
-
-
-def test_write_path_refuses_instead_of_precreating(tmp_path):
-    """写路径没拿到就绪槽位时立即拒绝——绝不自己 create+fsync。"""
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
-    store = layout._store
-    store.set_precreate_on_write(False)
+def test_write_path_refuses_beyond_published_groups(tmp_path):
+    """越过已发布组的写立即拒绝——写路径绝不自己建文件。"""
+    layout = _layout(tmp_path)
+    chunks = [_chunk(i) for i in range(SLOTS_PER_FILE + 1)]
     started = time.monotonic()
-    admitted, rejected = layout.prepare_put(_keys(b"a" * 16), capacity_chunks=8)
+    admitted, rejected = layout.prepare_put(_keys(*chunks), capacity_chunks=32)
     elapsed = time.monotonic() - started
-    assert rejected == 1 and admitted == {}
+    assert rejected == 1 and len(admitted) == SLOTS_PER_FILE * SPAN
     assert elapsed < 0.05, f"拒绝耗时 {elapsed * 1000:.1f}ms，写路径被预建阻塞了"
-    assert store.precreated_slots() == 0, "写路径不得偷偷预建"
-    slots_dir = os.path.dirname(_path(store.slot_uri(0)))
-    assert not os.path.exists(slots_dir) or os.listdir(slots_dir) == []
+    assert _segments(tmp_path) == ["0.seg"], "写路径不得偷偷建文件"
 
 
-def test_background_growth_fills_capacity(tmp_path, caplog):
-    """容量 > 已有：后台把差量异步补齐（写路径随后无需自己建槽）。
+HALF = SLOTS_PER_FILE // 2
 
-    同时断言两件与"可持续"有关的事：追上目标时要留下可观测信号
-    （线程名不进 /proc，没有日志就完全看不见它）；批次之间不得空等，
-    否则追赶速度会被睡眠周期拖慢几个数量级。
-    """
-    # 信号是 INFO 级；pytest 9 的 caplog 默认只捕 WARNING（root logger
-    # 默认级别），不显式放开的话这条断言永远看不见记录（测试自引入起
-    # 在本环境从未通过）。
+
+def _use(layout, count, start=0):
+    chunks = [_chunk(start + i) for i in range(count)]
+    admitted, rejected = layout.prepare_put(_keys(*chunks), capacity_chunks=64)
+    assert rejected == 0 and len(admitted) == count * SPAN
+
+
+def test_background_grows_when_group_is_half_used(tmp_path, caplog):
+    """后台线程在最后一组用过一半时建下一组，只领先一个组。"""
     caplog.set_level(logging.INFO)
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
+    layout = _layout(tmp_path, capacity=64)
     store = layout._store
-    assert layout.start_background_precreate(threads=2)
-    started = time.monotonic()
-    assert _wait_for(lambda: store.precreated_slots() >= 64, timeout=10.0)
-    elapsed = time.monotonic() - started
-    assert elapsed < 2.0, f"预建 64 个槽位用了 {elapsed:.2f}s，说明批次间在空等"
-    assert os.path.exists(_path(store.slot_uri(63)))
-    admitted, rejected = layout.prepare_put(_keys(b"b" * 16), capacity_chunks=8)
-    assert rejected == 0 and len(admitted) == SPAN
-    assert _wait_for(
-        lambda: any("BACKGROUND_PRECREATE_CAUGHT_UP" in r.message
-                    for r in caplog.records), timeout=2.0
-    ), "预建追上目标后必须留下可观测信号"
-    # 信号必须只在"真的到 target"时打：认领在飞导致的 0 返回不得被当成
-    # 追平（真机首跑就在 precreated=151049/209715 处误报过一次）。
-    for record in caplog.records:
-        if "BACKGROUND_PRECREATE_CAUGHT_UP" in record.message:
-            assert "precreated=64" in record.message, record.message
-    layout.stop_background_precreate()
-
-
-def test_precreate_keeps_only_headroom(tmp_path):
-    """容量只是上限：只为分配前沿之前的就绪余量建文件（"铺满容量"模式已删除）。"""
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
-    store = layout._store
-    assert layout.start_background_precreate(threads=1, headroom=8)
-    assert _wait_for(lambda: store.precreated_slots() >= 8)
-    assert store.precreated_slots() < 64
+    layout.start_background_precreate()
+    # 用到一半（含）之前：余量仍够，不建（建组与在线 KV 争带宽）。
+    _use(layout, HALF)
+    time.sleep(0.6)
+    assert store.precreated_slots() == SLOTS_PER_FILE
+    assert _segments(tmp_path) == ["0.seg"]
+    # 越过一半 → 建第 2 组，然后停下。
+    _use(layout, 1, start=HALF)
+    assert _wait_for(lambda: store.precreated_slots() == 2 * SLOTS_PER_FILE)
+    time.sleep(0.6)
+    assert store.precreated_slots() == 2 * SLOTS_PER_FILE
+    assert _segments(tmp_path) == ["0.seg", "1.seg"]
+    assert any("BACKGROUND_PRECREATE_GROUP" in r.message for r in caplog.records)
     layout.stop_background_precreate()
 
 
 def test_growth_never_exceeds_capacity(tmp_path):
-    """就绪余量再大也不越过容量上限。"""
-    layout = _layout(tmp_path, capacity=8, prewarm=4)
+    """容量不是文件组整数倍时，最后一组截到容量，不越界。"""
+    layout = _layout(tmp_path, capacity=SLOTS_PER_FILE + 3)
     store = layout._store
-    assert layout.start_background_precreate(threads=2, headroom=64)
-    assert _wait_for(lambda: store.precreated_slots() >= 8)
+    layout.start_background_precreate()
+    _use(layout, SLOTS_PER_FILE)
+    assert _wait_for(lambda: store.precreated_slots() == SLOTS_PER_FILE + 3)
     time.sleep(0.6)
-    assert store.precreated_slots() == 8
+    assert store.precreated_slots() == SLOTS_PER_FILE + 3
+    assert _segments(tmp_path) == ["0.seg", "1.seg"]
+    layout.stop_background_precreate()
 
 
 def test_start_is_idempotent(tmp_path):
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
-    assert layout.start_background_precreate(threads=1, headroom=8)
-    assert layout.start_background_precreate(threads=1, headroom=8)
+    layout = _layout(tmp_path)
+    layout.start_background_precreate()
+    layout.start_background_precreate()
+    assert layout._precreate_stop is not None
     layout.stop_background_precreate()
 
 
 def test_space_guard_pauses_growth_and_resumes(tmp_path, caplog, monkeypatch):
-    """磁盘空间护栏：可用空间低于门限时暂停预建，恢复后自动继续。
-
-    故障形态（2026-09-22 事故）：容量配得超过物理盘（8TiB/rank × 8 rank >
-    4×5.8TB）时，预建线程一路补到 ENOSPC——写坏池子（半截文件）并把写路径
-    拖回"自己建槽"的慢路径。护栏用"暂停增长"替代"把盘写满"：写路径仍走
-    非阻塞裁剪契约，空间恢复后增长继续（线程不得因护栏退出）。
-    """
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
+    """磁盘空间护栏：可用空间低于门限时暂停预建，恢复后自动继续。"""
+    layout = _layout(tmp_path, capacity=64)
     store = layout._store
-    # 门限抬到不可能满足的高度 → 预建必须停手
+    _use(layout, HALF + 1)
     monkeypatch.setenv("TUTTI_PRECREATE_MIN_FREE_BYTES", str(10 ** 18))
-    assert layout.start_background_precreate(threads=1)
+    layout.start_background_precreate()
     time.sleep(0.6)
-    assert store.precreated_slots() == 0, "空间不足时不得预建"
+    assert store.precreated_slots() == SLOTS_PER_FILE, "空间不足时不得预建"
     assert any("BACKGROUND_PRECREATE_SPACE_LOW" in r.message
                for r in caplog.records), "空间不足必须留下告警"
     assert not any("BACKGROUND_PRECREATE_FAILED" in r.message
                    for r in caplog.records), "护栏不是失败：线程必须活着"
-
-    # 门限恢复正常 → 增长自动继续（线程只是等空间，没有退出）
     monkeypatch.setenv("TUTTI_PRECREATE_MIN_FREE_BYTES", "0")
-    assert _wait_for(lambda: store.precreated_slots() >= 64, timeout=15.0)
+    assert _wait_for(lambda: store.precreated_slots() == 2 * SLOTS_PER_FILE,
+                     timeout=15.0)
     layout.stop_background_precreate()
 
 
-def test_on_write_precreate_is_the_default(tmp_path):
-    """没开后台增长时保持旧行为：写路径按需预建。"""
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
-    store = layout._store
-    admitted, rejected = layout.prepare_put(
-        _keys(b"c" * 16, b"d" * 16, b"e" * 16, b"f" * 16, b"g" * 16),
-        capacity_chunks=8,
+def test_grower_failure_is_retried(tmp_path, caplog, monkeypatch):
+    """后台建组失败不发布任何槽位，线程存活并在之后重试成功。"""
+    monkeypatch.setattr(
+        "tutti.storage.tutti_nvme.object_layout._PRECREATE_SPACE_RECHECK_S", 0.05
     )
-    assert rejected == 0 and len(admitted) == 5 * SPAN
-    assert store.precreated_slots() == 5, "写路径应当自己把槽位建出来"
-    assert os.path.exists(_path(store.slot_uri(4)))
-
-
-def test_grower_failure_hands_precreate_back_to_the_write_path(tmp_path):
-    """后台增长出错时必须交还按需预建，否则池子会静默停止增长。"""
-    layout = _layout(tmp_path, capacity=64, prewarm=4)
+    layout = _layout(tmp_path, capacity=64)
     store = layout._store
+    real_step = store.precreate_step
+    calls = {"n": 0}
 
-    def boom(*_args, **_kwargs):
-        raise RuntimeError("injected grower failure")
+    def flaky(headroom):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected grower failure")
+        return real_step(headroom)
 
-    store.precreate_step = boom
-    assert layout.start_background_precreate(threads=1, headroom=8)
-
-    # 写路径恢复自建槽位是唯一能解释"随后这笔写成功"的原因。
-    admitted, rejected = layout.prepare_put(_keys(b"d" * 16), capacity_chunks=8)
-    if rejected:
-        for _ in range(100):
-            time.sleep(0.05)
-            admitted, rejected = layout.prepare_put(
-                _keys(b"d" * 16), capacity_chunks=8
-            )
-            if not rejected:
-                break
-    assert rejected == 0 and len(admitted) == SPAN
+    store.precreate_step = flaky
+    _use(layout, HALF + 1)
+    layout.start_background_precreate()
+    assert _wait_for(lambda: store.precreated_slots() == 2 * SLOTS_PER_FILE)
+    assert calls["n"] >= 2
+    assert any("BACKGROUND_PRECREATE_FAILED" in r.message for r in caplog.records)
+    layout.stop_background_precreate()

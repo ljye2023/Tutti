@@ -1,6 +1,8 @@
 # Tutti vLLM Connector 目标架构与当前实现
 
-> 状态：当前权威架构文档，更新于 2026-09-03。
+> 状态：当前权威架构文档，更新于 2026-09-03；§8 存储布局与预建、§3.3/§6.2 的
+> 恢复描述更新于 2026-10-03（段文件为唯一布局）。其余章节中的 `stores/...` 路径、
+> marker 等表述可能早于后续重构。
 > 适用版本：Tutti 当前工作树；vendored vLLM `897ff4f39`。
 > 当前执行目标：vLLM eager 模式下的逐层 read / transfer / compute / write
 > 流水，不以 CUDA Graph、persistent dispatcher 或整步 GPU DAG 为前置条件。
@@ -120,7 +122,7 @@ StorageRuntime
                       |
                       v
 Resolver -> DataPath SPI
-  LocalFileResolver / StripedResolver
+  LocalFileResolver / MultiMountLocalFileResolver
   LocalNvmeDataPath / StripedDataPath
                       |
                       v
@@ -203,12 +205,13 @@ NVMe 命令；它 drain completion，并禁止后续 scatter/save。
 
 ### 3.3 Engine、store 与 handle
 
-- scheduler 持有 `SchedulerMetadataIndex` 和 metadata-only store；它只扫描
-  manifest/marker、维护 `ChunkIndex` 和容量 reservation。
+- scheduler 持有 `SchedulerMetadataIndex` 和 metadata-only store；它在构造时以
+  只读方式打开各 rank 的对象层视图做一次冷启动恢复，之后只维护内存 `ChunkIndex`
+  和容量 reservation（运行期 resident 来自 worker 增量，不再扫盘）。
 - worker 的 `KVEngine` 持有 `ChunkIndex`、data-plane store、transfer 和 inflight；
   仅 staged fallback 持有 read/write bank。
-- 同一进程、同一 `vllm_config` 可经 `_ENGINE_CACHE` 共享 engine；多进程实例
-  通过持久 marker 对账。
+- 同一进程、同一 `vllm_config` 可经 `_ENGINE_CACHE` 共享 engine；跨进程重启
+  通过对象层检查点 + 对象头恢复。
 - `TuttiKVStore` 持有 runtime、target/memory tickets、buffer IDs、read/write
   CUDA stream owner 和文件 layout。
 - public I/O handle 必须 terminal 后才能 release。
@@ -280,7 +283,7 @@ payload。当前 canonical segment尚未完整区分两者。完成前，不满�
 TuttiConnectorV1.__init__
   -> _resolve_geometry(extra, kv_cache_config)
   -> reject DCP > 1 / multi-group / non-uniform pages
-  -> scheduler: SchedulerMetadataIndex -> metadata store -> scan markers
+  -> scheduler: SchedulerMetadataIndex -> metadata store -> recover object views
   -> worker: create_store -> KVEngine -> data-plane store.open
 
 vLLM KV cache allocation
@@ -391,12 +394,12 @@ build_connector_meta
 scheduler只做reservation。worker全部写成功后才`confirm_store(ok=True)`；失败
 必须`confirm_store(ok=False)`。
 
-TP部署还要求 all-rank commit：scheduler 为每个 chunk 下发同一逻辑
-generation；每个worker在本rank全部层完成后写rank-local commit record。scheduler
-同时扫描所有rank独立root，只有rank集合、层marker、namespace、slot bytes、
-object-pool generation和逻辑generation全部一致时才恢复resident。任一rank缺失、
-失败或generation不一致都使整个chunk miss；restart只清理不完整commit record，
-不删除其他rank payload/marker。
+TP部署还要求 all-rank commit：运行期由 worker 增量（`committed/failed`）在
+scheduler 内存索引里按 rank 计数，满 `tp_size` 且不在 `failed` 才发布 resident。
+冷启动时 scheduler 以只读方式打开每个 rank 的对象层视图（与 worker 同一段文件
+几何与命名空间指纹），从各 rank 的检查点恢复已提交对象并逐个与对象头交叉校验，
+再对各 rank 恢复出的集合取交集；任一 rank 缺失、头校验失败或几何不一致
+都使该 chunk miss。恢复只读、不删除任何 rank 的数据。
 
 ## 7. Eager 逐层执行编排
 
@@ -484,24 +487,35 @@ eager step不需要更多stream；只有真实trace证明多request/step可并�
 
 ## 8. 存储布局与地址映射
 
-### 8.1 Key 与文件布局
+### 8.1 Key 与对象布局
 
 ```text
 chunk_key = chained hash(token chunk, namespace)
 io_key    = chunk_key[16 B] || layer_idx[2 B little-endian]
 
-chunks/<chunk_key>.bin
-layer L offset = L * segment_bytes
-payload size   = num_layers * segment_bytes
+一个 chunk = 一个对象 = 一个槽位（slot）
+slot 放置：device = slot % N（N = 本 rank 的挂载点数）
+          段文件 = <mount>/r<rank>/segments/<(slot / N) / segment_file_slots>.seg
+          槽位起点 = ((slot / N) % segment_file_slots) * slot_bytes
+slot_bytes   = segment_header_bytes + num_layers * segment_bytes
+layer L 偏移 = 槽位起点 + segment_header_bytes + L * segment_bytes
 ```
 
-`ChunkIndex`管semantic chunk；store以layer `io_key`管marker。scheduler只有在
-期望层集合完整时恢复resident。
+默认 `segment_file_slots=2048`、`segment_header_bytes=32 KiB`（HY3 TP8 单文件约
+20 GiB）。槽位前缀放对象头；32 KiB 让每个 payload 起点 16 KiB 对齐——实测 4 KiB
+前缀读带宽低约 20%，原因是 SSD 内部并行单元跟随 LBA 规律，见
+`doc/design/kv-storage-layout-and-io-submission.md` §2。几何写进命名空间指纹，换几何即换池，
+旧介质 open 时 fail-closed。
 
-### 8.2 Striped mapping
+`ChunkIndex`管semantic chunk；对象层（C++ `StorageObjectStore`）管槽位分配、对象头、
+检查点与恢复。scheduler只有在期望层集合完整时恢复resident。
 
-virtual offset先按stripe unit映射shard，再经FIEMAP映射namespace LBA。fan-out
-必须同时遵守stripe boundary、extent boundary、MDTS和alignment。
+### 8.2 多盘放置
+
+不做条带：一个 chunk 的全部层落在同一块盘的一个连续区域，单个 IO 永不跨盘、
+永不按条带切碎；只按 MDTS 和 FIEMAP extent 边界拆 sub-IO。长 prompt 的多盘并发
+来自相邻 chunk 的槽位在盘间轮转——一次 submit 里的很多 chunk 各落各盘。runtime
+侧 `MultiMountLocalFileResolver` 按挂载点最长前缀把 `file://` URI 分派到对应盘。
 
 ### 8.3 Host-pinned PRP 路径
 
@@ -539,45 +553,32 @@ fallback已经删除。cache disabled/miss/exhausted时由可增长的host-pinne
 timeout只保留controller仍可能访问的host PRP/payload/target lease，不再永久消耗
 整个GPU arena slot。
 
-### 8.4 Rank-local 文件尺寸与对象预分配
+### 8.4 段文件预建
 
-当前`set_layer_span(num_layers)`只确定rank-local chunk文件的最终逻辑尺寸。文件
-并未在模型初始化时创建；第一次`prepare_put()`仍同步真实写零扩展到
-`num_layers * segment_bytes`并`fsync`。这保证FIEMAP有真实extent，但属于首请求
-热路径分配，不是存储对象池预分配。
+段文件必须真实写零（resolver 拒绝 UNWRITTEN/DELALLOC extent，DMA 不能打到未分配
+块），写完 fsync、校验 FIEMAP（无空洞、≤124 个 extent），再写 `<file>.ready`
+（记录 file_bytes、st_dev、st_ino）。同一挂载点上的文件创建由挂载点级 flock 串行，
+否则并发大文件分配会把 ext4 extent 碎到超限。
 
-Hy3有8个KV heads，TP4时每rank持有2个不同KV heads，因此payload不重复，但几何
-相同：每rank每chunk均为`80 * 256 KiB = 20 MiB`。重复的是chunk key、token元数据
-和marker目录结构，不是KV payload。
+预建单位是**文件组**：每盘一个段文件，即 `segment_file_slots × N` 个槽位。
 
-目标对象池按rank-local geometry建立：初始化时真实写零创建固定大小slot文件，
-分配chunk时把free slot原子rename到content-key名字；evict后在所有target handle
-关闭后rename回free pool。slot inode/FIEMAP extent保持稳定，请求热路径不再扩文件
-或fsync。不同rank即使未来PP/HMA导致文件尺寸不同，也各自使用本rank manifest和
-slot size，不要求全局文件等长。scheduler发布公共命中前仍需all-rank commit仲裁。
+- `open()`：先收编盘上 `.ready` 匹配的组；冷池时同步建出首组（HY3 TP8 约 1 分钟），
+  开服即可写。若 `.ready` 记录的是另一种几何，open 直接报错，不把它当半截文件续写。
+- 分配器只交出已发布组内的槽位（`SpaceAllocator::set_ready_limit`）。写路径永不
+  建文件：越过已发布组的预留与容量耗尽同一契约——非阻塞拒绝，调用方裁剪写批。
+- 后台单线程调用 `precreate_step(headroom)`，最后一组用过一半时建下一组；最后一组
+  截到容量上限。建组失败不发布任何槽位，稍后重试；可用空间低于护栏
+  （`min(32 GiB, 5%)`，`TUTTI_PRECREATE_MIN_FREE_BYTES` 覆盖）时暂停。
+- 容量（`num_chunks` / `capacity_bytes`）只是上限，盘上占用跟随分配前沿。
 
-对象池必须接通Tutti public Runtime生命周期，而不是只改Python文件名：
+票据按段文件打开并长驻：槽位回收只就地清零槽位前缀，文件与 extent 不变，所以
+回收/再分配不关闭、不重开票据；槽位是否被复用由对象层的 slot generation 判定。
+绑定期按已就绪槽位预开票据并做一次 1-page 读预热 peer-memory 注册，首请求不再
+付 resolve 与注册成本。
 
-```text
-allocate batch:
-  ChunkIndex selects unpinned LRU victims
-  wait victim IO terminal
-  Runtime.close(TargetHandle) / close_batch
-  rename victim chunk file -> free slot
-  rename free slots -> new chunk-key files
-  Runtime.open_batch(all missing URIs) exactly once
-  cache returned TargetHandles by URI + slot generation
-```
-
-当前binding虽暴露`open_batch`，但store逐URI调用`open_batch([uri])`，没有真正批量
-打开；binding也尚未暴露target close，Python pop ticket不会释放C++ TargetHandle。
-对象池实现必须先补`close_target/close_batch`，并禁止旧handle跨slot generation
-访问已复用inode。
-
-pool采用`initial_slots/low_watermark/high_watermark/max_slots`。初始化同步创建
-`initial_slots`；free slots降到low watermark时后台真实写零补到high watermark，
-不超过max slots。请求先通过LRU回收已分配slot；仍不足时只允许有界等待后台allocator
-或返回结构化`RESOURCE_EXHAUSTED`，不得在请求线程回退到同步扩文件/fsync。
+检查点与 residency bitmap 在 `kv_root` 下，段文件在挂载点下。换 `kv_root`（pool
+tag）得到全新索引，已有段文件被收编复用（旧内容不可达）；两个池同时用同一组盘
+会互相覆盖。
 
 ## 9. Structured completion
 

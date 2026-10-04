@@ -648,12 +648,22 @@ void test_space_allocator() {
         bad.slot_bytes = 0;
         CHECK(!no_geometry.configure(bad));
 
-        // prewarm is clamped to what exists.
-        SpaceAllocator warm;
-        SpaceAllocatorConfig over = cfg;
-        over.prewarm_slots = 1000;
-        CHECK(warm.configure(over));
-        CHECK(warm.prewarm_slots() == 10);
+        // Never-used slots at/above the ready limit are not handed out;
+        // recycled ones still are.
+        SpaceAllocator limited;
+        CHECK(limited.configure(cfg));
+        limited.set_ready_limit(2);
+        SlotReservation first = limited.reserve(3);
+        CHECK(first.slots.size() == 2);
+        CHECK(first.rejected == 1);
+        limited.abort(first.slots.data(), 1);
+        std::vector<std::uint64_t> scrub = limited.take_reclaimable(1);
+        limited.finish_reclaim(scrub.data(), scrub.size());
+        SlotReservation recycled = limited.reserve(1);
+        CHECK(recycled.slots.size() == 1 && recycled.slots[0] == 0);
+        limited.set_ready_limit(3);
+        SlotReservation grown = limited.reserve(2);
+        CHECK(grown.slots.size() == 1 && grown.slots[0] == 2);
     }
 
     // --- reserve / commit / release lifecycle ---

@@ -88,8 +88,8 @@ factory 的边界上汇合。
 | StorageRuntime | `RuntimeConfig`、`RuntimeComponents` | `StorageRuntime` | 接收路由绑定并初始化 DataPath；销毁时停止 DataPath | 拥有 Resource、Resolver、DataPath 或理解 concrete backend spec |
 
 `BackendSpec` 是装配关系，不对应一个运行期 backend 对象。它在创建期把一个
-Resource、一个 Resolver 和一个 DataPath 连接起来，并携带三者共享的关系参数，例如
-striped backend 的 `stripe_unit`。
+Resource、一个 Resolver 和一个 DataPath 连接起来，并可携带三者共享的关系参数
+（当前三个 contract 都没有可配置的关系参数，`config` 为空）。
 
 ## 4. Config parser 边界
 
@@ -141,7 +141,6 @@ Parser 不判断以下语义：
 | Resource | `type: nvme` | `NvmeResourceConfig` |
 | Resource | `type: memory` | `MemoryResourceConfig` |
 | Resolver | `type: local-file` | `LocalFileResolverConfig` |
-| Resolver | `type: striped-file` | `StripedFileResolverConfig` |
 | Resolver | `type: memfs` | `MemfsResolverConfig` |
 | DataPath | `type: local-nvme` | `LocalNvmeDataPathConfig` |
 | DataPath | `type: striped-local-nvme` | `StripedLocalNvmeDataPathConfig` |
@@ -198,16 +197,13 @@ Spec 是普通 C++ value object。调用方可以绕过 YAML 直接构造，因�
 | `accelerator.profile` | `AcceleratorSpec` | 编译期 `TUTTI_COMPILED_ACCELERATOR_PROFILE` |
 | `runtime.accel_id` | `RuntimeSpec` | 编译期 `TUTTI_DEFAULT_ACCEL_ID`；HOST 为 `-1`，加速器 profile 为 `0` |
 | `NvmeAllocationSpec.selection` | NVMe resource spec | `Allowed`；当前 YAML parser 仍要求显式提供该字段，因此该默认值主要服务程序化构造 |
-| `NvmeDataPathTuning.threads_per_block` | NVMe DataPath spec | `16` |
 | NVMe DataPath 其余 tuning | NVMe DataPath spec | `0`；具体语义由 factory/concrete DataPath 解释 |
-| striped `stripe_unit` | striped backend spec | `512 KiB` |
 
 `provider.endpoint`、`queues_per_controller`、memory `capacity_bytes` 等字段没有可用的业务
 默认值；parser 将其设为 required，spec validator 也会拒绝空值或零值。
 
-例如 `examples/tutti_runtime/tutti_striped.yaml` 显式设置 `stripe_unit: 65536`；如果省略
-该 optional field，parser 构造 `StripedLocalNvmeBackendConfig` 时会保留 spec 中的
-`512 KiB` 默认值。
+`striped-local-nvme` backend 不接受任何 config 键（`stripe_unit` 已随条带化一起删除，
+写了会被 parser 拒绝）。
 
 ### 5.3 `validate()` 的职责
 
@@ -233,10 +229,12 @@ Spec 是普通 C++ value object。调用方可以绕过 YAML 直接构造，因�
 | Contract | Resource | Resolver | Scheme | DataPath | Resource cardinality |
 | --- | --- | --- | --- | --- | --- |
 | `ext4-local-nvme` | `nvme` | `local-file` | `file` | `local-nvme` | 1 |
-| `striped-local-nvme` | `nvme` | `striped-file` | `striped` | `striped-local-nvme` | 至少 2 |
+| `striped-local-nvme` | `nvme` | `local-file` | `file` | `striped-local-nvme` | 至少 2 |
 | `memfs` | `memory` | `memfs` | `memfs` | `memfs` | 1 |
 
-其中 striped contract 还要求 `stripe_unit` 非零且按 4096 字节对齐。
+`striped-local-nvme` 与 `ext4-local-nvme` 的区别只在资源数量和 DataPath：多盘时
+Resolver 仍是 `local-file`，由 factory 按挂载点分派（见 §8.2）。不做条带：一个文件
+只落一块盘，多盘并发来自不同文件落在不同盘上。
 
 这些检查只基于配置即可完成。daemon 实际返回几个 slice、每个 slice 的队列数和设备
 元数据是否有效，属于 Resource 初始化后的动态校验。
@@ -407,7 +405,7 @@ Result<std::unique_ptr<StorageTargetResolver>> create_resolver(
 | --- | --- | --- |
 | `ResolverSpec` | backend 的 `resolver` ID 在 `storage.resolvers` 中解析 | 选择 Resolver 类型和其静态 config |
 | `Resource&` | backend 的 `resource` ID 在已初始化 Resource registry 中解析 | 获取 resolver resource view |
-| `BackendSpec` | 当前装配关系 | 校验 contract，并读取 `stripe_unit` 等关系参数 |
+| `BackendSpec` | 当前装配关系 | 校验 contract（及未来的关系参数） |
 | `data_path_key` | 被引用的 `DataPathSpec.id` | 写入 Resolver 产生的 target，使其能路由到同一个 DataPath binding |
 
 Factory 会防御性确认 relation 确实引用传入的 Resolver、Resource 和 DataPath key，再按
@@ -424,13 +422,10 @@ local-file 组合要求一个 NVMe slice，构造 Resolver 时消费：
 - `block_path`；
 - `DataPathSpec.id` 形成的 DataPath key。
 
-striped-file 组合要求至少两个 slice。Factory 为每个 slice 构造 local-file shard，再用：
-
-- 所有 shard Resolver；
-- `BackendSpec.config.stripe_unit`；
-- `DataPathSpec.id` 形成的 DataPath key；
-
-构造 striped Resolver。
+`striped-local-nvme` 组合要求至少两个 slice。Factory 为每个 slice 生成一个挂载点
+绑定（`backing_mount_path`、`pci_bdf`、`namespace_id`、`logical_block_size`、
+`block_path`、DataPath key），构造 `MultiMountLocalFileResolver`：按 `file://` 路径的
+最长挂载点前缀选中对应盘，再走与单盘相同的 local-file 解析流程。
 
 Factory 的输出是未被 `StorageRuntime` 拥有的 `unique_ptr`。`TuttiRuntime` 将其注册到
 `resolvers_` registry，并向 `RuntimeComponents` 只提供：
@@ -482,11 +477,12 @@ local-nvme 组合要求一个 slice。构造 DataPath 时，factory 合并：
   logical block size、MDTS、PCI BDF。
 
 striped-local-nvme 组合要求至少两个 slice。Factory 为每个 slice 构造 device descriptor，
-并取所有 slice `max_data_size` 的最小值作为 effective MDTS。`threads_per_block` 不能超过
-任何 slice 的实际 granted queues。
+并取所有 slice `max_data_size` 的最小值作为 effective MDTS。
 
-因此，诸如“请求 32 个 queue，但 daemon 只 grant 16 个，而 tuning 要求 32 个线程”的
-冲突无法仅靠 spec 判断，应由 DataPath factory 在静态 tuning 与动态 grant 汇合处拒绝。
+提交 kernel 的 block 大小固定为一个 warp（`kSubmitBlockThreads = 32`），不可配置；
+IO 线程数由 worker 数决定（`TUTTI_POOL_WORKERS`，默认 256，且不超过本批条目数），
+线程按全局线程号取模映射到获批的队列，多线程共享同一队列由 `nvm_parallel_queue`
+的原子 cid 保证，所以获批队列数少于线程数不是错误。
 
 ### 9.3 Factory 不初始化 DataPath
 
@@ -680,15 +676,14 @@ RuntimeComponents:
 
 ### 12.2 Striped Local NVMe
 
-`examples/tutti_runtime/tutti_striped.yaml` 声明两个 device、striped Resolver/DataPath 和
-`stripe_unit: 65536`。它与 local 流程的差异只在 factory 内：
+`examples/tutti_runtime/tutti_striped.yaml` 声明两个 device、`local-file` Resolver 和
+striped DataPath。它与 local 流程的差异只在 factory 内：
 
 - NVMe Resource 要求 daemon 按请求顺序返回两个 slice；
-- Resolver factory 为两个 slice 构造 file shard，并用 backend 的 stripe unit 构造
-  `StripedResolver`；
+- Resolver factory 为两个 slice 构造挂载点绑定，生成 `MultiMountLocalFileResolver`；
 - DataPath factory 为两个 slice 构造 device descriptor，以最小 MDTS 作为共同上限，
-  构造 `StripedDataPath`；
-- binding key 使用 YAML 中的 DataPath ID，scheme 使用 `striped`。
+  构造 `StripedDataPath`（一次 launch 把一批请求发往各自所在的盘）；
+- binding key 使用 YAML 中的 DataPath ID，scheme 仍为 `file`。
 
 TuttiRuntime 的编排、所有权、StorageRuntime 创建和销毁流程与 local 模式完全相同。
 

@@ -12,8 +12,10 @@
 * **按对象提交，不按层**。一个 chunk 的全部层段共用一个对象，``commit`` 只写
   一次对象头；某层没写完在结构上就等于"整个对象未提交"，读侧永远看不到半截
   chunk。Python 侧只记 ``{chunk: 已写层集合}``，齐了才调一次 commit。
-* **槽位路径稳定且不含 chunk 身份**（``<root>/slots/<slot>.obj`` 或
-  ``<mount>/striped/<slot>.shard<i>``），因此票据缓存可以按 URI 长驻，分配与
+* **固定大段文件**：槽位号在挂载点间轮转（slot % N），每盘上连续
+  ``segment_file_slots`` 个槽位打包进一个段文件
+  ``<mount>/r<rank>/segments/<id>.seg``，槽位前缀（对象头）
+  ``segment_header_bytes``。路径不含 chunk 身份，票据按文件长驻，分配与
   回收都不需要 rename。
 * **零 marker 文件**。旧实现的 ``meta/<chunk>.<layer>.ok`` 与 manifest JSON 全
   部消失，冷启动驻留集合来自 ``recover()``。
@@ -34,31 +36,22 @@ from pathlib import Path
 # 挂在 tutti 树下的专属通道（connector 会为该树挂 handler 放行 INFO）。
 _PRECREATE_LOG = logging.getLogger("tutti.precreate")
 
-# 后台预建的节奏。batch 决定一次调用最多认领多少槽位（存储锁只在认领与发布
-# 时短暂持有，所以真正决定"写路径最多等多久"的是单槽 IO，而非 batch）；
-# idle 是没有可做的工作时的轮询间隔。
-_PRECREATE_BATCH_SLOTS = 64
+# 段文件几何默认值（HY3 TP8：2048 槽 × ~10 MiB ≈ 20 GiB/文件）。槽位前缀
+# 32 KiB 让每个槽位的 payload 起点 16 KiB 对齐（实测 4 KiB 前缀带宽低 20%）。
+DEFAULT_SEGMENT_FILE_SLOTS = 2048
+DEFAULT_SEGMENT_HEADER_BYTES = 32 * 1024
+
+# 后台预建没有工作时的轮询间隔。
 _PRECREATE_IDLE_SLEEP_S = 0.5
-# 认领在飞时的重试间隔：这个状态最长持续一次单槽 IO（~44ms），只需让出一
-# 点时间，避免四个线程一起空转白烧四个核。
-_PRECREATE_FLIGHT_SLEEP_S = 0.002
-# 需求驱动增长的默认就绪余量（槽位）。写路径永不等预建，余量的作用只是把
-# "增长跟不上需求"的概率压低：按 44ms/槽的单线程速度，1024 槽约 45s 的追赶
-# 余量，足够吸收突发。
-_MIN_PRECREATE_HEADROOM_SLOTS = 1024
 
 # 磁盘空间护栏：预建线程在把盘写满之前必须停手。故障形态（2026-09-22 事故）：
 # 容量配置超过物理盘（8TiB/rank × 8 rank = 64TiB 需求 > 4×5.8TB 盘），预建
-# 线程一路补到 ENOSPC——既写坏池子（半截文件），又让写路径退回"自己建槽"
-# 慢路径，前向线程被拖垮。护栏把增长压回"可用空间之内"：空间不足时暂停
-# 增长（写路径继续按非阻塞裁剪契约拒绝缺槽写），空间恢复后自动继续。
+# 线程一路补到 ENOSPC。护栏把增长压回"可用空间之内"：空间不足时暂停增长
+# （写路径继续按非阻塞裁剪契约拒绝缺槽写），空间恢复后自动继续。
 # 门限可用 TUTTI_PRECREATE_MIN_FREE_BYTES 覆盖（测试用）。
 _PRECREATE_MIN_FREE_BYTES_ENV = "TUTTI_PRECREATE_MIN_FREE_BYTES"
 _PRECREATE_DEFAULT_MIN_FREE_BYTES = 32 * 1024 ** 3  # 32 GiB
 _PRECREATE_SPACE_RECHECK_S = 5.0
-# CAUGHT_UP 是多线程共享的信号（每个线程各打一行会形成风暴），节流到这条
-# 间隔内只由最先追平的线程播报一次。
-_PRECREATE_CAUGHT_UP_LOG_INTERVAL_S = 10.0
 
 from tutti.index.chunk_index import decode_io_key as _decode
 from tutti.storage.object_store import (
@@ -68,14 +61,28 @@ from tutti.storage.object_store import (
     SCHEME_STRIPED_NVME_FILE,
 )
 
-__all__ = ["ObjectLayout"]
+__all__ = [
+    "DEFAULT_SEGMENT_FILE_SLOTS",
+    "DEFAULT_SEGMENT_HEADER_BYTES",
+    "ObjectLayout",
+    "layout_fingerprint",
+]
+
+
+def layout_fingerprint(namespace, segment_file_slots, segment_header_bytes):
+    """命名空间 + 段文件几何：几何变了就是另一个池，对象层 fail-closed。"""
+    tag = (b"segment-files-rotating-v4-slots:" +
+           str(int(segment_file_slots)).encode() + b"-header:" +
+           str(int(segment_header_bytes)).encode())
+    return (namespace or b"") + b"\0" + tag
+
 
 class ObjectLayout:
     """由对象层驱动的布局。
 
-    ``mounts`` 是数据盘目录；一个 slot 是一个文件，slot 号在 mounts 间
-    轮转（单 mount 即单文件布局）。``devices`` 是给 runtime resolver 用的
-    设备事实（controller/namespace），对象层只用其中的 ``mount_path``。
+    ``mounts`` 是数据盘目录（缺省为 root 本身），槽位在其间轮转、打包进
+    固定大段文件。``devices`` 是给 runtime resolver 用的设备事实
+    （controller/namespace），对象层只用其中的 ``mount_path``。
     """
 
     def __init__(
@@ -86,31 +93,26 @@ class ObjectLayout:
         mounts=None,
         devices=None,
         capacity_chunks: int = 0,
-        prewarm_chunks: int = 0,
         rank_id: int = 0,
         rank_count: int = 1,
         background_reclaim: bool = True,
-        warmup_probe_only: bool = False,
         namespace: bytes | str | None = None,
+        segment_file_slots: int = DEFAULT_SEGMENT_FILE_SLOTS,
+        segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
     ):
         self._root = Path(root)
         self._segment_bytes = int(segment_bytes)
+        self._segment_file_slots = int(segment_file_slots)
+        self._segment_header_bytes = int(segment_header_bytes)
         self._mounts = [str(m) for m in (mounts if mounts else [self._root])]
         self._devices = list(devices or [])
-        # 容量/预热按 chunk 计（对象层按 slot_bytes 折算为字节），避免上层
-        # 重复推导对象几何——对象头 4096B 由本模块在打开时加进去。
+        # 容量按 chunk 计（对象层按槽位几何折算为字节）。
         self._capacity_chunks = int(capacity_chunks or 0)
-        self._prewarm_chunks = int(prewarm_chunks or 0)
         self._rank_id = int(rank_id)
         self._rank_count = int(rank_count)
         self._background_reclaim = bool(background_reclaim)
-        # open 期预热口径：True = 只走查已存在的槽位、不建缺失的（配后台预建）；
-        # False = 旧同步语义（把缺失的预热槽位建出来）。
-        self._warmup_probe_only = bool(warmup_probe_only)
         # 后台预建线程的停止信号（None = 未启动），见 start_background_precreate。
         self._precreate_stop: threading.Event | None = None
-        # CAUGHT_UP 日志节流（多线程共享一个时间戳，见 _PRECREATE_CAUGHT_UP_LOG_INTERVAL_S）。
-        self._precreate_caught_up_log_at = 0.0
         self._namespace = (
             namespace.encode("utf-8") if isinstance(namespace, str) else namespace
         )
@@ -129,7 +131,7 @@ class ObjectLayout:
 
     @property
     def mounts(self) -> tuple[str, ...]:
-        """数据盘挂载点（单文件布局时即 root 本身）。"""
+        """数据盘挂载点（未配置时即 root 本身）。"""
         return tuple(self._mounts)
 
     @property
@@ -174,20 +176,23 @@ class ObjectLayout:
                 devices.append(entry)
         else:
             devices = [{"mount_path": mount} for mount in self._mounts]
-        prewarm_chunks = min(self._prewarm_chunks, self._capacity_chunks)
+        # 段文件几何是介质命名空间的一部分：换几何必须换池。
+        fingerprint = layout_fingerprint(
+            self._namespace, self._segment_file_slots, self._segment_header_bytes,
+        )
         return {
             "scheme": (
                 SCHEME_STRIPED_NVME_FILE
                 if len(self._mounts) > 1 else SCHEME_LOCAL_NVME_FILE
             ),
             "uri": str(self._root),
-            # 容量/预热按槽位声明：每槽位字节数由对象层按几何算。
+            # 容量按槽位声明：每槽位字节数由对象层按几何算。
             "capacity_slots": self._capacity_chunks,
-            "prewarm_slots": prewarm_chunks,
-            "warmup_probe_only": self._warmup_probe_only,
             "segment_bytes": self._segment_bytes,
             "segment_count": self._layer_span,
-            "namespace_fingerprint": self._namespace or b"",
+            "segment_file_slots": self._segment_file_slots,
+            "segment_header_bytes": self._segment_header_bytes,
+            "namespace_fingerprint": fingerprint,
             "devices": devices,
             "background_reclaim": self._background_reclaim,
             "rank_id": self._rank_id,
@@ -197,13 +202,11 @@ class ObjectLayout:
     def _open_store(self) -> None:
         store = ObjectStore(self._config())
         # 命名空间/几何不一致时对象层 fail-closed（不覆盖旧数据），异常直接上抛：
-        # 异构池必须由人处理，不能被当成"空池"静默复用。
+        # 异构池必须由人处理，不能被当成"空池"静默复用。冷池时 open 同步建出
+        # 首个文件组（每盘一个段文件，HY3 TP8 约 50s），开服即可写。
         store.open()
         self._store = store
         self._committed = store.recover()
-
-    def ensure_dirs(self) -> None:
-        """对象层自行物化目录与槽位文件，这里无事可做。"""
 
     def close_object_pool(self) -> None:
         if self._store is not None:
@@ -213,21 +216,14 @@ class ObjectLayout:
         self._reserved.clear()
         self._written_layers.clear()
 
-    def attach_object_pool(self, pool) -> None:
-        """兼容旧装配签名：对象布局不需要外部池。"""
-
-    def check_namespace(self, namespace) -> bool:
-        """命名空间校验已下沉到对象层（open 时 fail-closed）。"""
-        return True
-
     # ---------- 恢复 ----------
 
     def ready_slots(self) -> list[tuple[str, int]]:
         """已物化槽位的 ``(uri, generation)`` 列表（绑定期预热用）。
 
-        冷池与热池都非空：对象层在 open() 时已把预热槽位物化，恢复出的槽位
-        同样在盘上。绑定期拿这些 URI 先把运行时票据开好，请求路径就只剩内存
-        查找——首轮 resolve + peer-memory 注册的几百毫秒因此移出请求路径。
+        冷池与热池都非空：对象层 open() 至少建好首个文件组。绑定期拿这些 URI
+        先把运行时票据开好，请求路径就只剩内存查找——首轮 resolve +
+        peer-memory 注册的几百毫秒因此移出请求路径。
         """
         store = self._store
         if store is None:
@@ -287,72 +283,31 @@ class ObjectLayout:
             return _PRECREATE_DEFAULT_MIN_FREE_BYTES
         return min(_PRECREATE_DEFAULT_MIN_FREE_BYTES, total * 5 // 100)
 
-    def start_background_precreate(self, threads: int = 4,
-                                   headroom: int = 0) -> bool:
-        """后台预建槽位（只补就绪余量，跟随分配前沿），写路径不等它。
+    def start_background_precreate(self) -> None:
+        """后台线程：最后一个已建文件组用过一半时，建下一个文件组。
 
-        术语（与 SPI 头部一致）：**预热**是 open 期同步做掉的那一份；
-        **预建**是把槽位文件建成"尺寸正确、内容为零"的可用状态（~44ms/槽）；
-        **就绪**表示已预建、可被分配。
+        单位是**文件组**（每盘一个段文件 = ``segment_file_slots × 盘数`` 槽位），
+        对象层只整组发布，写路径永不建文件：前沿追上已建末尾时 reserve 非阻塞
+        拒绝、调用方裁剪，后台建好下一组后自动恢复。就绪余量取半个文件组：
+        建一组是重写入（HY3 TP8 每盘 8 rank × 20 GiB，约 50s），与在线 KV 争盘
+        带宽，所以不在组刚开始用时就建；剩一半（每 rank 4096 槽 ≈ 40 GiB KV）
+        足以覆盖建组时间。容量是上限，不是要立即铺满的目标。
 
-        与"复用"的关系（决定这批文件的来历，也决定这里要不要干活）：
-          * 容量 ≤ 盘上已有的槽位 → open 的走查已把它们记成就绪，本方法
-            不动任何文件（复用立即生效，零 IO、零异步）；
-          * 容量 > 盘上已有的槽位 → 差量在这里异步补，但**只为分配前沿
-            之前的一段就绪余量**铺文件：容量是用户指定的上限，不是要立刻
-            实体化的目标。已经存在的那部分由 C++ 的幂等探测跳过，所以
-            "复用"与"增长"合在同一条前沿上，不重复劳动。
-        就绪余量 headroom 的语义：增长总是从低到高、跟随分配前沿，所以先
-        满足的正是即将被分配到的槽位。曾有一个"一路补到容量上限"的模式
-        （full_capacity），被删除：盘占用 ∝ 容量而非工作集、几十万次零写
-        与在线 KV 争带宽，且容量配错时会把盘写满（2026-09-22 事故）。
-
-        为什么必须异步：预建一个槽位是 create + 写实零 + fsync（~44ms/槽，见
-        space_allocator 的注释），放在哪一端都是灾难——
-          * 放在 open 期：10 TB 级容量要几十分钟才起得来；
-          * 放在写路径（C++ reserve 的按需预建）：每个新槽位把前向线程卡
-            44ms，正好打在 GPU 计算/IO 流水线上。
-
-        因此契约拆成两半（见 storage_object_store.h 的异步增长一节）：
-          * open 只**走查**（probe，不写）调用方声明的初始槽位，把已经存在
-            的那些记成就绪——复用不花 IO，也不进异步；
-          * 本方法打开 ``set_precreate_on_write(False)``——写路径拿不到
-            就绪槽位时**拒绝并要求调用方裁剪**，与容量耗尽同一契约，且
-            自愈：后台追上后同一笔写就会成功；
-          * 增长由这里的后台线程驱动，容量上限仍然生效。
-
-        失败自愈：后台出错时立刻把按需预建交还写路径——宁慢，不静默停摆
-        （池子停止增长是看不见的容量故障）。
-        幂等：可安全重复启动。
-        返回 True 表示已启动（或无需启动）。
+        一个线程足够：对象层同一时刻只建一个组，同盘文件创建还有挂载点锁串行。
+        失败（如 ENOSPC、extent 过多）不发布任何槽位，稍后重试。幂等。
         """
         if self._precreate_stop is not None:
-            return True
-        store = self._store
-        step = getattr(store, "precreate_step", None)
-        if not callable(step):
-            # 原生扩展还没有异步预建接口：维持写路径按需预建（旧行为）。
-            return False
-        capacity = int(self._capacity_chunks)
-        # keep = 分配前沿之前要保持就绪的槽位数。容量只是上限，不在这里
-        # 铺实体（见方法头注释：full_capacity 已删除）。
-        keep = max(1, int(headroom or _MIN_PRECREATE_HEADROOM_SLOTS))
-        try:
-            store.set_precreate_on_write(False)
-        except Exception as exc:
-            _PRECREATE_LOG.warning(
-                "BACKGROUND_PRECREATE_DISABLED err=%r", exc
-            )
-            return False
+            return
+        store = self._store_required()
+        group = self._segment_file_slots * len(self._mounts)
+        headroom = max(1, group // 2)
         stop = threading.Event()
         self._precreate_stop = stop
 
-        def run(index: int) -> None:
-            worked = False
+        def run() -> None:
             space_low = False
             while not stop.is_set():
-                # 磁盘空间护栏（见模块头常量注释）：写路径永不因它阻塞——
-                # 空间不足时这里只是停止增长，缺槽写仍走非阻塞裁剪契约。
+                # 磁盘空间护栏（见模块头常量注释）。
                 free = self._mounts_free_bytes()
                 floor = self._min_free_bytes()
                 if free is not None and free < floor:
@@ -360,9 +315,8 @@ class ObjectLayout:
                         space_low = True
                         _PRECREATE_LOG.warning(
                             "BACKGROUND_PRECREATE_SPACE_LOW free=%dB floor=%dB "
-                            "precreated=%d target=%d；暂停增长，空间恢复后继续",
+                            "precreated=%d；暂停增长，空间恢复后继续",
                             free, floor, store.precreated_slots(),
-                            store.precreate_target(),
                         )
                     stop.wait(_PRECREATE_SPACE_RECHECK_S)
                     continue
@@ -372,81 +326,38 @@ class ObjectLayout:
                         "BACKGROUND_PRECREATE_SPACE_RESUMED free=%dB floor=%dB",
                         free, floor,
                     )
+                started = time.monotonic()
                 try:
-                    made = step(_PRECREATE_BATCH_SLOTS, keep)
+                    made = store.precreate_step(headroom)
                 except Exception as exc:
                     _PRECREATE_LOG.warning(
-                        "BACKGROUND_PRECREATE_FAILED thread=%d err=%r；"
-                        "把按需预建交还写路径",
-                        index, exc,
+                        "BACKGROUND_PRECREATE_FAILED err=%r；稍后重试，写路径"
+                        "保持非阻塞拒绝", exc,
                     )
-                    stop.set()
-                    try:
-                        store.set_precreate_on_write(True)
-                    except Exception:
-                        pass
-                    return
+                    stop.wait(_PRECREATE_SPACE_RECHECK_S)
+                    continue
                 if made > 0:
-                    # 有活就接着干，不在批次之间空等——追赶分配前沿时
-                    # 这条循环是热路径，睡眠会把它拖慢到 1/500。
-                    worked = True
+                    _PRECREATE_LOG.info(
+                        "BACKGROUND_PRECREATE_GROUP slots=%d precreated=%d "
+                        "capacity=%d took_s=%.1f",
+                        made, store.precreated_slots(), self._capacity_chunks,
+                        time.monotonic() - started,
+                    )
                     continue
-                # 返回 0 有两种可能：真无事可做（已到 target），或这一次的
-                # 认领都还在飞（别人刚认领走了）。只有前者该让出 CPU，
-                # 后者必须立刻重试，否则多线程会退化成 2 次/秒。
-                if store.precreated_slots() < store.precreate_target():
-                    # 让出极短时间再重试：这个状态最长持续一次单槽 IO
-                    # （~44ms），但四个线程一起空转会白烧四个核。
-                    stop.wait(_PRECREATE_FLIGHT_SLEEP_S)
-                    continue
-                if worked:
-                    # 从"有活"回到"无事可做"：这是外部唯一能观测到预建
-                    # 已补齐的信号（线程名不进 /proc，CPU 也测不出来）。
-                    # 四个线程会各自经历一次同样的转变，节流成一条。
-                    worked = False
-                    now = time.monotonic()
-                    if (now - self._precreate_caught_up_log_at
-                            >= _PRECREATE_CAUGHT_UP_LOG_INTERVAL_S):
-                        self._precreate_caught_up_log_at = now
-                        _PRECREATE_LOG.info(
-                            "BACKGROUND_PRECREATE_CAUGHT_UP precreated=%d "
-                            "target=%d capacity=%d",
-                            store.precreated_slots(), store.precreate_target(),
-                            capacity,
-                        )
-                # 没有可做的工作（分配前沿还没推过来，或已到容量上限）：
-                # 让出 CPU，等下一次需求把它叫醒。
                 stop.wait(_PRECREATE_IDLE_SLEEP_S)
 
-        workers = max(1, min(int(threads), 32))
-        for index in range(workers):
-            threading.Thread(
-                target=run, args=(index,),
-                name=f"tutti-precreate-{index}", daemon=True,
-            ).start()
+        threading.Thread(target=run, name="tutti-precreate", daemon=True).start()
         _PRECREATE_LOG.info(
-            "BACKGROUND_PRECREATE_START reused=%d capacity=%d "
-            "headroom=%d threads=%d batch=%d",
-            store.precreated_slots(), capacity,
-            keep, workers, _PRECREATE_BATCH_SLOTS,
+            "BACKGROUND_PRECREATE_START precreated=%d capacity=%d group=%d "
+            "headroom=%d",
+            store.precreated_slots(), self._capacity_chunks, group, headroom,
         )
-        return True
 
     def stop_background_precreate(self) -> None:
-        """请求后台预建停止（close 时调用；线程是 daemon，不阻塞退出）。
-
-        同时把按需预建交还写路径：增长线程没了，池子若还在被写入，就必须
-        退回"自己建槽"的慢路径，而不是永远拒绝。
-        """
+        """请求后台预建停止（close 时调用；线程是 daemon，不阻塞退出）。"""
         if self._precreate_stop is not None:
             self._precreate_stop.set()
             self._precreate_stop = None
-        restore = getattr(self._store, "set_precreate_on_write", None)
-        if callable(restore):
-            try:
-                restore(True)
-            except Exception:
-                pass
 
     def committed_chunks(self) -> set[bytes]:
         """已提交（= 层齐全）的 chunk 集合；层宽未定案时为空集。"""
@@ -588,20 +499,6 @@ class ObjectLayout:
             raise KeyError(f"chunk 未预留：{bytes(chunk_id)!r}")
         return placement.uri
 
-    def reserved_uris(self, chunk_ids) -> list[str]:
-        """已预留 chunk 的 URI 列表；未预留的静默跳过（保序去重）。
-
-        给清理路径（Store::abort_chunks）用：一个 chunk 可能已被驱逐/回收，
-        此时它不在预留表里、也没有可清理的缓存目标——这不是异常。target_uri
-        与 target_offset 保持 fail-fast，供真正要求"必须已预留"的调用方用。
-        """
-        uris = []
-        for chunk_id in dict.fromkeys(bytes(c) for c in chunk_ids):
-            placement = self._placement(chunk_id)
-            if placement is not None:
-                uris.append(placement.uri)
-        return uris
-
     def target_offset(self, chunk_id: bytes) -> int:
         """段 0 在对象逻辑地址空间中的起点（对象头之后）。"""
         placement = self._placement(chunk_id)
@@ -633,6 +530,3 @@ class ObjectLayout:
                 "义对象几何）"
             )
         return self._store
-
-
-

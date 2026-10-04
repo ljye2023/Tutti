@@ -35,18 +35,9 @@ Status read_only_error(const char* operation) {
                   std::string(operation) + ": store is read-only");
 }
 
-// How many slots a grower may claim beyond the precreated prefix. Bounds the
-// out-of-order completion set, and stops a stalled grower from parking the
-// prefix far behind its cursor.
-constexpr std::uint64_t kPrecreateClaimWindow = 64;
-
 } // namespace
 
 ObjectStoreCore::ObjectStoreCore() = default;
-
-ObjectStoreCore::ObjectStoreCore(
-    std::unique_ptr<SlotPlacementPolicy> placement)
-    : placement_(std::move(placement)) {}
 
 ObjectStoreCore::~ObjectStoreCore() {
     // No implicit checkpoint: persisting during destruction would make an error
@@ -94,6 +85,23 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "segment_bytes must be 4096-aligned for O_DIRECT");
     }
+    if (config.segment_file_slots == 0) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "segment_file_slots must be positive");
+    }
+    const std::uint64_t header_bytes = config.segment_header_bytes;
+    if (header_bytes < ObjectHeaderLayout::kHeaderBytes ||
+        header_bytes % 4096 != 0) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "segment_header_bytes must be at least 4096 and 4096-aligned");
+    }
+    const std::uint64_t payload_bytes = config.layout.payload_bytes();
+    if (payload_bytes > UINT64_MAX - header_bytes ||
+        config.segment_file_slots >
+            UINT64_MAX / (header_bytes + payload_bytes)) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "segment_file_slots overflows file size");
+    }
 
     if (opened_) {
         // Reopening the same namespace must agree on geometry and identity.
@@ -101,6 +109,8 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
         // entry point, because destroying a populated cache is an operational
         // action, not a runtime capability.
         if (!(config.layout == config_.layout) ||
+            config.segment_file_slots != config_.segment_file_slots ||
+            config.segment_header_bytes != config_.segment_header_bytes ||
             config.namespace_fingerprint != config_.namespace_fingerprint ||
             config.uri != config_.uri) {
             return Status(StatusCode::INVALID_ARGUMENT,
@@ -111,14 +121,12 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
 
     config_ = config;
 
-    // Build placement and resolver before anything consults them.
+    // A slot occupies its reserved prefix (object header) plus the payload.
+    slot_bytes_ = header_bytes + payload_bytes;
+
+    // Build placement before anything consults it.
     const Status backend = build_backend_locked();
     if (!backend.ok()) return backend;
-
-    // The placement owns where the payload starts: the space a slot occupies is
-    // its payload prefix plus the payload itself.
-    slot_bytes_ = placement_->payload_offset() + config.layout.payload_bytes();
-    shard_bytes_ = placement_->shard_file_bytes(slot_bytes_);
 
     SpaceAllocatorConfig alloc_config;
     // capacity is a ceiling; the slot count follows from slot_bytes_. Callers
@@ -128,15 +136,14 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
         config.capacity_slots > 0 ? config.capacity_slots * slot_bytes_
                                   : config.capacity_bytes;
     alloc_config.slot_bytes = slot_bytes_;
-    alloc_config.prewarm_slots =
-        config.prewarm_slots > 0
-            ? config.prewarm_slots
-            : (config.prewarm_bytes == 0 ? 0
-                                         : config.prewarm_bytes / slot_bytes_);
     if (!allocator_.configure(alloc_config)) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "capacity_bytes too small to hold a single object");
     }
+    if (config.segment_file_slots > UINT64_MAX / config.devices.size()) {
+        return Status(StatusCode::INVALID_ARGUMENT, "segment group size overflows");
+    }
+    group_slots_ = config.segment_file_slots * config.devices.size();
 
     if (!config_.read_only) {
         const Status layout_status = ensure_layout_locked();
@@ -153,34 +160,26 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
         if (!meta_status.ok()) return meta_status;
     }
 
-    // Recover before prewarming. Recovery may find slots already precreated
-    // and in use, and prewarming first would be wasted work on a warm pool.
-    // A missing checkpoint is a cold start either way, so the read-only path
-    // needs no special casing here.
+    // Recover before touching media: a warm pool is adopted as-is.
     const Status recovered = load_checkpoint_locked();
     if (!recovered.ok()) return recovered;
 
-    // Prewarm the rest of the requested prefix. This is where a large
-    // prewarm_bytes costs real time: extents must be genuinely written, at
-    // roughly 225 MB/s per rank, so a terabyte is on the order of an hour.
-    // capacity_bytes is only a ceiling; prewarm_bytes is what open() pays for.
+    // Writer: adopt every file group already on media; on a cold pool build the
+    // first group here, so a store is writable the moment open() returns. This
+    // is where service startup pays for its first files (~50 s for 8 ranks x 4
+    // disks x 20 GiB). Later groups are built by precreate_step().
     if (!config_.read_only) {
-        if (config_.warmup_probe_only) {
-            // 增长由后台预建驱动（set_precreate_on_write(false)）：open 只
-            // 走查调用方声明的前缀，把已经在盘上的记成就绪。复用不花 IO，
-            // 容量差量留给后台，大容量冷启动因此不在 open 期付建文件的代价。
-            const Status reused =
-                adopt_existing_through_locked(allocator_.prewarm_slots());
-            if (!reused.ok()) return reused;
-        } else {
-            // 默认（同步）语义：把缺失的预热槽位建出来。这是历史行为，
-            // 未启用后台预建的部署与测试都走这条。
-            const Status warmed =
-                precreate_through_locked(allocator_.prewarm_slots());
-            if (!warmed.ok()) return warmed;
+        const Status reused = adopt_existing_groups_locked();
+        if (!reused.ok()) return reused;
+        if (precreated_ == 0) {
+            std::vector<std::string> paths;
+            const Status resolved = group_paths_locked(0, &paths);
+            if (!resolved.ok()) return resolved;
+            const Status made = materialise_group(paths);
+            if (!made.ok()) return made;
+            precreated_ = std::min(group_slots_, allocator_.total_slots());
         }
-        precreate_cursor_ = precreated_;
-        precreate_done_.clear();
+        allocator_.set_ready_limit(precreated_);
     }
 
     // Residency bitmaps last: their slot_count depends on the final geometry.
@@ -242,9 +241,6 @@ Status ObjectStoreCore::close() {
 }
 
 Status ObjectStoreCore::build_backend_locked() {
-    // Already injected: nothing to build. This is the path tests take.
-    if (placement_ != nullptr) return {};
-
     if (config_.devices.empty()) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "at least one device must be configured");
@@ -260,28 +256,22 @@ Status ObjectStoreCore::build_backend_locked() {
         }
     }
 
-    // One mount: every slot is a file under it, rotation is trivial. Several
-    // mounts: slots rotate across them by slot number, one file per slot.
-    // Slots live under a per-rank directory: several ranks of one deployment
-    // share the mounts, and slot numbers are per-rank -- without the rank
-    // directory they would overwrite each other's files.
-    if (config_.devices.size() == 1) {
-        placement_ = std::make_unique<SingleFilePlacement>(
-            config_.devices[0].mount_path);
-        return {};
-    }
-
+    // Slot numbers rotate over the mounts; every segment file is scoped to a
+    // rank so ranks with the same slot numbers cannot overwrite one another.
     std::vector<std::string> mounts;
     mounts.reserve(config_.devices.size());
     for (const StoreDevice& device : config_.devices) {
         mounts.push_back(device.mount_path);
     }
-    auto rotating = std::make_unique<RotatingFilePlacement>(
-        std::move(mounts), "r" + std::to_string(config_.rank_id));
-    if (!rotating->geometry_valid()) {
-        return Status(StatusCode::INVALID_ARGUMENT, "no mounts configured");
+    auto segmented = std::make_unique<FixedSegmentFilePlacement>(
+        std::move(mounts), "r" + std::to_string(config_.rank_id) + "/segments",
+        slot_bytes_, slot_bytes_ * config_.segment_file_slots,
+        config_.segment_header_bytes);
+    if (!segmented->geometry_valid()) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "invalid fixed segment file geometry");
     }
-    placement_ = std::move(rotating);
+    placement_ = std::move(segmented);
     return {};
 }
 
@@ -291,13 +281,11 @@ Status ObjectStoreCore::ensure_layout_locked() {
     const Status meta = ensure_directory(join(config_.uri, "meta"));
     if (!meta.ok()) return meta;
 
-    // Slot directories live under whichever mounts the placement policy uses,
-    // so ask it rather than assuming a single root: for a striped layout the
-    // slots are spread across devices.
-    std::vector<std::string> paths;
-    const Status probe = placement_->paths_for_slot(0, &paths);
-    if (!probe.ok()) return probe;
-    for (const std::string& path : paths) {
+    // One segment directory per device: slots 0..N-1 land on devices 0..N-1.
+    const std::uint64_t devices =
+        std::min<std::uint64_t>(config_.devices.size(), allocator_.total_slots());
+    for (std::uint64_t slot = 0; slot < devices; ++slot) {
+        const std::string path = placement_->path_for_slot(slot);
         const std::size_t slash = path.find_last_of('/');
         if (slash == std::string::npos) continue;
         const Status dir = ensure_directory(path.substr(0, slash));
@@ -310,35 +298,42 @@ Status ObjectStoreCore::ensure_layout_locked() {
 // precreate
 // -------------------------------------------------------------------------
 
-Status ObjectStoreCore::adopt_existing_through_locked(
-    std::uint64_t slot_exclusive_end) {
-    const std::uint64_t limit =
-        std::min(slot_exclusive_end, allocator_.total_slots());
-    while (precreated_ < limit) {
-        std::vector<std::string> paths;
-        const Status resolved = placement_->paths_for_slot(precreated_, &paths);
-        if (!resolved.ok()) return resolved;
-        bool present = false;
-        const Status probed =
-            slot_is_precreated(paths, shard_bytes_, &present);
-        if (!probed.ok()) return probed;
-        if (!present) break;   // the prefix stays contiguous; the grower takes it
-        ++precreated_;
+// A file group is `group_slots_` consecutive slots starting at a multiple of
+// group_slots_; slot group_start + d lives in the group's file on device d.
+Status ObjectStoreCore::group_paths_locked(std::uint64_t slot,
+                                          std::vector<std::string>* out) const {
+    out->clear();
+    const std::uint64_t group_start = (slot / group_slots_) * group_slots_;
+    for (std::size_t device = 0; device < config_.devices.size(); ++device) {
+        const std::uint64_t first = group_start + device;
+        if (first >= allocator_.total_slots()) break;
+        out->push_back(placement_->path_for_slot(first));
     }
     return {};
 }
 
-Status ObjectStoreCore::precreate_through_locked(
-    std::uint64_t slot_exclusive_end) {
-    const std::uint64_t limit =
-        std::min(slot_exclusive_end, allocator_.total_slots());
-    while (precreated_ < limit) {
-        std::vector<std::string> paths;
-        const Status resolved = placement_->paths_for_slot(precreated_, &paths);
-        if (!resolved.ok()) return resolved;
-        const Status made = materialise_slot(paths, shard_bytes_);
+Status ObjectStoreCore::materialise_group(
+    const std::vector<std::string>& paths) const {
+    for (const std::string& path : paths) {
+        const Status made = materialise_segment_file(path, placement_->file_bytes());
         if (!made.ok()) return made;
-        ++precreated_;
+    }
+    return {};
+}
+
+Status ObjectStoreCore::adopt_existing_groups_locked() {
+    const std::uint64_t total = allocator_.total_slots();
+    while (precreated_ < total) {
+        std::vector<std::string> paths;
+        const Status resolved = group_paths_locked(precreated_, &paths);
+        if (!resolved.ok()) return resolved;
+        for (const std::string& path : paths) {
+            bool present = false;
+            const Status probed = segment_file_is_ready(path, placement_->file_bytes(), &present);
+            if (!probed.ok()) return probed;
+            if (!present) return {};  // never publish a partially ready group
+        }
+        precreated_ = std::min(total, precreated_ + group_slots_);
     }
     return {};
 }
@@ -350,7 +345,7 @@ ObjectPlacement ObjectStoreCore::placement_locked(
     // here too would pay the FIEMAP plus peer-memory mapping cost twice.
     p.uri = placement_->uri_for_slot(slot);
     // Skip the header so segment 0 begins exactly at p.offset.
-    p.offset = placement_->payload_offset();
+    p.offset = placement_->payload_offset_for_slot(slot);
     p.payload_bytes = config_.layout.payload_bytes();
     p.slot = slot;
     p.generation = generation;
@@ -438,14 +433,15 @@ StoreUsage ObjectStoreCore::usage() const {
     u.reclaiming_bytes = s.reclaiming_slots * slot_bytes_;
     u.usable_bytes = (s.free_slots + s.unmaterialised_slots) * slot_bytes_;
 
-    // Per device. The apportioning rule is implementation-private: striped
-    // layouts are not required to be balanced, only to stay within each
-    // device's available space.
-    const std::uint32_t shards = placement_->shard_count();
-    if (shards > 0) {
+    // Per device: slots rotate over the devices, so slot s is on s % N.
+    const std::uint64_t devices = config_.devices.size();
+    if (devices > 0) {
         const std::uint64_t used = s.committed_slots + s.reserved_slots +
                                    s.reclaiming_slots;
-        u.per_device_bytes.assign(shards, used * shard_bytes_ / shards);
+        u.per_device_bytes.assign(devices, used / devices * slot_bytes_);
+        for (std::uint64_t d = 0; d < used % devices; ++d) {
+            u.per_device_bytes[d] += slot_bytes_;
+        }
     }
     return u;
 }
@@ -453,12 +449,11 @@ StoreUsage ObjectStoreCore::usage() const {
 std::uint64_t ObjectStoreCore::ready_slots() const {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!opened_) return 0;
-    // precreated_ is the count of slots whose files actually exist on media
-    // (prewarmed here, or recovered from a previous process). Do NOT derive
-    // this from SpaceAllocatorStats::unmaterialised_slots: that is the
-    // allocator's high-water mark of *handed out* slots, which stays at zero
-    // through prewarm, so the bind-time warm-up saw an empty pool and the first
-    // IO paid the whole peer-memory registration on the request path.
+    // precreated_ counts slots whose file group is ready on media. Do NOT
+    // derive this from SpaceAllocatorStats::unmaterialised_slots: that is the
+    // allocator's high-water mark of *handed out* slots, which is zero at bind
+    // time, so the warm-up would see an empty pool and the first IO would pay
+    // the whole peer-memory registration on the request path.
     return precreated_;
 }
 
@@ -518,36 +513,16 @@ Result<ReserveOutcome> ObjectStoreCore::reserve(const ObjectKey* keys,
 
         SlotReservation got = allocator_.reserve(1);
         if (got.slots.empty()) {
-            // Capacity exhausted. A cache that never fills is over-provisioned,
-            // so this is a steady state, not a fault: report the remainder and
+            // Capacity exhausted, or the next file group is not published yet
+            // (the allocator only hands out slots below precreated_; growth
+            // belongs to precreate_step(), never to the forward thread). Either
+            // way this is a steady state, not a fault: report the remainder and
             // let the caller trim its write batch. Never block, never raise.
             out.rejected_count += count - i;
             break;
         }
         const std::uint64_t slot = got.slots[0];
         const std::uint64_t generation = got.generations[0];
-
-        if (slot >= precreated_ && !precreate_on_write_) {
-            // Growth belongs to the background caller (precreate_step): a
-            // forward thread must never create+fsync a slot, which costs tens
-            // of milliseconds each. Refusing is the same non-blocking contract
-            // as capacity exhaustion -- the caller trims -- and the slot
-            // becomes available as soon as the grower reaches it.
-            allocator_.abort(&slot, 1);
-            ++out.rejected_count;
-            continue;
-        }
-        // Precreate on demand when prewarm did not cover this slot. This is
-        // the one place reserve can be slow (~44 ms per slot), which is why
-        // prewarm_bytes should cover the working set.
-        if (slot >= precreated_) {
-            const Status made = precreate_through_locked(slot + 1);
-            if (!made.ok()) {
-                allocator_.abort(&slot, 1);
-                ++out.rejected_count;
-                continue;
-            }
-        }
 
         Entry entry;
         entry.slot = slot;
@@ -566,23 +541,14 @@ Status ObjectStoreCore::write_header_locked(std::uint64_t slot,
                                            const ObjectKey& key,
                                            std::uint64_t generation,
                                            std::uint64_t commit_seq) {
-    std::vector<std::string> paths;
-    const Status resolved = placement_->paths_for_slot(slot, &paths);
-    if (!resolved.ok()) return resolved;
-
-    const std::uint32_t shard = placement_->header_shard();
-    if (shard >= paths.size()) {
-        return Status(StatusCode::INTERNAL, "header shard out of range");
-    }
-
     std::vector<std::uint8_t> header(ObjectHeaderLayout::kHeaderBytes);
     if (!encode_object_header(header.data(), header.size(), key,
                               config_.layout.payload_bytes(), generation,
                               commit_seq)) {
         return Status(StatusCode::INVALID_ARGUMENT, "could not encode header");
     }
-    return write_object_header(paths[shard],
-                               placement_->header_offset_in_shard(),
+    return write_object_header(placement_->path_for_slot(slot),
+                               placement_->header_offset_for_slot(slot),
                                header.data(), header.size());
 }
 
@@ -723,15 +689,13 @@ std::uint64_t ObjectStoreCore::drain_reclaim(std::uint64_t max) {
     done.reserve(taken.size());
 
     for (std::uint64_t slot : taken) {
-        std::vector<std::string> paths;
-        if (!placement_->paths_for_slot(slot, &paths).ok()) {
-            failed.push_back(slot);
-            continue;
-        }
         // Zeroing the header is what actually invalidates the object: a zero
         // magic decodes as "never written" rather than as corruption, making a
         // reclaimed slot indistinguishable from a fresh one.
-        if (!zero_slot(paths, shard_bytes_).ok()) {
+        const Status zeroed = zero_file_range(placement_->path_for_slot(slot),
+                                              placement_->header_offset_for_slot(slot),
+                                              slot_bytes_);
+        if (!zeroed.ok()) {
             failed.push_back(slot);
             continue;
         }
@@ -759,78 +723,49 @@ std::uint64_t ObjectStoreCore::precreate_target() const {
     return precreate_target_;
 }
 
-void ObjectStoreCore::set_precreate_on_write(bool enabled) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    precreate_on_write_ = enabled;
-}
-
-Result<std::uint64_t> ObjectStoreCore::precreate_step(
-    std::uint64_t max_slots, std::uint64_t headroom) {
-    std::uint64_t done = 0;
-    while (done < max_slots) {
-        std::uint64_t slot = 0;
-        std::uint64_t shard_bytes = 0;
-        std::vector<std::string> paths;
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (!opened_) {
-                return Result<std::uint64_t>::Failure(
-                    Status(StatusCode::NOT_READY, "store is not open"));
-            }
-            if (config_.read_only) {
-                return Result<std::uint64_t>::Success(done);
-            }
-            const std::uint64_t total = allocator_.total_slots();
-            const SpaceAllocatorStats stats = allocator_.stats();
-            // Slots never handed out: the allocation frontier is everything
-            // below that. Growth follows demand by `headroom` slots.
-            const std::uint64_t frontier = total - stats.unmaterialised_slots;
-            const std::uint64_t target = std::min(total, frontier + headroom);
-            // Published so callers can tell "no work left" from "every claim is
-            // in flight right now": both return 0 created slots, but only the
-            // first one means the grower may go idle.
-            precreate_target_ = target;
-            if (precreate_cursor_ >= target) {
-                return Result<std::uint64_t>::Success(done);
-            }
-            if (precreate_cursor_ - precreated_ >=
-                kPrecreateClaimWindow) {
-                return Result<std::uint64_t>::Success(done);
-            }
-            slot = precreate_cursor_++;
-            // Resolve under the lock -- placement_ is not documented thread
-            // safe -- but do the IO outside it. Holding mutex_ across a
-            // create+fsync is exactly what makes a synchronous precreate
-            // expensive for every other caller.
-            const Status resolved = placement_->paths_for_slot(slot, &paths);
-            if (!resolved.ok()) {
-                --precreate_cursor_;
-                return Result<std::uint64_t>::Failure(resolved);
-            }
-            shard_bytes = shard_bytes_;
+Result<std::uint64_t> ObjectStoreCore::precreate_step(std::uint64_t headroom) {
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+    std::vector<std::string> paths;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (!opened_) {
+            return Result<std::uint64_t>::Failure(
+                Status(StatusCode::NOT_READY, "store is not open"));
         }
-
-        const Status made = materialise_slot(paths, shard_bytes);
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (made.ok()) {
-                precreate_done_.insert(slot);
-                // Publish in order: [0, precreated_) stays "on media" even
-                // when several growers finish out of order.
-                while (precreate_done_.erase(precreated_) > 0) {
-                    ++precreated_;
-                }
-            }
-            // A failure deliberately leaves the cursor where it is: another
-            // grower may already have claimed past this slot, and handing the
-            // number out again would write the same file twice. The hole keeps
-            // the prefix from advancing, which is safe -- reserve() refuses
-            // everything at or beyond it -- and the caller is told.
+        if (config_.read_only) return Result<std::uint64_t>::Success(0);
+        const std::uint64_t total = allocator_.total_slots();
+        // Allocation frontier: slots the allocator has ever handed out.
+        const std::uint64_t frontier = total - allocator_.stats().unmaterialised_slots;
+        const std::uint64_t wanted =
+            headroom >= total - frontier ? total : frontier + headroom;
+        // Whole groups only: a partially published group would make slots look
+        // ready on disks whose file does not exist yet.
+        const std::uint64_t rounded =
+            (wanted + group_slots_ - 1) / group_slots_ * group_slots_;
+        precreate_target_ = std::min(total, rounded);
+        if (precreate_busy_ || precreated_ >= precreate_target_) {
+            return Result<std::uint64_t>::Success(0);
         }
-        if (!made.ok()) return Result<std::uint64_t>::Failure(made);
-        ++done;
+        start = precreated_;
+        end = std::min(total, start + group_slots_);
+        const Status resolved = group_paths_locked(start, &paths);
+        if (!resolved.ok()) return Result<std::uint64_t>::Failure(resolved);
+        precreate_busy_ = true;
     }
-    return Result<std::uint64_t>::Success(done);
+    // Materialise outside the lock: a group is tens of GiB of zero-fill, and
+    // the forward path must keep reserving slots that are already published.
+    const Status made = materialise_group(paths);
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        precreate_busy_ = false;
+        if (made.ok()) {
+            precreated_ = end;
+            allocator_.set_ready_limit(precreated_);
+        }
+    }
+    if (!made.ok()) return Result<std::uint64_t>::Failure(made);
+    return Result<std::uint64_t>::Success(end - start);
 }
 
 // -------------------------------------------------------------------------
@@ -955,7 +890,6 @@ Status ObjectStoreCore::load_checkpoint_locked() {
     std::vector<std::uint64_t> to_commit;
     to_commit.reserve(entries.size());
     std::uint64_t highest_seq = 0;
-    std::uint64_t highest_slot = 0;
 
     for (const CheckpointEntry& entry : entries) {
         if (entry.slot >= allocator_.total_slots() ||
@@ -973,18 +907,9 @@ Status ObjectStoreCore::load_checkpoint_locked() {
             continue;
         }
 
-        std::vector<std::string> paths;
-        if (!placement_->paths_for_slot(entry.slot, &paths).ok()) {
-            ++recovery_.dropped_geometry;
-            continue;
-        }
-        const std::uint32_t shard = placement_->header_shard();
-        if (shard >= paths.size()) {
-            ++recovery_.dropped_geometry;
-            continue;
-        }
-        if (!read_object_header(paths[shard], placement_->header_offset_in_shard(),
-                               header.data(), header.size()).ok()) {
+        if (!read_object_header(placement_->path_for_slot(entry.slot),
+                                placement_->header_offset_for_slot(entry.slot),
+                                header.data(), header.size()).ok()) {
             ++recovery_.dropped_header;
             continue;
         }
@@ -1012,13 +937,11 @@ Status ObjectStoreCore::load_checkpoint_locked() {
         slot_owner_[entry.slot] = ik;
         to_commit.push_back(entry.slot);
         highest_seq = std::max(highest_seq, fields.commit_seq);
-        highest_slot = std::max(highest_slot, entry.slot + 1);
         ++recovery_.accepted;
     }
 
-    // Recovered slots are already materialised on media; record that so
-    // reserve() does not try to materialise them again.
-    precreated_ = std::max(precreated_, highest_slot);
+    // precreated_ is not derived from recovered slots: open() adopts whole file
+    // groups from media right after this, which keeps it group-aligned.
     commit_seq_ = std::max(commit_seq_, highest_seq);
 
     // Move the recovered slots through reserve->commit in the allocator so its

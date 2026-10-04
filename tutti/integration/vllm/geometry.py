@@ -180,8 +180,8 @@ def apply_capacity_bytes(options: dict, *, segment_bytes: int,
     换算，与 ``apply_device_groups`` 之前调用：当时 ``preset.device_groups``
     仍完整，可算出总盘数）。
 
-    换算依据放置几何：一个 slot 是一个文件，占 ``payload + 对象头`` 字节
-    （对象头 4KiB 由对象层加入；这里按 payload 的整数倍近似，误差 <0.1%），
+    换算依据放置几何：一个 slot 在段文件里占 ``payload + 槽位前缀`` 字节
+    （前缀 32KiB 由对象层加入；这里按 payload 的整数倍近似，误差 <0.5%），
     slot 在 N 块盘间轮转，于是
 
         物理总量 = num_chunks × 每 slot 字节

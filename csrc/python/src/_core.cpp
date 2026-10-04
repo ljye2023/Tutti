@@ -727,7 +727,7 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
     check_unknown_keys(
         d,
         {"device", "gpu_id", "num_queues", "max_batch_entries",
-         "max_in_flight_operations", "threads_per_block",
+         "max_in_flight_operations",
          "handle_cache_capacity", "prp_cache_capacity"},
         "local nvme preset");
     tutti::presets::LocalNvmePreset p;  // C++ 默认：预算字段的单一来源
@@ -736,7 +736,6 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
     opt_int_field(d, "num_queues", p.num_queues);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
     opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
-    opt_int_field(d, "threads_per_block", p.threads_per_block);
     opt_int_field(d, "handle_cache_capacity", p.handle_cache_capacity);
     opt_int_field(d, "prp_cache_capacity", p.prp_cache_capacity);
     return p;
@@ -747,7 +746,7 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
         d,
         {"devices", "gpu_id", "num_queues",
          "max_batch_entries", "max_in_flight_operations",
-         "threads_per_block", "prp_cache_capacity"},
+         "prp_cache_capacity"},
         "striped nvme preset");
     if (!d.contains("devices")) {
         value_error("missing preset key: 'devices'");
@@ -769,7 +768,6 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
     opt_int_field(d, "num_queues", p.num_queues);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
     opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
-    opt_int_field(d, "threads_per_block", p.threads_per_block);
     opt_int_field(d, "prp_cache_capacity", p.prp_cache_capacity);
     return p;
 }
@@ -897,14 +895,16 @@ tutti::StoreConfig store_config_from_py(const py::dict& config) {
     if (config.contains("capacity_slots")) {
         out.capacity_slots = py::cast<std::uint64_t>(config["capacity_slots"]);
     }
-    if (config.contains("prewarm_slots")) {
-        out.prewarm_slots = py::cast<std::uint64_t>(config["prewarm_slots"]);
-    }
-    if (config.contains("warmup_probe_only")) {
-        out.warmup_probe_only = py::cast<bool>(config["warmup_probe_only"]);
-    }
     out.layout.segment_bytes = py::cast<std::uint64_t>(config["segment_bytes"]);
     out.layout.segment_count = py::cast<std::uint32_t>(config["segment_count"]);
+    if (config.contains("segment_file_slots")) {
+        out.segment_file_slots = py::cast<std::uint64_t>(
+            config["segment_file_slots"]);
+    }
+    if (config.contains("segment_header_bytes")) {
+        out.segment_header_bytes = py::cast<std::uint64_t>(
+            config["segment_header_bytes"]);
+    }
     if (config.contains("namespace_fingerprint")) {
         const py::bytes fingerprint =
             py::cast<py::bytes>(config["namespace_fingerprint"]);
@@ -916,9 +916,6 @@ tutti::StoreConfig store_config_from_py(const py::dict& config) {
     }
     for (const py::handle item : py::cast<py::list>(config["devices"])) {
         out.devices.push_back(store_device_from_py(item));
-    }
-    if (config.contains("prewarm_bytes")) {
-        out.prewarm_bytes = py::cast<std::uint64_t>(config["prewarm_bytes"]);
     }
     if (config.contains("background_reclaim")) {
         out.background_reclaim = py::cast<bool>(config["background_reclaim"]);
@@ -963,9 +960,9 @@ public:
 
         tutti::Status status;
         {
-            // open() materialises prewarm_bytes on real media (measured at
-            // roughly 225 MB/s per rank) and may scan object headers. Holding
-            // the GIL across that would stall every other Python thread.
+            // open() builds the first file group on a cold pool (tens of GiB
+            // of zero-fill) and reads object headers. Holding the GIL across
+            // that would stall every other Python thread.
             py::gil_scoped_release release;
             status = store->open(parsed);
         }
@@ -1143,18 +1140,13 @@ public:
         return store().precreate_target();
     }
 
-    void set_precreate_on_write(bool enabled) {
-        store().set_precreate_on_write(enabled);
-    }
-
-    // Called by the grower thread, never by a request thread. The IO runs with
-    // the GIL released and with the store lock dropped between slots, so a
-    // request thread waits for at most one slot's create+fsync.
-    std::uint64_t precreate_step(std::uint64_t max_slots,
-                                  std::uint64_t headroom) {
+    // Called by the grower thread, never by a request thread. Builds at most
+    // one file group with the GIL released and the store lock dropped, so
+    // request threads keep reserving already-published slots meanwhile.
+    std::uint64_t precreate_step(std::uint64_t headroom) {
         auto outcome = [&]() {
             py::gil_scoped_release release;
-            return store().precreate_step(max_slots, headroom);
+            return store().precreate_step(headroom);
         }();
         if (!outcome.ok()) {
             throw_status("object_store.precreate_step", outcome.status());
@@ -1251,11 +1243,9 @@ PYBIND11_MODULE(_core, m) {
         .def("recover", &PyObjectStore::recover)
         .def("checkpoint", &PyObjectStore::checkpoint)
         .def("precreate_step", &PyObjectStore::precreate_step,
-             py::arg("max_slots"), py::arg("headroom"))
+             py::arg("headroom"))
         .def("precreated_slots", &PyObjectStore::precreated_slots)
-        .def("precreate_target", &PyObjectStore::precreate_target)
-        .def("set_precreate_on_write", &PyObjectStore::set_precreate_on_write,
-             py::arg("enabled"));
+        .def("precreate_target", &PyObjectStore::precreate_target);
 
     m.def("make_local_nvme_runtime", &make_local_nvme_runtime,
           py::arg("preset"));

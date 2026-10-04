@@ -591,13 +591,26 @@ class WorkerImpl:
         """
         self._kv_caches = dict(kv_caches)
         self._layer_names = list(kv_caches.keys())
+        self._reserve_io_sms(next(iter(kv_caches.values()), None))
         if self._config_ready():
             self._ensure_bound()
+
+    @staticmethod
+    def _reserve_io_sms(tensor) -> None:
+        """Opt-in green-context SM split (TUTTI_GREEN_CTX_IO_SMS); see
+        green_context.py. Runs on the forward thread before the first model
+        kernel so vLLM's current stream becomes the confined one."""
+        from tutti.integration.vllm.green_context import enabled, reserve_io_sms
+
+        if not enabled() or tensor is None or not getattr(tensor, "is_cuda", False):
+            return
+        reserve_io_sms(tensor.device.index)
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend) -> None:
         """登记 uniform cross-layer KV pool 及其 attention backend。"""
         self._cross_pool = kv_cache
         self._cross_attn_backend = attn_backend
+        self._reserve_io_sms(kv_cache)
         if self._config_ready():
             self._ensure_bound()
 
