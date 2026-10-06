@@ -210,6 +210,9 @@ class TuttiDirectBackend:
         self._warm_uris: list[str] = []
         self._invalid_plan_tokens: set[int] = set()
         self._next_plan_token = 0
+        # 异步加载的读计划不占"read"方向槽位（那是本步同步读的），按 token
+        # 单独登记：同一 rank 上它可以跨多步与同步读计划并存，失效通知同样覆盖。
+        self._detached_plans: dict[int, DirectTargetPlan] = {}
         # Target-cache invalidation is the generation-change signal used by
         # layer submit. It avoids filesystem/object-pool queries on that path.
         self._store._direct_backend = self
@@ -482,8 +485,9 @@ class TuttiDirectBackend:
                 f"bound {required_batch}"
             )
 
-    def get_paged_batch(self, keys, layer_idx: int, block_tables):
-        return self._submit(keys, layer_idx, block_tables, "read")
+    def get_paged_batch(self, keys, layer_idx: int, block_tables, target_plan=None):
+        return self._submit(keys, layer_idx, block_tables, "read",
+                            target_plan=target_plan)
 
     def put_paged_batch(self, keys, layer_idx: int, block_tables):
         return self._submit(keys, layer_idx, block_tables, "write")
@@ -591,6 +595,11 @@ class TuttiDirectBackend:
             # Unadmitted chunks (capacity exhausted) are not written this step:
             # the write plan simply does not contain them.
             chunk_ids = self._prepared_write_chunks
+        plan = self._build_target_plan(chunk_ids, direction)
+        self._target_plans[direction] = plan
+        return plan
+
+    def _build_target_plan(self, chunk_ids, direction: str) -> DirectTargetPlan:
         entries = [(chunk_id + (0).to_bytes(2, "little"), 0, 0)
                    for chunk_id in chunk_ids]
         with nvtx_range(
@@ -618,13 +627,38 @@ class TuttiDirectBackend:
             plan_token=self._next_plan_token,
             entries=tuple(plan_entries),
         )
-        self._target_plans[direction] = plan
         # 正常路径的时间线诊断：debug（每个方向每次构建一条）。
         _LOG.debug(
             "DIRECT_TARGET_PLAN_BUILD direction=%s chunks=%d token=%d",
             direction, len(plan.entries), plan.plan_token,
         )
         return plan
+
+    def begin_detached_read_plan(self, keys) -> DirectTargetPlan:
+        """为异步加载构建读计划：不占"read"槽位，可与本步同步读并存。
+
+        调用方逐层提交时把它作为 ``target_plan`` 传回 get_paged_batch，并在
+        全部层完成后调 end_detached_read_plan。目标失效（槽位回收再分配）
+        同样会作废它，提交时 fail-closed。
+        """
+        if self._memory_ticket is None:
+            raise RuntimeError("direct target plan requires registered memory")
+        if not self.supports_async_read:
+            raise RuntimeError(
+                "async read needs a dedicated read stream (runtime advertises "
+                "fewer than 3 concurrent streams)"
+            )
+        plan = self._build_target_plan(self._chunk_ids(keys), "read")
+        self._detached_plans[plan.plan_token] = plan
+        return plan
+
+    @property
+    def supports_async_read(self) -> bool:
+        return self._store._read_async_stream is not None
+
+    def end_detached_read_plan(self, plan: DirectTargetPlan) -> None:
+        if self._detached_plans.pop(plan.plan_token, None) is not None:
+            self._invalid_plan_tokens.discard(plan.plan_token)
 
     def end_target_plan(self, direction: str) -> None:
         plan = self._target_plans.pop(direction, None)
@@ -650,7 +684,7 @@ class TuttiDirectBackend:
         invalid = set(uris)
         if not invalid:
             return
-        for plan in self._target_plans.values():
+        for plan in (*self._target_plans.values(), *self._detached_plans.values()):
             if any(entry.target_uri in invalid for entry in plan.entries):
                 self._invalid_plan_tokens.add(plan.plan_token)
 
@@ -736,7 +770,8 @@ class TuttiDirectBackend:
             )
         return validated_tables
 
-    def _submit(self, keys, layer_idx: int, block_tables, direction: str):
+    def _submit(self, keys, layer_idx: int, block_tables, direction: str,
+                target_plan: DirectTargetPlan | None = None):
         store = self._store
         geometry = self.geometry
         started_ns = time.perf_counter_ns()
@@ -757,7 +792,7 @@ class TuttiDirectBackend:
         if direction == "read" and any(io_key not in store._live for io_key in io_keys):
             missing = next(io_key for io_key in io_keys if io_key not in store._live)
             raise ValueError(f"direct get has non-resident key: {missing!r}")
-        plan = self._target_plans.get(direction)
+        plan = target_plan if target_plan is not None else self._target_plans.get(direction)
         if plan is None:
             if direction == "write":
                 self.prepare_write_targets(keys)
@@ -791,11 +826,20 @@ class TuttiDirectBackend:
                         direction,
                     ))
         submit_started_ns = time.perf_counter_ns()
+        stream_direction = (
+            "read_async"
+            if plan.plan_token in self._detached_plans else direction
+        )
         with nvtx_range(
-            f"tutti.direct.runtime_submit|op={direction}|layer={layer_idx}"
+            f"tutti.direct.runtime_submit|op={stream_direction}|layer={layer_idx}"
             f"|chunks={len(keys)}|requests={len(requests)}"
         ):
-            handles = store._submit_retry(requests, direction)
+            if stream_direction == direction:
+                handles = store._submit_retry(requests, direction)
+            else:
+                handles = store._submit_retry(
+                    requests, direction, stream_direction=stream_direction
+                )
         # 逐层计时：debug 级。原先用 info 会在每层每方向打一行——实测高负载下
         # 占日志总行数 97%（4.26M/4.37M 行、867 MB），既淹没真问题（排查 OOM
         # 时被冲掉），又让格式化本身成为可观开销。要看时开
@@ -903,6 +947,27 @@ class _TuttiCompletion:
         if auto_watch:
             self._start_watcher()
 
+    def poll(self) -> bool | None:
+        """非阻塞推进：None = 未完成；True/False = 已结算（成功/失败）。
+
+        直连完成句柄不自建 watcher（auto_watch=False），平时由引擎在步末
+        同步 drain。异步加载要跨步观察完成，又不能阻塞前向线程，所以这里
+        只做一次零超时的 runtime 观察；已完成则结算并释放句柄。
+        """
+        if self._settled:
+            return not self._failed
+        if not self._ready.is_set():
+            if not self._drain_lock.acquire(blocking=False):
+                return None
+            try:
+                if self._terminal is None:
+                    self._probe_runtime()
+            finally:
+                self._drain_lock.release()
+        if not self._ready.is_set():
+            return None
+        return self._finish()
+
     def query(self) -> bool:
         if self._settled:
             return not self._failed
@@ -1007,10 +1072,17 @@ class _TuttiCompletion:
             self._terminal_results.setdefault(result.handle, result)
 
     def _probe_runtime(self) -> None:
-        """做一次非阻塞观察，避免 query 对 watcher 启动存在竞态。"""
+        """做一次非阻塞观察，避免 query 对 watcher 启动存在竞态。
+
+        ``wait_result(h, 0)`` 只报告已记录的状态、不推进完成；没人阻塞等待的
+        IO（异步加载）必须先 ``query_io`` 推进一次，否则永远停在 IN_FLIGHT。
+        """
+        query_io = getattr(self._runtime, "query_io", None)
         try:
             observed = []
             for submitted in self._submitted:
+                if callable(query_io) and query_io(submitted.handle) == "IN_FLIGHT":
+                    return
                 result = self._observe(submitted, 0)
                 if (result.observation == "TIMEOUT" or
                         result.state not in ("COMPLETED", "FAILED")):
@@ -1249,6 +1321,11 @@ class TuttiKVStore:
         self._read_stream_obj = None
         self._write_stream_obj = None
         self._read_copy_stream_obj = None
+        # 异步加载（跨步读）专用流：submit kernel 在流上一直跑到 IO 完成，
+        # 与同步读共用读流会让本步的同步读排在它后面、丢掉逐层重叠。
+        # 仅 dual 模式且 runtime 广告 ≥3 条并发流时才有（见 _resolve_auto_stream）。
+        self._read_async_stream = None
+        self._read_async_stream_obj = None
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._execution = "device"
@@ -1385,6 +1462,15 @@ class TuttiKVStore:
         except (TypeError, ValueError):
             return False
 
+    def _runtime_max_streams(self) -> int:
+        try:
+            caps = self._runtime.caps()
+            if not caps.get("supports_multi_stream", False):
+                return 0
+            return int(caps.get("max_concurrent_streams", 0))
+        except Exception:
+            return 0
+
     def _runtime_accel(self) -> int:
         """Resolve one accelerator shared by runtime, read, and write streams."""
         preset_accel = None
@@ -1482,6 +1568,10 @@ class TuttiKVStore:
         self._read_stream = int(read_obj.cuda_stream)
         self._write_stream = int(write_obj.cuda_stream)
         self._read_copy_stream = int(read_copy_obj.cuda_stream)
+        if self._runtime_max_streams() >= 3:
+            async_obj = torch.cuda.Stream(device=f"cuda:{accel}")
+            self._read_async_stream_obj = async_obj
+            self._read_async_stream = int(async_obj.cuda_stream)
         self._io_stream = None
         self._stream_mode = "dual"
 
@@ -1533,6 +1623,8 @@ class TuttiKVStore:
         self._read_stream_obj = None
         self._write_stream_obj = None
         self._read_copy_stream_obj = None
+        self._read_async_stream = None
+        self._read_async_stream_obj = None
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._io_stream = None
@@ -1627,6 +1719,8 @@ class TuttiKVStore:
             return self._read_stream, self._read_stream_obj
         if direction == "read_copy":
             return self._read_copy_stream, self._read_copy_stream_obj
+        if direction == "read_async":
+            return self._read_async_stream, self._read_async_stream_obj
         if direction == "write":
             return self._write_stream, self._write_stream_obj
         raise ValueError(f"未知 IO 方向：{direction!r}")
@@ -1701,6 +1795,10 @@ class TuttiKVStore:
     def record_read_event(self, event=None):
         """Record and return a fence on the store-owned read stream."""
         return self._record_event("read", event)
+
+    def record_read_async_event(self, event=None):
+        """Record and return a fence on the async-load read stream."""
+        return self._record_event("read_async", event)
 
     def record_read_copy_event(self, event=None):
         """Record and return a fence after scatter on the read-copy stream."""
@@ -2196,7 +2294,8 @@ class TuttiKVStore:
             self._direct_failed_chunks.update(chunks)
             raise
 
-    def _submit_retry(self, requests, direction: str):
+    def _submit_retry(self, requests, direction: str,
+                      stream_direction: str | None = None):
         """提交整批；超宽先按上限切段，partial-commit 的被拒请求窗口重发。
 
         宽度处理分两层：
@@ -2233,7 +2332,7 @@ class TuttiKVStore:
                 result = self._runtime.submit(
                     [request for _, request in pending],
                     accel_id=self._accel_id,
-                    stream=self._stream_for(direction)[0],
+                    stream=self._stream_for(stream_direction or direction)[0],
                     execution=self._execution,
                 )
                 rejected = list(result.rejected or [])

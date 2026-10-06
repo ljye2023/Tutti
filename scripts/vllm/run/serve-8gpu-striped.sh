@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Tutti 在线服务：Hy3-FP8 × TP8 × 2 盘条带，与 8 卡离线基准同构。
+# Tutti 在线服务：Hy3-FP8 × TP8 × 4 盘段文件，与 8 卡离线基准同构。
 #
 # 与 vllm_smoke_server.sh 的区别：那份是 TP4 + 单盘 + 旧模块路径（adapter.connector，
 # 已随包重构失效），这份对齐 scripts/vllm/run/bench-8gpu-striped.sh 的几何与
@@ -21,24 +21,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 PORT="${PORT:-8192}"
-# 工具调用（tool choice=auto 必需）：hy_v3 是 vLLM 为 HYV3ForCausalLM 内置的
-# 解析器；换模型时按 vllm 的 --tool-call-parser 列表改（hermes/qwen3_coder…）。
-# 这两个参数不影响 Tutti 的 key 命名空间，旧池数据继续可复用。
-TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hy_v3}"
+# 工具调用（tool choice=auto 必需）。默认 hermes，与平台此前的 Mooncake 基线
+# 一致：本服务只测 KV，不解析 Hy3 的工具调用。hermes 不认识 Hy3 的
+# <tool_calls:opensource>，会把它当正文透传；hy_v3（Hy3 专用）会缓存它等参数，
+# 在平台 max_tokens=1 的测法下正文为空、被判"答案为空"。需要结构化 tool_calls
+# 时改用 TOOL_CALL_PARSER=hy_v3。不影响 Tutti 的 key 命名空间，旧池数据可复用。
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
 # 对外服务名：流量平台按服务组名 base_model_zh7 路由请求，必须挂成 vLLM
 # 别名，否则 404 "model does not exist"。tutti 保留给本地脚本（driver 默认
 # --model tutti）。vLLM 的 --served-model-name 接受空格分隔的多名字。
 SERVED_NAME="${SERVED_NAME:-tutti base_model_zh7}"
 TP_SIZE="${TP_SIZE:-8}"
-CHUNK_TOKENS="${CHUNK_TOKENS:-256}"
+# KV 精度。默认 fp8：Hy3-FP8 checkpoint 自带 KV scale（kv_cache_scheme: static），
+# 每 token 字节减半 → HBM KV 容量约 2.4M token（bf16 时 1.23M），盘读量也减半。
+# 设 auto 回到 bf16。KV 命名空间含 dtype，切换后旧池数据不会被误读（但也不能复用）。
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+CHUNK_TOKENS="${CHUNK_TOKENS:-512}"
 # vLLM 的 KV block 大小（token 数）。决定 Tutti 侧的两条几何：
-#   page_bytes       = BLOCK_SIZE × 512 B   （单条 IO 的大小）
+#   page_bytes       = BLOCK_SIZE × 每 token 字节（TP8：bf16 512 B / fp8 256 B，单条 IO 的大小）
 #   blocks_per_chunk = CHUNK_TOKENS / BLOCK_SIZE（必须整除）
-# 取 128：单条 IO 64 KiB，一个 chunk = 2 条 IO。
+# 取 512：bf16 单条 IO 256 KiB、fp8 128 KiB，一个 chunk = 1 条 IO。
 # 改这个值必须同步改 NUM_GPU_BLOCKS_OVERRIDE —— 后者的单位是 block 而非
 # token，block 定义翻倍而该值不变会让 HBM KV 池占用翻倍（反之则缩水）。
-BLOCK_SIZE="${BLOCK_SIZE:-128}"
+BLOCK_SIZE="${BLOCK_SIZE:-512}"
 # 在线驱动只发不超过该长度的 prompt（脚本默认 --max-prompt-tokens 与之一致）。
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-262144}"
 SAMPLES="${SAMPLES:-4}"
@@ -48,15 +54,14 @@ POOL_TAG="${POOL_TAG:-online1}"
 MODEL_MAX_LEN="${MODEL_MAX_LEN:-262144}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$(( MAX_PROMPT_TOKENS + 16 < MODEL_MAX_LEN ? MAX_PROMPT_TOKENS + 16 : MODEL_MAX_LEN ))}"
 
-# HBM KV 池上限（单位：block）。默认**不传**：用 vLLM 自然池（本机 ~10077
-# blocks = 1.29M tokens，TP8/bf16 下每 token 40 KiB，见 README 的几何推导）。
-# 自然池可容纳 ~4.9 条 256K 或 ~9.8 条 128K 请求并发——生产服务用它。
+# HBM KV 池上限（单位：block）。默认**不传**：用 vLLM 自然池。
+# FP8 的可用 token 总量约 2.46M；512-token block 的块数由 vLLM 实测决定。
 #
 # 只有"隔离 Tutti 路径做实验"时才需要压小它：本机 vLLM 未注册
 # /reset_prefix_cache 端点，无法清 HBM 前缀缓存，把池压到装不下工作集才能
 # 逼 HBM 淘汰、让复用落到 Tutti（离线测试的做法：1040 blocks = 1.01 并发
 # 128K）。⚠️ 压小 = 并发被锁死（请求排队），线上服务不要压。
-# 取值约束：≥ ceil(MAX_PROMPT_TOKENS / BLOCK_SIZE)（2048 for 256K），否则
+# 取值约束：≥ ceil(MAX_PROMPT_TOKENS / BLOCK_SIZE)（512 for 256K/512），否则
 # 调度器无法容纳一个请求。
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 
@@ -72,12 +77,12 @@ CAPACITY_BYTES=$(( TOTAL_CAPACITY_BYTES / TP_SIZE ))
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 WORKING_SET=$(( SAMPLES * CHUNKS_PER_REQ ))
 
-echo "[serve] model=$MODEL tp=$TP_SIZE port=$PORT max_model_len=$MAX_MODEL_LEN (prompt≤$MAX_PROMPT_TOKENS)"
+echo "[serve] model=$MODEL tp=$TP_SIZE port=$PORT max_model_len=$MAX_MODEL_LEN (prompt≤$MAX_PROMPT_TOKENS) kv_cache_dtype=$KV_CACHE_DTYPE"
 if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
     echo "[serve] HBM KV 池: ${NUM_GPU_BLOCKS_OVERRIDE} blocks（覆盖值）" \
          "(${NUM_GPU_BLOCKS_OVERRIDE} × ${BLOCK_SIZE} = $(( NUM_GPU_BLOCKS_OVERRIDE * BLOCK_SIZE )) tokens)"
 else
-    echo "[serve] HBM KV 池: vLLM 自然池（未覆盖；约 10077 blocks ≈ 1.29M tokens）"
+    echo "[serve] HBM KV 池: vLLM 自然池（未覆盖；实际容量见 vLLM 启动日志）"
 fi
 echo "[serve] chunks_per_req=$CHUNKS_PER_REQ working_set=$WORKING_SET"
 echo "[serve] IO 几何: block_size=$BLOCK_SIZE tokens/block" \
@@ -149,6 +154,7 @@ exec "$PYTHON" -m vllm.entrypoints.openai.api_server \
     --served-model-name $SERVED_NAME \
     --tensor-parallel-size "$TP_SIZE" \
     --block-size "$BLOCK_SIZE" \
+    --kv-cache-dtype "$KV_CACHE_DTYPE" \
     --enforce-eager \
     --max-model-len "$MAX_MODEL_LEN" \
     --load-format "$LOAD_FORMAT" \

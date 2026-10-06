@@ -3321,7 +3321,7 @@ int main(int argc, char** argv) {
 
         // Multi-stream: enabled after S5 dual-stream data-isolation validation.
         CHECK(c.supports_multi_stream == true, "multi-stream true (S5 verified)");
-        CHECK(c.max_concurrent_streams == 2, "max_concurrent_streams == 2 (verified)");
+        CHECK(c.max_concurrent_streams == 3, "max_concurrent_streams == 3 (per-op isolation)");
 
         // Completion semantics.
         CHECK(c.device_completion_fence_on_caller_stream == true, "fence on caller stream");

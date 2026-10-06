@@ -182,6 +182,178 @@ def _bind_thread_cuda_device(store) -> None:
                    exc_info=True)
 
 
+class _AsyncReadPlan:
+    """异步加载的全层读计划：在读流上跑，**不进入任何步的同步点**。
+
+    与同步读计划（``_DirectAllLayerReadPlan``）的区别：
+
+    * 不是引擎的 ``_active_read_plan``、完成句柄不进 ``_inflight`` —— 步末
+      ``wait_idle`` 不 join 它的 feeder、也不 drain 它，前向线程永不等它；
+    * 用独立的 detached 目标计划，不占本步同步读的"read"槽位；
+    * 计算流不等它的 fence：请求要等全部 rank 报完成后才会被调度。
+
+    完成只由 ``poll()`` 非阻塞地观察（worker 每步一次）。失败时仍要等已提交
+    的 IO 全部结算才算结束——DMA 可能还在写这些块，提前报完成会让 vLLM 把
+    块交给别的请求。
+    """
+
+    def __init__(self, engine, keys, block_tables, physical_layers):
+        self.engine = engine
+        self.keys = list(keys)
+        self.block_tables = [list(table) for table in block_tables]
+        self.physical_layers = tuple(physical_layers)
+        if not self.keys or not self.physical_layers:
+            raise ValueError("async read plan requires keys and layers")
+        backend = getattr(engine._transfer, "_backend", None)
+        self._backend = backend
+        self._target_plan = backend.begin_detached_read_plan(self.keys)
+        self._lock = threading.Lock()
+        self._completions: list = []
+        self._polled = 0
+        self.failure: BaseException | None = None
+        self._ended = False
+        self._stop = threading.Event()
+        self._feeder_done = threading.Event()
+        self.started_ns = time.perf_counter_ns()
+        self.finished_ns: int | None = None
+        store = engine._store
+        self._origin = self._timing_event()
+        self._last = None
+        if self._origin is not None:
+            store.record_read_async_event(self._origin)
+        self._feeder = threading.Thread(
+            target=self._run, name="tutti-async-read-feeder", daemon=True
+        )
+        self._feeder.start()
+
+    @staticmethod
+    def _timing_event():
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return torch.cuda.Event(enable_timing=True)
+        except Exception:
+            pass
+        return None
+
+    def _run(self) -> None:
+        engine = self.engine
+        _bind_thread_cuda_device(engine._store)
+        try:
+            for physical in self.physical_layers:
+                if self._stop.is_set():
+                    break
+                with engine._direct_submit_lock:
+                    completion = engine._transfer.load_layer(
+                        self.keys, physical, self.block_tables,
+                        target_plan=self._target_plan,
+                    )
+                with self._lock:
+                    self._completions.append(completion)
+            last = self._timing_event()
+            if last is not None:
+                engine._store.record_read_async_event(last)
+                self._last = last
+        except Exception as exc:  # 提交失败：已提交的照常结算后再报失败
+            if self.failure is None:
+                self.failure = exc
+            _LOG.error("ASYNC_READ_SUBMIT_FAILED chunks=%d: %s", len(self.keys), exc)
+        finally:
+            self._feeder_done.set()
+
+    def poll(self) -> bool | None:
+        """None = 未完成；True = 全部层成功；False = 失败（已提交 IO 均已结算）。"""
+        if self._ended:
+            return self.failure is None
+        while True:
+            with self._lock:
+                if self._polled >= len(self._completions):
+                    break
+                completion = self._completions[self._polled]
+            try:
+                state = completion.poll()
+            except Exception as exc:
+                state = False
+                if self.failure is None:
+                    self.failure = exc
+            if state is None:
+                return None
+            if state is False and self.failure is None:
+                self.failure = RuntimeError("async direct read failed")
+                self._stop.set()
+            self._polled += 1
+        if not self._feeder_done.is_set():
+            return None
+        with self._lock:
+            if self._polled < len(self._completions):
+                return None
+        self._end()
+        return self.failure is None
+
+    def read_ms(self) -> float | None:
+        """读流上从计划起点到末层完成的 GPU 时长（不可得时 None）。"""
+        origin, last = self._origin, self._last
+        if origin is None or last is None:
+            return None
+        try:
+            if not last.query():
+                return None
+            return float(origin.elapsed_time(last))
+        except Exception:
+            return None
+
+    def abort(self) -> None:
+        """停止提交并阻塞等待已提交 IO 结算（只用于关闭/中止）。"""
+        self._stop.set()
+        self._feeder.join()
+        with self._lock:
+            pending = self._completions[self._polled:]
+        for completion in pending:
+            try:
+                completion.wait()
+            except Exception as exc:
+                if self.failure is None:
+                    self.failure = exc
+        self._polled = len(self._completions)
+        self._end()
+
+    def _end(self) -> None:
+        if self._ended:
+            return
+        self._ended = True
+        self.finished_ns = time.perf_counter_ns()
+        end = getattr(self._backend, "end_detached_read_plan", None)
+        if callable(end):
+            end(self._target_plan)
+        plans = getattr(self.engine, "_async_read_plans", None)
+        if plans is not None:
+            plans.discard(self)
+
+
+class _CompletedReadPlan:
+    """非直连引擎（staged 测试路径）的异步读：构造时同步读完，poll 即完成。"""
+
+    def __init__(self, engine, keys, block_tables, physical_layers):
+        self.failure = None
+        self.started_ns = time.perf_counter_ns()
+        try:
+            for physical in physical_layers:
+                engine.load_layer(keys, physical, block_tables).wait()
+        except Exception as exc:
+            self.failure = exc
+        self.finished_ns = time.perf_counter_ns()
+
+    def poll(self) -> bool:
+        return self.failure is None
+
+    def read_ms(self) -> float | None:
+        return None
+
+    def abort(self) -> None:
+        return None
+
+
 class _DirectAllLayerReadPlan:
     """Direct-only all-layer read plan.
 
@@ -982,6 +1154,9 @@ class KVEngine:
         self._write_reuse_event = None
         self._direct_submit_lock = threading.RLock()
         self._active_read_plan = None
+        # 在途的异步读计划（不在 _inflight 里，见 _AsyncReadPlan）；关闭/中止
+        # 时逐个 drain。
+        self._async_read_plans: set = set()
 
     @property
     def max_in_flight_operations(self) -> int:
@@ -1523,6 +1698,31 @@ class KVEngine:
             self, keys, block_tables, physical_layers, depth, on_failure
         )
 
+    def start_async_read_plan(self, keys, block_tables, physical_layers):
+        """发起异步加载的全层读计划（见 _AsyncReadPlan），返回可 poll 的句柄。
+
+        非直连引擎没有可跨步观察的读流，直接同步读完（只在测试替身上出现）。
+        """
+        self._require_open()
+        if self.direct and callable(getattr(
+                getattr(self._transfer, "_backend", None),
+                "begin_detached_read_plan", None)):
+            plan = _AsyncReadPlan(self, keys, block_tables, physical_layers)
+            self._async_read_plans.add(plan)
+            return plan
+        return _CompletedReadPlan(self, keys, block_tables, physical_layers)
+
+    def _abort_async_read_plans(self) -> BaseException | None:
+        first_error = None
+        for plan in list(self._async_read_plans):
+            try:
+                plan.abort()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        self._async_read_plans.clear()
+        return first_error
+
     def checkpoint_if_due(self) -> bool:
         """周期落盘提交索引（转发 store，节流在 store 侧）。
 
@@ -1787,7 +1987,11 @@ class KVEngine:
             raise first_error
 
     def abort(self, timeout=None) -> None:
-        """安全中间态 abort：不取消底层 DMA，drain 两边后再返回。"""
+        """安全中间态 abort：不取消底层 DMA，drain 两边后再返回。
+
+        异步读计划不在这里 drain：它们不属于任何一步，worker 的 abort 只回滚
+        本步；整体关闭（close）时才逐个等待（见 _abort_async_read_plans）。
+        """
         active_plan = getattr(self, "_active_read_plan", None)
         if active_plan is not None:
             active_plan.abort()
@@ -1840,11 +2044,12 @@ class KVEngine:
         """收尾：等待在途批次并关闭 store；幂等。"""
         if self._closed:
             return
-        first_error = None
+        first_error = self._abort_async_read_plans()
         try:
             self.wait_idle()
         except Exception as exc:
-            first_error = exc
+            if first_error is None:
+                first_error = exc
         self._active_read_plan = None
         if isinstance(self._transfer, DirectTransfer):
             try:

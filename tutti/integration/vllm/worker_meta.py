@@ -51,6 +51,10 @@ class TuttiWorkerMetadata(KVConnectorWorkerMetadata):
     failed: set[bytes] = field(default_factory=set)
     forgotten: set[bytes] = field(default_factory=set)
     evicted: set[bytes] = field(default_factory=set)
+    #: 读耗时样本 (chunks, ms)，供调度侧拟合 read_ms(chunks)（load_policy）。
+    read_samples: list[tuple[int, float]] = field(default_factory=list)
+    #: 无同步读的步的 GPU 计算耗时样本 (tokens, ms)，供拟合 compute_ms(tokens)。
+    step_samples: list[tuple[int, float]] = field(default_factory=list)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -65,4 +69,6 @@ class TuttiWorkerMetadata(KVConnectorWorkerMetadata):
             failed=self.failed | other.failed,
             forgotten=self.forgotten | other.forgotten,
             evicted=self.evicted | other.evicted,
+            read_samples=list(self.read_samples) + list(other.read_samples),
+            step_samples=list(self.step_samples) + list(other.step_samples),
         )

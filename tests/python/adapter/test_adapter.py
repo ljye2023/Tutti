@@ -740,6 +740,116 @@ class TestLoadSemantics:
         assert impl._load_keys == keys[2:3]
         assert impl._load_block_tables == [[12]]
 
+    def test_mixed_prefix_load_start_uses_local_hit_boundary(self):
+        """本地命中 N + 外部命中时，加载区间起点必须是 N。
+
+        vLLM 的真实调用序：request.num_computed_tokens 在
+        update_state_after_alloc **之后**才被赋值（scheduler.py：
+        update_state_after_alloc 在前，``request.num_computed_tokens =
+        num_computed_tokens`` 在后），调用时它仍是 0。起点只能取
+        get_num_new_matched_tokens 收到的本地命中边界，否则会把
+        [0, new) 重写一遍、[N, N+new) 却从未加载（注意力读到未初始化的块）。
+        """
+        h = _make_harness()
+        prompt = list(range(4 * CHUNK_TOKENS))
+        blocks = list(range(4 * CHUNK_TOKENS // BLOCK_SIZE))
+        keys = self._prefill_save(h, prompt, blocks)
+
+        req2 = _fake_request("r2", prompt, num_computed_tokens=0)
+        matched, _ = h.scheduler.get_num_new_matched_tokens(req2, 2 * CHUNK_TOKENS)
+        assert matched == CHUNK_TOKENS
+        h.scheduler.update_state_after_alloc(req2, object(), matched)
+        meta2 = h.scheduler.build_connector_meta(_sched_output(new_reqs=[
+            SimpleNamespace(req_id="r2", prompt_token_ids=prompt,
+                            block_ids=list(range(10, 14)))
+        ]))
+        m = meta2.requests[0]
+        assert m.load_start_token == 2 * CHUNK_TOKENS
+        assert m.load_tokens == CHUNK_TOKENS
+
+        h.worker.bind_connector_metadata(meta2)
+        h.worker.start_load_kv(None)
+        impl = h.worker._impl
+        assert impl._load_keys == keys[2:3]
+        assert impl._load_block_tables == [[12]]
+
+    def test_async_load_reads_outside_the_step_and_reports_finished(self, monkeypatch):
+        """异步加载：调度侧返回 True、下发 load_async；worker 本步不走同步读，
+        读完经 get_finished 回报，读回的数据与写入一致。"""
+        monkeypatch.setenv("TUTTI_LOAD_MODE", "async")
+        h = _make_harness()
+        prompt = list(range(4 * CHUNK_TOKENS))
+        blocks = list(range(4 * CHUNK_TOKENS // BLOCK_SIZE))
+        keys = self._prefill_save(h, prompt, blocks)
+
+        req2 = _fake_request("r2", prompt, num_computed_tokens=0)
+        matched, is_async = h.scheduler.get_num_new_matched_tokens(req2, 0)
+        assert matched == 3 * CHUNK_TOKENS and is_async is True
+        block_holder = SimpleNamespace(get_block_ids=lambda: ([10, 11],))
+        h.scheduler.update_state_after_alloc(req2, block_holder, matched)
+        # 异步请求本步不被调度：scheduled_new_reqs 里没有它。
+        meta = h.scheduler.build_connector_meta(_sched_output())
+        assert len(meta.requests) == 1
+        m = meta.requests[0]
+        assert m.load_async and m.load_start_token == 0
+        assert m.load_tokens == 3 * CHUNK_TOKENS
+
+        h.worker.bind_connector_metadata(meta)
+        h.worker.start_load_kv(None)
+        impl = h.worker._impl
+        assert impl._load_keys == []          # 不进本步同步读
+        assert impl._external_load_step is False
+        _, recving = h.worker.get_finished(set())
+        assert recving == {"r2"}
+        assert h.worker.get_block_ids_with_load_errors() == set()
+        for i, key in enumerate(keys[:3]):
+            for layer in range(NUM_LAYERS):
+                assert h.hooks.sink[(key, layer)] == _segment(i, layer)
+        # 全部 rank 回报后，调度侧不再视其为在途。
+        h.scheduler.update_connector_output(
+            SimpleNamespace(finished_recving={"r2"}, kv_connector_worker_meta=None)
+        )
+        assert not h.scheduler._async_outstanding
+
+    def test_auto_load_mode_needs_running_batch_and_free_blocks(self, monkeypatch):
+        """auto：只有它一个→同步；有别的请求在算且显存够→异步；池紧→同步。"""
+        monkeypatch.delenv("TUTTI_LOAD_MODE", raising=False)
+        h = _make_harness()
+        prompt = list(range(4 * CHUNK_TOKENS))
+        self._prefill_save(h, prompt, list(range(4 * CHUNK_TOKENS // BLOCK_SIZE)))
+        s = h.scheduler
+        s._policy.observe_read(1, 10_000.0)     # 读很慢
+        s._policy.observe_step(4096, 40.96)     # 算很快
+        s._total_blocks = 10_000
+        s._live_requests.clear()
+        req = _fake_request("r2", prompt)
+        assert s.get_num_new_matched_tokens(req, 0) == (3 * CHUNK_TOKENS, False)
+        s._live_requests["r9"] = _fake_request(
+            "r9", [1] * CHUNK_TOKENS, num_computed_tokens=CHUNK_TOKENS)
+        assert s.get_num_new_matched_tokens(req, 0) == (3 * CHUNK_TOKENS, True)
+        # 本请求要 3 chunk 的块，空闲只剩约 4 块：0.5 × 4 放不下。
+        s._total_blocks = 4 + CHUNK_TOKENS // BLOCK_SIZE
+        assert s.get_num_new_matched_tokens(req, 0) == (3 * CHUNK_TOKENS, False)
+
+    def test_async_load_missing_keys_reports_error_blocks(self, monkeypatch):
+        """异步加载的 chunk 已被驱逐：块报为 load error，请求照常回报完成。"""
+        monkeypatch.setenv("TUTTI_LOAD_MODE", "async")
+        h = _make_harness()
+        prompt = list(range(2 * CHUNK_TOKENS))
+        keys = self._prefill_save(h, prompt, [0])
+        req2 = _fake_request("r2", prompt, num_computed_tokens=0)
+        matched, is_async = h.scheduler.get_num_new_matched_tokens(req2, 0)
+        assert is_async
+        h.scheduler.update_state_after_alloc(
+            req2, SimpleNamespace(get_block_ids=lambda: ([7],)), matched)
+        meta = h.scheduler.build_connector_meta(_sched_output())
+        h.engine._index.forget(keys)
+        h.worker.bind_connector_metadata(meta)
+        h.worker.start_load_kv(None)
+        _, recving = h.worker.get_finished(set())
+        assert recving == {"r2"}
+        assert h.worker.get_block_ids_with_load_errors() == {7}
+
     def test_resumed_request_replaces_block_table(self):
         """M2：preemption→resume 的 new_block_ids 为替换语义。"""
         h = _make_harness()

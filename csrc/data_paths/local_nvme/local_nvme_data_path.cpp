@@ -189,8 +189,10 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     // Multi-stream: enabled after S5 dual-stream data-isolation validation
     // (test 50) proved two concurrent ops on two streams keep per-op
     // entry/PRP workspaces distinct and read back correct distinct patterns.
+    // Isolation is per operation, so the stream count is bounded only by the
+    // in-flight quota; three covers sync read + write + async read streams.
     caps_.supports_multi_stream = true;
-    caps_.max_concurrent_streams = 2;
+    caps_.max_concurrent_streams = 3;
     caps_.max_concurrent_operations = max_in_flight_operations_;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;

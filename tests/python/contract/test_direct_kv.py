@@ -189,6 +189,7 @@ class FakeStoreOwner:
         self._runtime = runtime
         self._read_stream = 11
         self._write_stream = 22
+        self._read_async_stream = None
         self._accel_id = 0
         self._execution = "device"
         self._layout = FakeLayout(runtime.events)
@@ -206,7 +207,8 @@ class FakeStoreOwner:
         return TuttiDirectBackend(self)
 
     def _stream_for(self, direction):
-        return {"read": 11, "write": 22}[direction], None
+        return {"read": 11, "write": 22,
+                "read_async": self._read_async_stream}[direction], None
 
     def _ensure_targets(self, entries):
         self.ensure_targets_calls += 1
@@ -223,8 +225,10 @@ class FakeStoreOwner:
                 )
         return {uri: self._targets[uri].ticket for uri in uris}
 
-    def _submit_retry(self, requests, direction):
-        return TuttiKVStore._submit_retry(self, requests, direction)
+    def _submit_retry(self, requests, direction, stream_direction=None):
+        return TuttiKVStore._submit_retry(
+            self, requests, direction, stream_direction=stream_direction
+        )
 
     def _batch_width_limit(self):
         return TuttiKVStore._batch_width_limit(self)
@@ -421,6 +425,34 @@ def test_direct_target_plan_is_built_once_per_direction():
     backend.put_paged_batch(keys, 1, [[3, 1], [7, 0]])
     assert store.ensure_targets_calls == 2
     assert backend._target_plans["write"].plan_token == 2
+    backend.close()
+
+
+def test_detached_read_plan_submits_on_async_stream():
+    """异步加载的读走独立流：submit kernel 在流上跑到 IO 完成，共用读流会让
+    同一 rank 本步的同步读排在它后面。与同步读计划并存、互不占槽位。"""
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    keys = [b"a" * 16, b"b" * 16]
+    store._live.update(
+        derive_io_key(key, layer) for key in keys for layer in range(3)
+    )
+    with pytest.raises(RuntimeError, match="dedicated read stream"):
+        backend.begin_detached_read_plan(keys[:1])
+    store._read_async_stream = 33
+    detached = backend.begin_detached_read_plan(keys[:1])
+    backend.get_paged_batch(keys[:1], 0, [[3, 1]], target_plan=detached)
+    assert runtime.submit_calls[-1][1]["stream"] == 33
+    backend.get_paged_batch(keys[1:], 0, [[7, 0]])
+    assert runtime.submit_calls[-1][1]["stream"] == 11
+    assert backend._target_plans["read"].plan_token != detached.plan_token
+    backend.end_detached_read_plan(detached)
+    assert detached.plan_token not in backend._detached_plans
     backend.close()
 
 

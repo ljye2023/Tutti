@@ -4,6 +4,7 @@
 // Includes private headers to construct DataPaths + resolvers, returns
 // public types (StorageRuntime + RuntimeTelemetry).
 
+#include <algorithm>
 #include <tutti/presets/local_nvme.h>
 
 #include <tutti/storage_runtime.h>
@@ -128,6 +129,14 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
 
     RuntimeConfig runtime_config;
     runtime_config.accel_id = p.accel_id;
+    // Terminal-but-unreleased IOs are bounded by the DataPath's op arena
+    // (2 x max_in_flight_operations slots, held until release). The default
+    // 64 is below one whole-layer plan: an async read plan keeps up to
+    // num_layers completed handles until its next poll, any other wait drives
+    // them terminal, and sync submits arriving meanwhile were rejected.
+    runtime_config.max_terminal_results = std::max<std::uint64_t>(
+        runtime_config.max_terminal_results,
+        2ull * p.max_in_flight_operations);
     auto created = StorageRuntime::create_owning(runtime_config, std::move(owned));
     if (!created.ok()) {
         RuntimeWithTelemetry result;
@@ -188,6 +197,14 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
 
     RuntimeConfig runtime_config;
     runtime_config.accel_id = p.accel_id;
+    // Terminal-but-unreleased IOs are bounded by the DataPath's op arena
+    // (2 x max_in_flight_operations slots, held until release). The default
+    // 64 is below one whole-layer plan: an async read plan keeps up to
+    // num_layers completed handles until its next poll, any other wait drives
+    // them terminal, and sync submits arriving meanwhile were rejected.
+    runtime_config.max_terminal_results = std::max<std::uint64_t>(
+        runtime_config.max_terminal_results,
+        2ull * p.max_in_flight_operations);
     auto created = StorageRuntime::create_owning(runtime_config, std::move(owned));
     if (!created.ok()) {
         RuntimeWithTelemetry result;

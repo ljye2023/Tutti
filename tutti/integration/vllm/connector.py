@@ -31,6 +31,11 @@ from tutti.integration.vllm.geometry import (
     flatten_blocks,
     resolve_geometry,
 )
+from tutti.integration.vllm.load_policy import (
+    LoadModePolicy,
+    resolve_free_ratio,
+    resolve_load_mode,
+)
 from tutti.integration.vllm.worker_meta import TuttiWorkerMetadata
 
 # 模块以 adapter.* 顶层包导入，logger 名须落在 vllm 命名空间下
@@ -83,6 +88,10 @@ _scheduler_index_for = scheduler_index_for
 _PENDING_MAX_AGE_STEPS = 3
 
 
+def _fmt(value, digits: int) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
 
 @dataclass
 class _RequestTracker:
@@ -132,10 +141,13 @@ class _ReqMeta:
     token_ids: list[int]
     block_ids: list[int]
     load_tokens: int = 0
-    load_start_token: int = 0   # 加载区间起点（vLLM 已计 token 数）
+    load_start_token: int = 0   # 加载区间起点（本地前缀命中边界）
     save_chunk_start: int = 0
     save_chunk_count: int = 0
     save_generations: list[str] = field(default_factory=list)
+    #: 异步加载：请求本步不参与计算（WAITING_FOR_REMOTE_KVS），worker 在读
+    #: 流上读完后经 get_finished 回报；不进入本步的逐层 fence 与 TP 失败共识。
+    load_async: bool = False
 
 
 @dataclass
@@ -147,6 +159,9 @@ class TuttiConnectorMetadata(KVConnectorMetadata):
     #: 数据面删除 + 本 rank 索引对齐，使两侧独立 LRU 按构造收敛；worker
     #: 仍保留自身驱逐作为漂移兜底（见 KVEngine.apply_evictions）。
     evicted_keys: list[bytes] = field(default_factory=list)
+    #: 本步调度的 token 总数：worker 用它把本步 GPU 计算耗时折成
+    #: compute_ms(tokens) 样本（load_policy 的计算侧拟合）。
+    step_tokens: int = 0
 
 
 class TuttiConnectorV1(KVConnectorBase_V1):
@@ -199,8 +214,32 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         # 请求对象切片——scheduled_cached_reqs.new_token_ids 仅 PP 时
         # 非空，常规部署恒为空表）
         self._live_requests: dict[str, object] = {}
-        # 外部加载区间起点（update_state_after_alloc 时的已计 token 数）
+        # 外部加载区间起点 = get_num_new_matched_tokens 收到的本地命中边界。
+        # 不能取 update_state_after_alloc 时的 request.num_computed_tokens：
+        # vLLM 在该回调**之后**才给它赋值，此前恒为 0。
+        self._match_starts: dict[str, int] = {}
         self._load_starts: dict[str, int] = {}
+        # 同步/异步加载（见 load_policy）：
+        #   _load_async      最近一次命中查询的判定（被调度时生效）
+        #   _async_pending   已分配块、待随下一份 metadata 下发的异步加载
+        #   _async_outstanding 已下发、尚未被全部 rank 报完成的异步加载
+        #                    （req_id → 占用块数，供显存门槛计数）
+        self._load_mode = resolve_load_mode(extra)
+        self._load_async: dict[str, bool] = {}
+        self._async_pending: dict[str, _ReqMeta] = {}
+        self._async_outstanding: dict[str, int] = {}
+        # 显存门槛的分母：HBM KV 池总块数（单 KV 组）；未知时异步一律不放行。
+        self._total_blocks = getattr(kv_cache_config, "num_blocks", None)
+        self._policy: LoadModePolicy | None = None
+        if role is not KVConnectorRole.WORKER:
+            scheduler_config = getattr(vllm_config, "scheduler_config", None)
+            self._policy = LoadModePolicy(
+                mode=self._load_mode,
+                free_ratio=resolve_free_ratio(extra),
+                max_step_tokens=getattr(
+                    scheduler_config, "max_num_batched_tokens", None
+                ),
+            )
         # 命中统计（原先是每请求一条 info 日志，改为累计计数 + debug）
         self._hit_tokens_total = 0
         self._hit_requests_total = 0
@@ -304,8 +343,8 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._require_worker().wait_for_save()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        """本实现的收发均在步内同步结算，无跨步异步完成集合。"""
-        return set(), set()
+        """写入步内结算；异步加载读完的请求经此回报（finished_recving）。"""
+        return self._require_worker().get_finished(finished_req_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """上报读取未遂的块（由上层重算兜底）。"""
@@ -357,30 +396,70 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             new = 0
         if self._max_tokens_per_load:
             new = min(new, self._max_tokens_per_load)
-        if new > 0:
-            # 每请求一条、且是热路径：降为 debug 并聚合计数（见阶段 D 指标）。
-            self._hit_tokens_total += new
-            self._hit_requests_total += 1
-            logger.debug(
-                "[tutti] external hit: req=%s tokens=%d computed=%d",
-                request.request_id, new, num_computed_tokens,
+        req_id = request.request_id
+        if new <= 0:
+            self._load_async.pop(req_id, None)
+            return new, False
+        # 每请求一条、且是热路径：降为 debug 并聚合计数（见阶段 D 指标）。
+        self._hit_tokens_total += new
+        self._hit_requests_total += 1
+        self._match_starts[req_id] = int(num_computed_tokens)
+        is_async = False
+        if self._policy is not None:
+            others, held, free = self._block_usage(req_id)
+            decision = self._policy.decide(
+                chunks=new // self._chunk_tokens,
+                compute_tokens=len(tokens) - num_computed_tokens - new,
+                others=others,
+                held_blocks=held,
+                need_blocks=-(-(int(num_computed_tokens) + new) // self._block_size),
+                free_blocks=free,
             )
-        return new, False
+            is_async = decision.is_async
+            logger.debug(
+                "[tutti] external hit: req=%s tokens=%d computed=%d async=%s "
+                "reason=%s read_ms=%.1f compute_ms=%.1f step_ms=%.1f",
+                req_id, new, num_computed_tokens, is_async, decision.reason,
+                decision.read_ms, decision.compute_ms, decision.step_ms,
+            )
+        self._load_async[req_id] = is_async
+        return new, is_async
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int) -> None:
         """登记本步要加载的 token 数（块分配已完成）。
 
         同时保留活请求引用：请求对象的 token 序列随 decode 持续
         增长，cached 步的增量切片依赖该引用（见 build_connector_meta）。
-        外部加载区间起点 = 请求当前已计 token 数（vLLM 本地前缀
-        命中计入其中，connector 只补其后区间）。
+        外部加载区间 = [本地命中边界, 本地命中边界 + num_external_tokens)；
+        边界取自 get_num_new_matched_tokens 的入参（见 _match_starts）。
+
+        异步加载的请求本步不会出现在 scheduled_new_reqs 里，所以在这里就
+        把块表与 token 序列取全，留到 build_connector_meta 下发。
         """
-        self._live_requests[request.request_id] = request
-        if num_external_tokens > 0:
-            self._pending_loads[request.request_id] = num_external_tokens
-            self._load_starts[request.request_id] = int(
-                getattr(request, "num_computed_tokens", 0)
+        req_id = request.request_id
+        self._live_requests[req_id] = request
+        start = self._match_starts.pop(req_id, None)
+        is_async = self._load_async.pop(req_id, False)
+        if num_external_tokens <= 0:
+            return
+        if start is None:
+            start = int(getattr(request, "num_computed_tokens", 0))
+        if is_async:
+            tokens = list(getattr(request, "prompt_token_ids", None) or [])
+            tokens += list(getattr(request, "output_token_ids", None) or [])
+            get_ids = getattr(blocks, "get_block_ids", None)
+            block_ids = flatten_blocks(get_ids() if callable(get_ids) else blocks)
+            self._async_pending[req_id] = _ReqMeta(
+                req_id=req_id,
+                token_ids=tokens,
+                block_ids=block_ids,
+                load_tokens=int(num_external_tokens),
+                load_start_token=start,
+                load_async=True,
             )
+            return
+        self._pending_loads[req_id] = num_external_tokens
+        self._load_starts[req_id] = start
 
     def _log_step_summary(self, scheduler_output) -> None:
         """每步容量/命中汇总：debug 明细 + info 级长跑体检。
@@ -452,6 +531,16 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             snapshot.get("eviction_drift_total"),
             snapshot.get("pending_reclaimed_total"),
         )
+        if self._policy is not None:
+            p = self._policy.snapshot()
+            logger.info(
+                "[tutti] load-policy mode=%s free_ratio=%.2f decisions=%s "
+                "outstanding=%d read_ms/chunk=%s compute_ms/token=%s step_ms=%s",
+                p["mode"], p["free_ratio"], p["decisions"],
+                len(self._async_outstanding) + len(self._async_pending),
+                _fmt(p["read_ms_per_chunk"], 3), _fmt(p["compute_ms_per_token"], 4),
+                _fmt(p["step_ms"], 1),
+            )
         self._health_last_ns = now
         self._health_last = {
             "steps": self._steps_total,
@@ -557,8 +646,21 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                         meta.save_generations = [
                             generation_by_key[key] for key in keys
                         ]
+        # 异步加载随本步 metadata 下发：请求本步不计算，worker 只读不写。
+        # 即使请求已被终止也照发——vLLM 对 WAITING_FOR_REMOTE_KVS 请求延迟
+        # 释放块，直到全部 rank 报 finished_recving（见 scheduler.finish_requests）。
+        for req_id, meta in self._async_pending.items():
+            requests.append(meta)
+            self._async_outstanding[req_id] = len(meta.block_ids)
+        self._async_pending = {}
+        step_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+        if step_tokens is None:
+            step_tokens = sum(
+                (getattr(scheduler_output, "num_scheduled_tokens", None) or {}).values()
+            )
         return TuttiConnectorMetadata(
-            requests=requests, evicted_keys=evicted_keys
+            requests=requests, evicted_keys=evicted_keys,
+            step_tokens=int(step_tokens or 0),
         )
 
     def update_connector_output(self, connector_output) -> None:
@@ -567,7 +669,12 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         vLLM 每步在 scheduler 侧调用一次，携带 KVOutputAggregator
         跨 TP rank 聚合后的 worker metadata。全部 rank 报告成功的
         chunk 才发布驻留；任一 rank 失败即 fail-closed 回收预留。
+
+        异步加载的完成（finished_recving）也在这里结算：聚合器只在全部
+        rank 都报完成时才放进集合，此后它不再算作在途。
         """
+        for req_id in getattr(connector_output, "finished_recving", None) or ():
+            self._async_outstanding.pop(req_id, None)
         meta = getattr(connector_output, "kv_connector_worker_meta", None)
         if meta is None:
             return
@@ -580,6 +687,17 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 self._meta_type_warned = True
                 return
             meta = rebuilt
+        if self._policy is not None:
+            # 各 rank 样本已被聚合器拼在一起；TP 下一步跟最慢的 rank 走，
+            # 所以每步只取最慢的一条（读按每 chunk 耗时、步按耗时）。
+            reads = [(int(c), float(ms)) for c, ms in
+                     getattr(meta, "read_samples", None) or () if c > 0 and ms > 0]
+            if reads:
+                self._policy.observe_read(*max(reads, key=lambda s: s[1] / s[0]))
+            steps = [(int(t), float(ms)) for t, ms in
+                     getattr(meta, "step_samples", None) or () if t > 0 and ms > 0]
+            if steps:
+                self._policy.observe_step(*max(steps, key=lambda s: s[1]))
         apply_commits = getattr(self._index, "apply_worker_commits", None)
         if not callable(apply_commits):
             return
@@ -634,9 +752,37 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._pending_loads.pop(request.request_id, None)
         self._live_requests.pop(request.request_id, None)
         self._load_starts.pop(request.request_id, None)
+        self._match_starts.pop(request.request_id, None)
+        self._load_async.pop(request.request_id, None)
+        # _async_pending / _async_outstanding 不清：读仍要完成并回报
+        # finished_recving，vLLM 才会释放这些块（见 build_connector_meta）。
         return False, None
 
     # ---- 内部 ----
+
+    def _block_usage(self, req_id: str) -> tuple[int, int, int | None]:
+        """(在算的其他请求数, 异步加载占着的块数, 估计空闲块数)。
+
+        connector 看不到 vLLM 的块池，按活请求估：在算的请求每个占
+        ceil(已计 token / block_size) 块，异步加载按已分配块数计。被抢占的
+        请求仍在 _live_requests 里、前缀共享块会被重复计——都让空闲块偏少，
+        即偏向同步，不会多放异步。
+        """
+        held = sum(self._async_outstanding.values()) + sum(
+            len(meta.block_ids) for meta in self._async_pending.values()
+        )
+        others = 0
+        used = 0
+        for rid, request in self._live_requests.items():
+            if (rid == req_id or rid in self._async_outstanding
+                    or rid in self._async_pending):
+                continue
+            others += 1
+            computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+            used += -(-computed // self._block_size)
+        if not self._total_blocks:
+            return others, held, None
+        return others, held, int(self._total_blocks) - used - held
 
     def _require_worker(self) -> WorkerImpl:
         if self._impl is None:

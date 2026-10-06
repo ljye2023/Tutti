@@ -26,8 +26,14 @@ _ENGINE_CACHE: dict[int, tuple[Any, dict[tuple, Any]]] = {}
 _SCHEDULER_CACHE: dict[int, tuple[Any, dict[tuple, Any]]] = {}
 
 
-def _apply_direct_admission_floor(options: dict, num_layers: int) -> None:
-    """未显式配置时，把在飞配额抬到直连准入的下限 ``2 * num_layers``。
+def _apply_direct_admission_floor(options: dict, num_layers: int,
+                                  plans: int = 2) -> None:
+    """未显式配置时，把在飞配额抬到直连准入的下限 ``plans * num_layers``。
+
+    ``plans`` = 同时在途的整层计划数。同步模式是读 + 写 = 2；允许异步加载
+    时再加一个后台读计划 = 3（每 rank 同一时刻至多一个异步读计划，见
+    worker 的异步加载队列），否则异步读占满配额后，同步读/写的提交会被
+    RESOURCE_EXHAUSTED 拒绝。代价：80 层模型多 160 个 arena 槽位 ≈ 90 MiB。
 
     直连一次提交整个请求的全部层（读 80 + 写 80），故运行时的并发在飞配额必须
     容得下 ``2 * num_layers``。而 preset 是 C 侧结构，不知道模型层数，其硬编码
@@ -54,7 +60,7 @@ def _apply_direct_admission_floor(options: dict, num_layers: int) -> None:
         return
     if preset.get("max_in_flight_operations") is not None:
         return
-    preset["max_in_flight_operations"] = 2 * int(num_layers)
+    preset["max_in_flight_operations"] = int(plans) * int(num_layers)
 
 
 def worker_engine_for(vllm_config, extra: dict):
@@ -112,7 +118,12 @@ def worker_engine_for(vllm_config, extra: dict):
             )
         options["segment_bytes"] = segment_bytes
         # 数据面 store 才需要直连准入下限；调度侧的元数据 store 不做 IO。
-        _apply_direct_admission_floor(options, int(extra["num_layers"]))
+        from tutti.integration.vllm.load_policy import resolve_load_mode
+
+        plans = 2 if resolve_load_mode(extra) == "sync" else 3
+        _apply_direct_admission_floor(
+            options, int(extra["num_layers"]), plans=plans
+        )
         store = create_store(store_spec["type"], options)
         # 可选层数预告：查询侧（不做 bind）的驱逐展开与冷启动完整性
         # 判定依赖层数；与缓存键无关（同配置实例共享同引擎）。

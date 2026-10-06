@@ -148,7 +148,10 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
     caps_.device_completion_fence_on_caller_stream = true;
     caps_.device_execution_autonomous = true;
     caps_.supports_multi_stream = true;
-    caps_.max_concurrent_streams = 2;
+    // Workspaces are per operation (arena slot), not per stream, so the
+    // stream count is bounded only by the in-flight quota. Three covers the
+    // connector's sync read + write + async (cross-step) read streams.
+    caps_.max_concurrent_streams = 3;
     caps_.max_concurrent_operations = max_in_flight_operations_;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;

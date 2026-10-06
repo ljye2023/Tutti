@@ -342,6 +342,35 @@ public:
         ios_.erase(ticket);
     }
 
+    // Non-blocking progress probe. Unlike wait(ticket, 0) -- which only
+    // reports state already recorded and never drives progress -- this runs
+    // one progress pass (CUDA event queries + completion status) so an IO
+    // nobody is blocking on can still reach a terminal state. Returns
+    // "IN_FLIGHT", "COMPLETED" or "FAILED".
+    std::string query_io(std::uint64_t ticket) {
+        auto retained = terminal_results_.find(ticket);
+        if (retained != terminal_results_.end()) {
+            return retained->second.state;
+        }
+        const IoHandle handle = lookup_io_(ticket);
+        tutti::Result<tutti::IoSnapshot> snap = [&] {
+            py::gil_scoped_release release;
+            return rt_->query(handle);
+        }();
+        if (!snap.ok()) {
+            throw_status("query_io failed", snap.status());
+        }
+        switch (snap.value().state) {
+            case tutti::IoState::COMPLETED: return "COMPLETED";
+            case tutti::IoState::FAILED: return "FAILED";
+            case tutti::IoState::IN_FLIGHT: break;
+        }
+        return "IN_FLIGHT";
+    }
+
+    // IO handles submitted but not yet released (in flight or terminal).
+    std::size_t open_io_count() const { return ios_.size(); }
+
     std::pair<std::string, std::string> wait(std::uint64_t ticket,
                                              std::uint64_t timeout_ms) {
         WaitResult result = wait_result(ticket, timeout_ms);
@@ -785,7 +814,7 @@ PyRuntime make_local_nvme_runtime(const py::dict& preset) {
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
                      p.max_batch_entries, p.max_in_flight_operations,
-                     p.accel_id, /*max_concurrent_streams=*/2);
+                     p.accel_id, /*max_concurrent_streams=*/3);
 }
 
 PyRuntime make_striped_nvme_runtime(const py::dict& preset) {
@@ -797,7 +826,7 @@ PyRuntime make_striped_nvme_runtime(const py::dict& preset) {
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
                      p.max_batch_entries, p.max_in_flight_operations,
-                     p.accel_id, /*max_concurrent_streams=*/2);
+                     p.accel_id, /*max_concurrent_streams=*/3);
 }
 
 PyRuntime make_stub_runtime(std::int32_t accel_id) {
@@ -1205,6 +1234,8 @@ PYBIND11_MODULE(_core, m) {
              py::arg("accel_id"), py::arg("stream"),
              py::arg("execution") = "device")
         .def("release_io", &PyRuntime::release_io, py::arg("io_handle"))
+        .def("query_io", &PyRuntime::query_io, py::arg("io_handle"))
+        .def("open_io_count", &PyRuntime::open_io_count)
         .def("wait", &PyRuntime::wait, py::arg("io_handle"),
              py::arg("timeout_ms"))
         .def("wait_result", &PyRuntime::wait_result, py::arg("io_handle"),

@@ -93,6 +93,29 @@ class _LoadRequestSpan:
 
 
 @dataclass(frozen=True)
+class _AsyncLoad:
+    """一个请求的异步加载：已 pin 的 chunk key 与目标块表。"""
+    req_id: str
+    keys: tuple[bytes, ...]
+    block_tables: tuple[tuple[int, ...], ...]
+
+
+@dataclass
+class _AsyncBatch:
+    """在途的异步读计划（每 rank 同时至多一个，见 _kick_async_loads）。"""
+    loads: list[_AsyncLoad]
+    plan: object
+    chunks: int
+    queued_ns: int
+
+
+#: 等待取样的步计时上限（只保留最近的，GPU 落后时旧的直接丢弃）。
+_STEP_TIMING_PENDING_LIMIT = 16
+#: 单步交给调度侧的样本上限（防止长时间无汇报时样本无界堆积）。
+_SAMPLE_LIMIT = 64
+
+
+@dataclass(frozen=True)
 class _FailureConsensus:
     failed: bool
     generation: int
@@ -543,6 +566,25 @@ class WorkerImpl:
         self._failure_collective_done = False
         self._failure_consensus = None
         self._failure_collective_poisoned = False
+        # 异步加载（scheduler 判定 load_async 的请求）：
+        #   _async_queue    已 pin、等当前计划结束后合并发起的加载
+        #   _async_active   在途计划（每 rank 至多一个：配额按 3 个整层计划
+        #                   预留，见 factory._apply_direct_admission_floor）
+        #   _async_finished 已结束、待 get_finished 回报的请求
+        #   _async_error_blocks 失败请求的块，与同步读的错误块分开存放——
+        #                   同步路径会整体重建 _load_error_blocks
+        self._async_queue: list[_AsyncLoad] = []
+        self._async_active: _AsyncBatch | None = None
+        self._async_finished: set[str] = set()
+        self._async_error_blocks: set[int] = set()
+        # 调度侧代价模型的样本（load_policy），随 worker meta 回传。
+        self._read_samples: list[tuple[int, float]] = []
+        # 已结算、等末层 fence 完成后再取读耗时的同步读计划 (chunks, plan)
+        self._read_timing: list[tuple[int, object]] = []
+        self._open_io_reported = 0
+        self._step_samples: list[tuple[int, float]] = []
+        self._step_timing: list | None = None
+        self._step_timing_pending: list[list] = []
 
     # ---- 配置与登记 ----
 
@@ -661,8 +703,13 @@ class WorkerImpl:
         self._legacy_eager_active = False
         self._read_plan = None
         self._load_generation += 1
+        self._harvest_step_timing()
+        self._poll_async_loads()
+        # 只有同步加载参与本步的 TP 失败共识：异步加载的请求本步不计算，
+        # 失败经 invalid block 在它被回报完成的那一步交给 vLLM 处理。
         self._external_load_step = any(
             getattr(meta, "load_tokens", 0) > 0
+            and not getattr(meta, "load_async", False)
             for meta in getattr(self._metadata, "requests", []) or []
         )
         self._failure_collective_done = False
@@ -681,6 +728,9 @@ class WorkerImpl:
         for request_ordinal, meta in enumerate(
                 getattr(self._metadata, "requests", []) or []):
             if meta.load_tokens <= 0:
+                continue
+            if getattr(meta, "load_async", False):
+                self._enqueue_async_load(meta)
                 continue
             first_chunk, n_chunks = _load_chunk_span(
                 meta.load_start_token, meta.load_tokens, self._chunk_tokens
@@ -770,6 +820,10 @@ class WorkerImpl:
                     self._mark_load_failure()
                     self._abort_step()
                     raise
+        # 异步加载在同步读计划之后发起：两者共用读流，同步读排在前面，
+        # 本步计算等的那部分先完成。
+        self._kick_async_loads()
+        self._start_step_timing(had_sync_read=bool(self._load_keys))
         # 写批准备（哈希/准入/对象池分配）在读计划预提交之后立即完成：
         # 此时读已在飞、计算未开始，这些 host 开销不与层 0→1 的计算
         # 下发争用前向线程。save_kv_layer 的首层路径保留幂等兜底。
@@ -1110,6 +1164,7 @@ class WorkerImpl:
 
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
+        self._end_step_timing()
         first_error = self._save_error
         drained = False
         # Direct reads are fully pre-enqueued by start_load; staged
@@ -1125,6 +1180,11 @@ class WorkerImpl:
                     require_complete()
                 except Exception as exc:
                     self._mark_load_failure(exc)
+                # 主机侧此刻 GPU 往往还在读，末层 fence 未完成、_read_tail_ms
+                # 还是 None（完成回调稍后才填）；留住计划，到 fence 完成时再取。
+                if not self._load_failed:
+                    self._read_timing.append((len(self._load_keys), self._read_plan))
+                    del self._read_timing[:-_SAMPLE_LIMIT]
             try:
                 self._engine.wait_idle()
                 drained = True
@@ -1202,6 +1262,7 @@ class WorkerImpl:
             checkpoint = getattr(self._engine, "checkpoint_if_due", None)
             if callable(checkpoint):
                 checkpoint()
+        self._check_open_ios()
         self._save_inflight = []
         self._defer_write_event = None
         self._save_seen_callbacks = set()
@@ -1275,10 +1336,33 @@ class WorkerImpl:
     def write_window(self) -> RingWindow | None:
         return self._write_window
 
+    def get_finished(self, finished_req_ids) -> tuple[set[str], set[str]]:
+        """回报读完的异步加载（finished_recving）；写入在步内结算，无 sending。
+
+        vLLM 要求失败的块不晚于请求被回报完成的那一步出现在
+        get_block_ids_with_load_errors 里——它紧随本调用，两者同步交出。
+        已终止的请求若还在排队，直接不读了：vLLM 只等它的完成回报来释放块。
+        """
+        self._poll_async_loads()
+        finished = set(finished_req_ids or ())
+        if finished and self._async_queue:
+            keep = []
+            for load in self._async_queue:
+                if load.req_id in finished:
+                    self._release_async_load(load)
+                    self._async_finished.add(load.req_id)
+                else:
+                    keep.append(load)
+            self._async_queue = keep
+        done = self._async_finished
+        self._async_finished = set()
+        return set(), done
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """上报读取未遂的块集合（读取后清空）。"""
-        errors = self._load_error_blocks
+        errors = self._load_error_blocks | self._async_error_blocks
         self._load_error_blocks = set()
+        self._async_error_blocks = set()
         if errors:
             _LOG.error(
                 "REAL_LOAD_INVALID_BLOCKS count=%d block_ids=%s "
@@ -1352,8 +1436,10 @@ class WorkerImpl:
     def build_connector_worker_meta(self):
         """交出本步索引增量（vLLM 每步调用一次，调用即清空）。"""
         self._settle_unreported_plans()
+        self._harvest_read_timing()
         if (not self._store_committed and not self._store_failed
-                and not self._index_forgotten and not self._index_evicted):
+                and not self._index_forgotten and not self._index_evicted
+                and not self._read_samples and not self._step_samples):
             self._committed_this_step.clear()
             return None
         meta = TuttiWorkerMetadata(
@@ -1361,13 +1447,212 @@ class WorkerImpl:
             failed=set(self._store_failed),
             forgotten=set(self._index_forgotten),
             evicted=set(self._index_evicted),
+            read_samples=list(self._read_samples),
+            step_samples=list(self._step_samples),
         )
         self._store_committed = {}
         self._store_failed = set()
         self._committed_this_step = set()
         self._index_forgotten = set()
         self._index_evicted = set()
+        self._read_samples = []
+        self._step_samples = []
         return meta
+
+    # ---- 异步加载 ----
+
+    def _enqueue_async_load(self, meta) -> None:
+        """pin 一个异步加载的 chunk 区间并排队；不可读时直接报完成 + 失败块。"""
+        req_id = str(getattr(meta, "req_id", ""))
+        first_chunk, n_chunks = _load_chunk_span(
+            meta.load_start_token, meta.load_tokens, self._chunk_tokens
+        )
+        if n_chunks <= 0:
+            self._async_finished.add(req_id)
+            return
+        req_keys, _ = self._engine.hash_keys(meta.token_ids)
+        req_keys = req_keys[first_chunk:first_chunk + n_chunks]
+        tables = self._chunk_block_tables(meta, first_chunk + n_chunks)[first_chunk:]
+        blocks = {int(block) for table in tables for block in table}
+        # 与同步路径同一契约：块表不完整说明上层契约被破坏，直接失败。
+        self._validate_direct_or_fail(tables)
+        try:
+            self._engine.pin(req_keys)
+        except KeyError as exc:
+            missing = exc.args[0] if exc.args else ()
+            if isinstance(missing, (list, tuple, set, frozenset)):
+                self._index_forgotten.update(bytes(key) for key in missing)
+            self._async_error_blocks.update(blocks)
+            self._async_finished.add(req_id)
+            return
+        self._async_queue.append(_AsyncLoad(
+            req_id=req_id,
+            keys=tuple(req_keys),
+            block_tables=tuple(tuple(table) for table in tables),
+        ))
+        _LOG.debug("ASYNC_LOAD_QUEUED req=%s chunks=%d", req_id, n_chunks)
+
+    def _kick_async_loads(self) -> None:
+        """当前没有在途计划时，把排队的加载合并成一个读计划发起。
+
+        每 rank 同时只跑一个异步计划：配额只多留了一个整层计划，而且合并后
+        批越大、盘越容易跑满；排队的请求只是多等一会儿。
+        """
+        if self._async_active is not None or not self._async_queue:
+            return
+        loads, self._async_queue = self._async_queue, []
+        keys = [key for load in loads for key in load.keys]
+        tables = [list(table) for load in loads for table in load.block_tables]
+        layers = self._callback_to_physical or tuple(range(self._num_layers))
+        queued_ns = time.perf_counter_ns()
+        try:
+            with nvtx_range(
+                f"tutti.request.load_async|requests={len(loads)}|chunks={len(keys)}"
+            ):
+                plan = self._engine.start_async_read_plan(keys, tables, layers)
+        except Exception as exc:
+            _LOG.error("ASYNC_LOAD_START_FAILED requests=%d chunks=%d: %s",
+                       len(loads), len(keys), exc)
+            self._finish_async_loads(loads, ok=False)
+            return
+        self._async_active = _AsyncBatch(
+            loads=loads, plan=plan, chunks=len(keys), queued_ns=queued_ns
+        )
+        self._poll_async_loads()
+
+    def _poll_async_loads(self) -> None:
+        """非阻塞推进在途计划；结束则解 pin、记完成，并发起下一批。"""
+        batch = self._async_active
+        if batch is None:
+            self._kick_async_loads()
+            return
+        state = batch.plan.poll()
+        if state is None:
+            return
+        self._async_active = None
+        ok = bool(state)
+        read_ms = batch.plan.read_ms()
+        wall_ms = (time.perf_counter_ns() - batch.queued_ns) / 1e6
+        if ok and read_ms:
+            self._add_sample(self._read_samples, batch.chunks, read_ms)
+        log = _LOG.info if ok else _LOG.error
+        log(
+            "DIRECT_ASYNC_READ_DONE ok=%s requests=%d chunks=%d read_ms=%s "
+            "wall_ms=%.1f error=%s",
+            ok, len(batch.loads), batch.chunks,
+            f"{read_ms:.1f}" if read_ms else "n/a", wall_ms,
+            getattr(batch.plan, "failure", None),
+        )
+        self._finish_async_loads(batch.loads, ok=ok)
+        self._kick_async_loads()
+
+    def _finish_async_loads(self, loads, ok: bool) -> None:
+        for load in loads:
+            self._release_async_load(load)
+            if not ok:
+                self._async_error_blocks.update(
+                    int(block) for table in load.block_tables for block in table
+                )
+            self._async_finished.add(load.req_id)
+
+    def _release_async_load(self, load: _AsyncLoad) -> None:
+        try:
+            self._engine.unpin(list(load.keys))
+        except Exception as exc:
+            _LOG.warning("ASYNC_LOAD_UNPIN_FAILED req=%s: %s", load.req_id, exc)
+
+    # ---- 代价模型样本 ----
+
+    def _check_open_ios(self) -> None:
+        """不变式：步末 drain 完，除异步读计划外不应再有未释放的 IO 句柄。
+
+        runtime 对“已完成未释放”的句柄有硬上限（max_terminal_results），
+        泄漏累积到上限后所有提交被拒；这里在泄漏刚出现时就报出来。
+        """
+        if self._async_active is not None:
+            return
+        store = getattr(self._engine, "_store", None)
+        count = getattr(getattr(store, "_runtime", None), "open_io_count", None)
+        if not callable(count):
+            return
+        try:
+            n = int(count())
+        except Exception:
+            return
+        if n > self._open_io_reported:
+            _LOG.warning("TUTTI_IO_HANDLES_LEAKED open=%d after step drain", n)
+        self._open_io_reported = n
+
+    def _harvest_read_timing(self) -> None:
+        """把末层 fence 已完成的同步读计划转成 (chunks, ms) 样本。"""
+        pending = []
+        for chunks, plan in self._read_timing:
+            capture = getattr(plan, "_capture_read_tail", None)
+            if callable(capture):
+                capture()
+            tail_ms = getattr(plan, "_read_tail_ms", None)
+            if tail_ms:
+                self._add_sample(self._read_samples, chunks, tail_ms)
+            elif callable(capture):
+                pending.append((chunks, plan))
+        self._read_timing = pending
+
+    @staticmethod
+    def _add_sample(samples: list, x: int, ms: float) -> None:
+        if x > 0 and ms > 0:
+            samples.append((int(x), float(ms)))
+            if len(samples) > _SAMPLE_LIMIT:
+                del samples[:-_SAMPLE_LIMIT]
+
+    def _start_step_timing(self, had_sync_read: bool) -> None:
+        """在计算流上记本步起点（GPU 时间），供 compute_ms(tokens) 拟合。
+
+        只有不含同步读的步才是"纯计算"样本：同步读会让计算流等读 fence。
+        """
+        self._step_timing = None
+        tokens = int(getattr(self._metadata, "step_tokens", 0) or 0)
+        if tokens <= 0 or not torch.cuda.is_available():
+            return
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
+        except Exception:
+            return
+        self._step_timing = [start, None, tokens, bool(had_sync_read)]
+
+    def _end_step_timing(self) -> None:
+        timing = self._step_timing
+        if timing is None or timing[1] is not None:
+            return
+        try:
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+        except Exception:
+            self._step_timing = None
+            return
+        timing[1] = end
+        self._step_timing_pending.append(timing)
+        if len(self._step_timing_pending) > _STEP_TIMING_PENDING_LIMIT:
+            del self._step_timing_pending[:-_STEP_TIMING_PENDING_LIMIT]
+        self._step_timing = None
+
+    def _harvest_step_timing(self) -> None:
+        """取走 GPU 上已完成的步计时（非阻塞；未完成的留到下一步）。"""
+        self._step_timing = None  # 没走到 wait_for_save 的步（无前向）丢弃
+        pending = []
+        for start, end, tokens, had_sync_read in self._step_timing_pending:
+            try:
+                if not end.query():
+                    pending.append([start, end, tokens, had_sync_read])
+                    continue
+                ms = float(start.elapsed_time(end))
+            except Exception:
+                continue
+            if not had_sync_read:
+                self._add_sample(self._step_samples, tokens, ms)
+        self._step_timing_pending = pending
 
     # ---- 内部 ----
 
