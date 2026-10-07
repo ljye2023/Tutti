@@ -157,6 +157,7 @@ private:
     bool opened_ = false;
 
     std::uint64_t slot_bytes_ = 0;        // header + payload, per slot
+    std::uint64_t mount_count_ = 1;       // distinct mounts the slots rotate over
     std::uint64_t precreated_ = 0;        // slots [0, precreated_) are ready
     // Slots per file group (segment_file_slots x devices). A group is the
     // precreate unit and is published only when all its files are ready.

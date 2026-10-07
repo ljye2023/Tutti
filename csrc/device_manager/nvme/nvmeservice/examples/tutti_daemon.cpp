@@ -212,6 +212,43 @@ int main(int argc, char** argv) {
         }
     }
 
+    // md RAID0 arrays over brought-up namespaces: assemble (or adopt), then
+    // mount the array where its members' backing_mount_path points.
+    for (const auto& array : cfg.raid0_arrays) {
+        if (!array.auto_mount) continue;
+        std::vector<std::string> members;
+        for (int32_t id : array.device_ids) {
+            const auto found = std::find_if(startup_devices.begin(), startup_devices.end(),
+                [&](const auto& resource) { return resource.device_id == id; });
+            if (found == startup_devices.end() || found->block_path.empty()) break;
+            members.push_back(found->block_path);
+        }
+        if (members.size() != array.device_ids.size()) {
+            std::fprintf(stderr, "warning: raid0 %s: not every member was brought "
+                         "up; array not assembled\n", array.name.c_str());
+            continue;
+        }
+        std::string err;
+        const std::string md_device = mount_mgr.assemble_raid0(array.name, members, &err);
+        if (md_device.empty()) {
+            std::fprintf(stderr, "warning: raid0 %s: %s\n", array.name.c_str(),
+                         err.c_str());
+            continue;
+        }
+        auto mr = mount_mgr.mount_one(md_device, array.mount_path);
+        // fstab/systemd may have mounted the array as soon as it appeared;
+        // the daemon still owns that mount, or it could not stop the array.
+        if (!mr.mounted_by_daemon &&
+            mount_mgr.adopt_mount(md_device, array.mount_path)) {
+            mr.error.clear();
+        }
+        if (!mr.error.empty()) {
+            std::fprintf(stderr, "warning: auto-mount %s at %s failed: %s\n",
+                         md_device.c_str(), array.mount_path.c_str(),
+                         mr.error.c_str());
+        }
+    }
+
     // Publish accelerator views only after the backing mount is visible.
     // Creating ACCEL<n> before mount(2) would place it on the host filesystem
     // and the later mount would hide it.
@@ -248,7 +285,7 @@ int main(int argc, char** argv) {
                      cfg.grpc.endpoint.c_str());
         state->stop_reaper();
         state->unpublish_gpu_views();
-        mount_mgr.unmount_all();
+        if (mount_mgr.unmount_all() == 0) mount_mgr.stop_arrays();
         return 1;
     }
 
@@ -307,11 +344,28 @@ int main(int argc, char** argv) {
                      "mounts left in place\n");
     } else {
         int remaining = mount_mgr.unmount_all();
+        // Releasing the controllers under a still-mounted filesystem kills
+        // it mid-flight (an md array loses its members). With arrays that can
+        // hold host data (the adopted md0), keep retrying until every mount
+        // is gone; only a second signal (force-exit) gives up.
+        while (remaining > 0 && !cfg.raid0_arrays.empty() &&
+               !g_force_exit.load(std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "tutti_daemon: %d mount(s) still busy; controllers "
+                         "stay up until they are released (send the signal "
+                         "again to force-exit)\n",
+                         remaining);
+            remaining = mount_mgr.unmount_all();
+        }
         if (remaining > 0) {
             std::fprintf(stderr,
                          "tutti_daemon: %d mount(s) still busy after retries; "
                          "leaving mounted\n",
                          remaining);
+        } else {
+            // Arrays go before the controllers are released (ServiceState
+            // teardown), so md never sees its members vanish under it.
+            mount_mgr.stop_arrays();
         }
     }
 

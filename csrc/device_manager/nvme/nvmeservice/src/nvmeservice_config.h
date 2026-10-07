@@ -92,6 +92,21 @@ struct NvmeEntry {
     bool                 auto_mount = true;
 };
 
+// An md RAID0 over several brought-up namespaces, mounted as ONE filesystem.
+// Members are listed by device_id; their nvmes[] entries must use this
+// mount_path as backing_mount_path and auto_mount: false (the array, not the
+// member, is mounted). The daemon assembles the array after bring-up (or
+// adopts the one udev already assembled from exactly these members), mounts
+// it, and on shutdown unmounts and stops it before releasing the
+// controllers. It never creates an array: that is a one-time operator step
+// (scripts/tutti-raid0-create.sh).
+struct Raid0ArrayEntry {
+    std::string          name;          // md name: /dev/md/<name>
+    std::vector<int32_t> device_ids;
+    std::string          mount_path;
+    bool                 auto_mount = true;
+};
+
 struct QueuePoolConfig {
     // Requested zero means default_per_client. The effective grant is further
     // clamped by max_per_client, max_queues_per_group, and available capacity.
@@ -115,6 +130,7 @@ struct ServiceConfig {
     GrpcConfig                   grpc;
     std::vector<AcceleratorEntry> accelerators;
     std::vector<NvmeEntry>       nvmes;
+    std::vector<Raid0ArrayEntry> raid0_arrays;
     QueuePoolConfig              queue_pool;
     LeaseConfig                  lease;
     UnmountRetryConfig           unmount_retry;

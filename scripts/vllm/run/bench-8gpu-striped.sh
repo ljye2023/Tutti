@@ -43,6 +43,13 @@ REUSE_PCT=80
 ROUNDS=2
 TAG=""
 POOL_TAG="${POOL_TAG:-v1}"
+# 盘组部署，与 serve-8gpu-striped.sh 一致（默认：两个 RAID0，各一个 daemon）：
+#   DAEMON_CONFIG  各 daemon 配置，逗号分隔；KV_MOUNT 池根挂载点；
+#   DEVICE_GROUPS  按 rank 分组的 device_id（分号分组）。
+_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+DAEMON_CONFIG="${DAEMON_CONFIG:-$_REPO/config/local/tutti_daemon_kv0.yaml,$_REPO/config/local/tutti_daemon_md0.yaml}"
+KV_MOUNT="${KV_MOUNT:-/mnt/tutti_md0}"
+DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
 MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
 TP_SIZE=8
 # 直连准入要求 >= 2 * num_layers（80 层模型 = 160），这是下限。
@@ -150,11 +157,12 @@ else
     # spelling like '[[0,1],[2,3]]' parses to nonsense and silently falls back
     # to the same failure.
     ARGS+=(
-        --device-groups '0,1,2,3'
+        --device-groups "${DEVICE_GROUPS:-0,1,2,3}"
         # {LOCAL_RANK} 是 driver 的占位符（大括号、无 $）。写成 shell 的
         # ${LOCAL_RANK} 会被转义成字面量 "$0"，于是 8 个 rank 全写进同一个名为
         # "...-$0" 的目录——池按 rank 隔离的语义失效，且互相追加同名文件。
-        --kv-root "/mnt/nvme0/tutti-kv-8gpu-${POOL_TAG}-{LOCAL_RANK}"
+        --kv-root "${KV_MOUNT}/tutti-kv-8gpu-${POOL_TAG}-{LOCAL_RANK}"
+        --daemon-config "$DAEMON_CONFIG"
         # Per device. 8 ranks x 8 queues = 64 on a disk whose usable pool is
         # 119, which fits (the default 32 would need 256 and fail EAGAIN).
         --num-queues 8

@@ -294,6 +294,11 @@ def main() -> int:
         default="/mnt/nvme{LOCAL_RANK}/tutti-kv-profile-rank{LOCAL_RANK}",
     )
     parser.add_argument(
+        "--daemon-config",
+        default="/data/home/ryeqiu/Tutti/config/local/tutti_daemon.yaml",
+        help="与运行中的 tutti_daemon 同一份配置（RAID0 用 tutti_daemon_raid0.yaml）",
+    )
+    parser.add_argument(
         "--device-groups",
         default=None,
         help=(
@@ -388,10 +393,7 @@ def main() -> int:
             "num_chunks": num_chunks,
             "io_stream": "auto",
             "preset": {
-                "daemon_config": (
-                    "/data/home/ryeqiu/Tutti/"
-                    "config/local/tutti_daemon.yaml"
-                ),
+                "daemon_config": args.daemon_config,
                 "gpu_id": "{LOCAL_RANK}",
             },
         }

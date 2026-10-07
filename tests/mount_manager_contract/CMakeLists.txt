@@ -35,6 +35,7 @@ target_link_libraries(tutti_mount_manager_contract_test PRIVATE
 target_include_directories(tutti_mount_manager_contract_test PRIVATE
     ${TUTTI_SOURCE_DIR}/device_manager/nvme/nvmeservice/src
     ${TUTTI_SOURCE_DIR}/device_manager/nvme/libnvm/include
+    ${TUTTI_REPOSITORY_ROOT}   # csrc/common/md_raid0.h
 )
 
 set_target_properties(tutti_mount_manager_contract_test PROPERTIES

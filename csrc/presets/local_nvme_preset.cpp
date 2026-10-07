@@ -10,18 +10,17 @@
 #include <tutti/storage_runtime.h>
 #include <tutti/cuda_like.h>
 #include "csrc/common/backend_ids.h"
+#include "csrc/common/snvme_identity.h"
 
 #include <cctype>
-#include <cstdlib>
-#include <filesystem>
 #include <stdexcept>
-#include <system_error>
 
 // Private headers — included here ONLY, never by consumer code.
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
 #include "csrc/resolvers/local_file/resolver.h"
 #include "csrc/resolvers/local_file/multi_mount_resolver.h"
+#include "csrc/resolvers/local_file/raid0_resolver.h"
 
 namespace tutti::presets {
 
@@ -46,43 +45,23 @@ std::string normalize_bdf(std::string bdf) {
     return bdf;
 }
 
+// The character device of the controller at `pci_bdf`, established by the
+// kernel (NVM_GET_DEV_INFO -> disk -> PCI), never derived from a number:
+// /dev/ssnvmeN and controller snvmeM are numbered by unrelated allocators.
+// No match, or more than one, throws -- a wrong guess sends GPU IO to
+// another controller's namespace.
 std::string chrdev_for_bdf(const std::string& pci_bdf) {
     if (pci_bdf.empty()) {
         throw std::invalid_argument("NVMe device pci_bdf must not be empty");
     }
     const std::string wanted = normalize_bdf(pci_bdf);
-    const char* configured_root = std::getenv("TUTTI_SNVME_SYSFS_ROOT");
-    const std::filesystem::path root = configured_root && *configured_root
-        ? configured_root : "/sys/class/snvme";
-    std::error_code ec;
-    if (!std::filesystem::is_directory(root, ec)) {
-        throw std::runtime_error("SNVMe sysfs class is unavailable: " +
-                                 root.string());
+    const std::string chrdev = tutti::detail::snvme_identity::chrdev_for_pci(wanted);
+    if (chrdev.empty()) {
+        throw std::runtime_error(
+            "no unique /dev/ssnvme* character device reports PCI " + wanted +
+            " (is its controller brought up by tutti_daemon?)");
     }
-
-    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
-        if (ec) break;
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("snvme", 0) != 0 || name.size() == 5) continue;
-        bool numeric = true;
-        for (std::size_t i = 5; i < name.size(); ++i) {
-            numeric = numeric && std::isdigit(static_cast<unsigned char>(name[i]));
-        }
-        if (!numeric) continue;
-        const std::filesystem::path target =
-            std::filesystem::weakly_canonical(entry.path(), ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-        for (const auto& component : target) {
-            if (normalize_bdf(component.string()) == wanted) {
-                return "/dev/ssnvme" + name.substr(5);
-            }
-        }
-    }
-    throw std::runtime_error("no /dev/ssnvme device maps to PCI BDF " +
-                             pci_bdf + " under " + root.string());
+    return chrdev;
 }
 
 } // namespace
@@ -172,17 +151,44 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
         p.max_batch_entries, p.max_in_flight_operations,
         p.prp_cache_capacity);
 
-    // One "file" resolver dispatching by mount: a slot's file path already
-    // names the device it lives on (placement rotated slots across mounts),
-    // so resolution is prefix matching plus the full single-device pipeline.
-    std::vector<MultiMountLocalFileResolver::MountBinding> bindings;
-    bindings.reserve(p.devices.size());
+    // All devices behind one mount: that mount is an md RAID0 over them, and
+    // one resolver serves the array (payloads carry the md layout).
+    bool one_mount = p.devices.size() > 1;
     for (const auto& d : p.devices) {
-        bindings.push_back({d.mount_path, d.pci_bdf, d.namespace_id,
-                            d.block_size, d.backing_device,
-                            std::string(kStripedDataPathKey)});
+        one_mount = one_mount && d.mount_path == p.devices.front().mount_path;
     }
-    auto* resolver = new MultiMountLocalFileResolver(std::move(bindings));
+    StorageTargetResolver* resolver = nullptr;
+    if (one_mount) {
+        std::vector<tutti::resolvers::local_file::Raid0MemberNamespace> members;
+        for (const auto& d : p.devices) {
+            members.push_back({d.backing_device, d.pci_bdf, d.namespace_id,
+                               d.block_size});
+        }
+        std::string why;
+        auto raid0 = tutti::resolvers::local_file::make_raid0_resolver(
+            p.devices.front().mount_path, members,
+            std::string(kStripedDataPathKey), &why);
+        if (!raid0) {
+            delete dp;
+            RuntimeWithTelemetry result;
+            result.creation_status = Status(StatusCode::INVALID_ARGUMENT, why);
+            return result;
+        }
+        resolver = raid0.release();
+    } else {
+        // One "file" resolver dispatching by mount: a slot's file path
+        // already names the device it lives on (placement rotated slots
+        // across mounts), so resolution is prefix matching plus the full
+        // single-device pipeline.
+        std::vector<MultiMountLocalFileResolver::MountBinding> bindings;
+        bindings.reserve(p.devices.size());
+        for (const auto& d : p.devices) {
+            bindings.push_back({d.mount_path, d.pci_bdf, d.namespace_id,
+                                d.block_size, d.backing_device,
+                                std::string(kStripedDataPathKey)});
+        }
+        resolver = new MultiMountLocalFileResolver(std::move(bindings));
+    }
 
     // Same reasoning as the single-device factory above: inline construction
     // with no other owner, so the runtime takes them and frees them after

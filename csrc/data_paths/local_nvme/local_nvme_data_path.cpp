@@ -3,6 +3,7 @@
 // LocalNvmeDataPath implementation.
 
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
+#include "csrc/common/snvme_identity.h"
 #include "csrc/data_paths/local_nvme/io/nvme_queue_group.h"
 #include "csrc/data_paths/local_nvme/io/device_target.h"
 #include "csrc/data_paths/local_nvme/io/submit_one.cuh"
@@ -453,6 +454,21 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
                           std::to_string(rc));
         }
 
+        // The character device must drive the configured controller (see
+        // csrc/common/snvme_identity.h for why this is checked, not assumed).
+        if (!controller_pci_addr_.empty()) {
+            const std::string actual =
+                tutti::detail::snvme_identity::pci_of_chrdev(snvme_dev_path_);
+            if (actual != controller_pci_addr_) {
+                nvm_ctrl_free_client(ctrl_);
+                ctrl_ = nullptr;
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              snvme_dev_path_ + " drives PCI " +
+                                  (actual.empty() ? "<unknown>" : actual) +
+                                  ", not " + controller_pci_addr_);
+            }
+        }
+
         // --- Hardware MDTS ---
         // Only compute MDTS / PRP capacity in production mode (block_size_ > 0).
         // Skeleton mode (block_size_ == 0) skips this — no IO will be submitted.
@@ -729,6 +745,12 @@ Result<DataPathTarget> LocalNvmeDataPath::open_impl_(const ResolvedTarget& targe
                    payload_result.status().message()));
     }
     const auto* payload = payload_result.value();
+    if (payload->raid0() != nullptr) {
+        // Extent offsets are md array offsets, not offsets in one namespace.
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::UNSUPPORTED,
+                   "open: RAID0 targets need the multi-device DataPath"));
+    }
 
     const auto& ns = payload->namespace_identity();
     if (ns.block_size == 0) {

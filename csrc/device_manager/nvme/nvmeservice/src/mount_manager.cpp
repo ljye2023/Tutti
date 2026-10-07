@@ -2,10 +2,16 @@
 
 #include "tutti_verbose.h"
 
+#include "csrc/common/md_raid0.h"
+
+#include <spawn.h>
+#include <sys/wait.h>
+
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -125,7 +131,170 @@ bool parse_mountinfo_line(const std::string& line, MountEntry* out) {
     return true;
 }
 
+// Runs argv[0] (PATH lookup) without a shell; returns the exit status, or -1
+// when it could not be started.
+int run_program(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = 0;
+    if (::posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ) != 0) {
+        return -1;
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Filesystem on `block_device` from its superblock magic: "ext4" (ext2/3/4,
+// 0xEF53 at byte 1080) or "xfs" ("XFSB" at byte 0); "" for anything else, so
+// the caller fails closed instead of mounting an unknown filesystem.
+std::string detect_fs_type(const std::string& block_device) {
+    const int fd = ::open(block_device.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (fd < 0) return "";
+    void* buf = nullptr;
+    std::string type;
+    if (::posix_memalign(&buf, 4096, 4096) == 0 &&
+        ::pread(fd, buf, 4096, 0) == 4096) {
+        const auto* b = static_cast<const unsigned char*>(buf);
+        if (std::memcmp(b, "XFSB", 4) == 0) {
+            type = "xfs";
+        } else if (b[1080] == 0x53 && b[1081] == 0xEF) {
+            type = "ext4";
+        }
+    }
+    std::free(buf);
+    ::close(fd);
+    return type;
+}
+
+// The md array (e.g. "md127") holding block device `path`, "" when none.
+std::string md_holder(const std::string& path) {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0 || !S_ISBLK(st.st_mode)) return "";
+    const std::string dir = "/sys/dev/block/" + std::to_string(major(st.st_rdev)) +
+                            ":" + std::to_string(minor(st.st_rdev)) + "/holders";
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (starts_with(name, "md")) return name;
+    }
+    return "";
+}
+
 } // namespace
+
+// ---------------------------------------------------------------------------
+// md RAID0
+// ---------------------------------------------------------------------------
+
+std::string MountManager::assemble_raid0(const std::string& name,
+                                         const std::vector<std::string>& members,
+                                         std::string* error) {
+    namespace md = tutti::detail::md_raid0;
+    auto fail = [&](std::string message) {
+        if (error) *error = std::move(message);
+        return std::string();
+    };
+    // The member block devices appeared moments ago; let udev finish (its
+    // md rule may be assembling the array right now).
+    (void)run_program({"udevadm", "settle", "--timeout=10"});
+
+    auto common_holder = [&](std::string* holder) {
+        *holder = md_holder(members.front());
+        for (const auto& m : members) {
+            if (md_holder(m) != *holder) return false;
+        }
+        return true;
+    };
+    std::string holder;
+    if (!common_holder(&holder)) {
+        return fail("members of " + name + " are held by different md arrays");
+    }
+    if (!holder.empty()) {
+        std::string state;
+        std::ifstream f("/sys/block/" + holder + "/md/array_state");
+        std::getline(f, state);
+        if (state == "inactive") {
+            // A partial incremental assembly; start over from the members.
+            (void)run_program({"mdadm", "--stop", "/dev/" + holder});
+            holder.clear();
+        }
+    }
+    if (holder.empty()) {
+        std::vector<std::string> args = {"mdadm", "--assemble", "/dev/md/" + name,
+                                         "--run"};
+        args.insert(args.end(), members.begin(), members.end());
+        const int rc = run_program(args);
+        (void)run_program({"udevadm", "settle", "--timeout=10"});
+        if (rc != 0 || !common_holder(&holder) || holder.empty()) {
+            return fail("mdadm --assemble " + name + " failed (rc=" +
+                        std::to_string(rc) + "); if the members carry no md "
+                        "superblock yet, create the array once with "
+                        "scripts/tutti-raid0-create.sh");
+        }
+        TUTTI_INFO("mount_manager: assembled %s as /dev/%s\n", name.c_str(),
+                   holder.c_str());
+    } else {
+        TUTTI_INFO("mount_manager: adopted %s already assembled as /dev/%s\n",
+                   name.c_str(), holder.c_str());
+    }
+    const std::string device = "/dev/" + holder;
+    owned_arrays_.push_back(device);
+
+    // Same acceptance rule the clients' resolver applies: single-zone raid0
+    // over exactly these members, nothing else.
+    struct stat st {};
+    md::Geometry geometry;
+    std::string why;
+    if (::stat(device.c_str(), &st) != 0 ||
+        !md::probe(st.st_rdev, &geometry, &why)) {
+        return fail(device + " is not a usable RAID0: " + why);
+    }
+    if (geometry.members.size() != members.size()) {
+        return fail(device + " has " + std::to_string(geometry.members.size()) +
+                    " members, configured " + std::to_string(members.size()));
+    }
+    return device;
+}
+
+bool MountManager::adopt_mount(const std::string& block_device,
+                               const std::string& mount_path) {
+    MountEntry entry;
+    struct stat st {};
+    if (!lookup_mount(mount_path, &entry) || ::stat(block_device.c_str(), &st) != 0) {
+        return false;
+    }
+    const std::string fs_type = detect_fs_type(block_device);
+    if (fs_type.empty() ||
+        !existing_mount_acceptable(entry, fs_type, major(st.st_rdev),
+                                   minor(st.st_rdev), nullptr)) {
+        return false;
+    }
+    for (const auto& owned : owned_mounts_) {
+        if (owned.mount_path == mount_path) return true;
+    }
+    owned_mounts_.push_back({block_device, mount_path});
+    TUTTI_INFO("mount_manager: %s at %s was mounted by someone else; taking "
+               "ownership (the daemon stops this array)\n",
+               block_device.c_str(), mount_path.c_str());
+    return true;
+}
+
+int MountManager::stop_arrays() {
+    int failed = 0;
+    for (auto it = owned_arrays_.rbegin(); it != owned_arrays_.rend(); ++it) {
+        if (run_program({"mdadm", "--stop", *it}) == 0) {
+            TUTTI_INFO("mount_manager: stopped %s\n", it->c_str());
+        } else {
+            std::fprintf(stderr, "mount_manager: mdadm --stop %s failed\n",
+                         it->c_str());
+            ++failed;
+        }
+    }
+    owned_arrays_.clear();
+    return failed;
+}
 
 // ---------------------------------------------------------------------------
 // Existing-mount validation
@@ -201,6 +370,10 @@ MountResult MountManager::mount_one(const std::string& block_device,
         return res;
     }
 
+    // "" when the device holds neither; an existing mount then never matches
+    // and mount(2) below is refused.
+    const std::string fs_type = detect_fs_type(block_device);
+
     struct stat st;
     if (::stat(mount_path.c_str(), &st) != 0) {
         res.error = "stat " + mount_path + " failed: " +
@@ -239,7 +412,7 @@ MountResult MountManager::mount_one(const std::string& block_device,
                 return res;
             }
             std::string reason;
-            if (!existing_mount_acceptable(entry, "ext4",
+            if (!existing_mount_acceptable(entry, fs_type,
                                            major(dev_st.st_rdev),
                                            minor(dev_st.st_rdev), &reason)) {
                 res.error = mount_path + " already exists but " + reason +
@@ -257,11 +430,17 @@ MountResult MountManager::mount_one(const std::string& block_device,
         }
     }
 
-    // 3. mount(2) — ext4, default options.
-    int rc = ::mount(block_device.c_str(), mount_path.c_str(), "ext4", 0, nullptr);
+    // 3. mount(2) — the detected filesystem, default options plus noatime.
+    if (fs_type.empty()) {
+        res.error = block_device + " holds no ext4 or xfs filesystem";
+        TUTTI_INFO("mount_manager: %s (continuing without mount)\n", res.error.c_str());
+        return res;
+    }
+    int rc = ::mount(block_device.c_str(), mount_path.c_str(), fs_type.c_str(),
+                     MS_NOATIME, nullptr);
     if (rc != 0) {
-        res.error = "mount(" + block_device + ", " + mount_path +
-                    ", ext4) failed: " + std::strerror(errno);
+        res.error = "mount(" + block_device + ", " + mount_path + ", " +
+                    fs_type + ") failed: " + std::strerror(errno);
         TUTTI_INFO("mount_manager: %s (continuing without mount)\n", res.error.c_str());
         return res;
     }

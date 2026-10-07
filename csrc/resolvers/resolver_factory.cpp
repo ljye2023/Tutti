@@ -9,6 +9,7 @@
 
 #include "csrc/resolvers/local_file/resolver.h"
 #include "csrc/resolvers/local_file/multi_mount_resolver.h"
+#include "csrc/resolvers/local_file/raid0_resolver.h"
 
 #include "csrc/resolvers/memfs/resolver.h"
 #include "csrc/resource/memory/memory_resource.h"
@@ -61,6 +62,28 @@ Result<std::unique_ptr<const ResourceView>> resolver_view(
             invalid("Resource returned null resolver view"));
     }
     return view;
+}
+
+// All slices share one mount: it must be an md RAID0 whose members are
+// exactly these namespaces (any order; md slot order is taken from sysfs).
+Result<std::unique_ptr<StorageTargetResolver>> create_raid0_file(
+    const nvme_resource::NvmeResolverResourceView& view,
+    const ResolverCreateContext& context) {
+    std::vector<local_file::Raid0MemberNamespace> namespaces;
+    for (const auto& slice : view.slices) {
+        namespaces.push_back({slice.block_path, slice.pci_bdf, slice.namespace_id,
+                              slice.logical_block_size});
+    }
+    std::string why;
+    auto resolver = local_file::make_raid0_resolver(
+        view.slices.front().backing_mount_path, namespaces, context.data_path_key,
+        &why);
+    if (!resolver) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("NVMe slices share one mount: " + why));
+    }
+    std::unique_ptr<StorageTargetResolver> out = std::move(resolver);
+    return Result<std::unique_ptr<StorageTargetResolver>>::Success(std::move(out));
 }
 
 Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
@@ -128,15 +151,28 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
             std::move(resolver));
     }
 
-    // Several devices: one "file" resolver dispatching by mount prefix. A
-    // slot's file path already names the device it lives on (placement
-    // rotated slots across mounts), so resolution is prefix matching plus
-    // the full single-device pipeline per delegate.
     if (!multi) {
         return failure<std::unique_ptr<StorageTargetResolver>>(
             invalid("multiple NVMe slices require the striped-local-nvme "
                     "contract"));
     }
+
+    // Several devices behind ONE mount: the filesystem is an md RAID0 over
+    // them. One resolver for the array; the payload carries the md layout
+    // so the DataPath can take each IO to the member that holds it.
+    bool one_mount = true;
+    for (const auto& slice : view->slices) {
+        one_mount = one_mount &&
+            slice.backing_mount_path == view->slices.front().backing_mount_path;
+    }
+    if (one_mount) {
+        return create_raid0_file(*view, context);
+    }
+
+    // Several devices: one "file" resolver dispatching by mount prefix. A
+    // slot's file path already names the device it lives on (placement
+    // rotated slots across mounts), so resolution is prefix matching plus
+    // the full single-device pipeline per delegate.
     std::vector<local_file::MultiMountLocalFileResolver::MountBinding> bindings;
     bindings.reserve(view->slices.size());
     for (const auto& slice : view->slices) {

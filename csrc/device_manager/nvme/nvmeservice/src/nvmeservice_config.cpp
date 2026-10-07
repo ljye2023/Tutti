@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -106,6 +107,25 @@ void parse_common(const YAML::Node& root, ServiceConfig& config) {
             config.unmount_retry.interval_ms);
         config.unmount_retry.max = get_or<uint32_t>(
             root["unmount_retry"], "max", config.unmount_retry.max);
+    }
+    if (root["raid0_arrays"]) {
+        if (!root["raid0_arrays"].IsSequence()) {
+            throw std::runtime_error("raid0_arrays must be a sequence");
+        }
+        for (const auto& node : root["raid0_arrays"]) {
+            Raid0ArrayEntry entry;
+            entry.name = get_or<std::string>(node, "name", "");
+            entry.mount_path = get_or<std::string>(node, "mount_path", "");
+            entry.auto_mount = get_or<bool>(node, "auto_mount", true);
+            if (!node["device_ids"] || !node["device_ids"].IsSequence()) {
+                throw std::runtime_error("raid0_arrays[].device_ids must be a sequence");
+            }
+            for (const auto& id : node["device_ids"]) {
+                entry.device_ids.push_back(
+                    parse_nonnegative_id(id, "raid0_arrays[].device_ids[]"));
+            }
+            config.raid0_arrays.push_back(std::move(entry));
+        }
     }
 }
 
@@ -292,6 +312,37 @@ bool validate_config(const ServiceConfig& config, std::string* error) {
         }
     }
 
+    // RAID0 members share their array's mount path; that path is claimed
+    // once, by the array.
+    std::map<int32_t, const Raid0ArrayEntry*> array_of;
+    std::set<std::string> array_names;
+    for (const auto& array : config.raid0_arrays) {
+        if (array.name.empty() ||
+            array.name.find_first_not_of(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
+                std::string::npos) {
+            return fail("raid0_arrays[].name must be non-empty [A-Za-z0-9_-]");
+        }
+        if (!array_names.insert(array.name).second) {
+            return fail("duplicate raid0_arrays[].name: " + array.name);
+        }
+        if (array.device_ids.size() < 2) {
+            return fail("raid0_arrays[" + array.name + "] needs at least two devices");
+        }
+        if (array.mount_path.empty()) {
+            return fail("raid0_arrays[" + array.name + "].mount_path is empty");
+        }
+        if (!all_paths.insert(array.mount_path).second) {
+            return fail("duplicate configured path: " + array.mount_path);
+        }
+        for (int32_t id : array.device_ids) {
+            if (!array_of.emplace(id, &array).second) {
+                return fail("device_id=" + std::to_string(id) +
+                            " is listed in more than one raid0 array slot");
+            }
+        }
+    }
+
     std::set<int32_t> device_ids;
     std::set<std::string> pci_addresses;
     for (const auto& nvme : config.nvmes) {
@@ -308,7 +359,19 @@ bool validate_config(const ServiceConfig& config, std::string* error) {
             return fail("nvmes[device_id=" + std::to_string(nvme.device_id) +
                         "].backing_mount_path is empty");
         }
-        if (!all_paths.insert(nvme.backing_mount_path).second) {
+        const auto member = array_of.find(nvme.device_id);
+        if (member != array_of.end()) {
+            if (nvme.backing_mount_path != member->second->mount_path) {
+                return fail("nvmes[device_id=" + std::to_string(nvme.device_id) +
+                            "] is a member of raid0 array " + member->second->name +
+                            "; its backing_mount_path must be " +
+                            member->second->mount_path);
+            }
+            if (nvme.auto_mount) {
+                return fail("nvmes[device_id=" + std::to_string(nvme.device_id) +
+                            "] is a raid0 member and must set auto_mount: false");
+            }
+        } else if (!all_paths.insert(nvme.backing_mount_path).second) {
             return fail("duplicate configured path: " + nvme.backing_mount_path);
         }
         std::set<int32_t> acl;
@@ -325,6 +388,12 @@ bool validate_config(const ServiceConfig& config, std::string* error) {
                             "].allowed_accel_ids has duplicate accel_id=" +
                             std::to_string(accel_id));
             }
+        }
+    }
+    for (const auto& [id, array] : array_of) {
+        if (!device_ids.count(id)) {
+            return fail("raid0_arrays[" + array->name +
+                        "] references unknown device_id=" + std::to_string(id));
         }
     }
 

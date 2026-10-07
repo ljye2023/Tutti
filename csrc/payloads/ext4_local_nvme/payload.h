@@ -94,6 +94,38 @@ struct NamespaceIdentity {
 };
 
 // -------------------------------------------------------------------------
+// Raid0Layout
+//
+// Present when the filesystem sits on a single-zone md RAID0 whose members
+// are NVMe namespaces. Extent::device_offset is then a byte offset in the
+// md array, and this is the second hop to the member that holds it -- the
+// same arithmetic as the kernel's raid0 map_sector() for zone 0:
+//
+//   chunk  = md_offset / chunk_bytes
+//   member = chunk % members.size()                 (md slot order, rdN)
+//   offset = data_offset_bytes + (chunk / N) * chunk_bytes
+//            + md_offset % chunk_bytes
+//
+// An IO must not cross a chunk boundary; the DataPath splits there.
+// RAID0 has no parity, mirror or write-intent bitmap, so writing members
+// directly leaves the array consistent. Other levels must never get here.
+// -------------------------------------------------------------------------
+struct Raid0Member {
+    NamespaceIdentity ns;
+    std::uint64_t data_offset_bytes = 0;  // md dev-*/offset
+};
+
+struct Raid0Layout {
+    std::uint64_t chunk_bytes = 0;
+    std::uint64_t member_data_bytes = 0;  // per member, chunk-rounded
+    std::vector<Raid0Member> members;     // index == md slot
+
+    std::uint64_t array_bytes() const noexcept {
+        return member_data_bytes * members.size();
+    }
+};
+
+// -------------------------------------------------------------------------
 // Ext4LocalNvmePayload
 //
 // Immutable payload produced by the resolver and consumed by the
@@ -101,6 +133,7 @@ struct NamespaceIdentity {
 //   - the namespace identity
 //   - an ordered, validated set of extents covering [0, file_size)
 //   - the logical file size
+//   - optionally, the RAID0 layout under the filesystem (see Raid0Layout)
 //
 // The constructor is private; use the factory which runs validate().
 // All accessors return const references / values only.
@@ -113,12 +146,14 @@ public:
     static Result<std::shared_ptr<const Ext4LocalNvmePayload>>
     create(NamespaceIdentity ns,
            std::vector<Extent> extents,
-           std::uint64_t file_size) {
+           std::uint64_t file_size,
+           std::shared_ptr<const Raid0Layout> raid0 = nullptr) {
 
         // Build a temporary to validate.
         auto tmp = std::unique_ptr<Ext4LocalNvmePayload>(
             new Ext4LocalNvmePayload(
                 std::move(ns), std::move(extents), file_size));
+        tmp->raid0_ = std::move(raid0);
 
         Status vs = tmp->validate();
         if (!vs.ok()) {
@@ -141,6 +176,11 @@ public:
 
     std::uint64_t file_size() const noexcept {
         return file_size_;
+    }
+
+    // nullptr unless the filesystem sits on md RAID0.
+    const Raid0Layout* raid0() const noexcept {
+        return raid0_.get();
     }
 
     // Map a logical byte offset within the file to a device byte offset.
@@ -221,6 +261,23 @@ public:
                            "extents do not fully cover [0, file_size)");
         }
 
+        if (raid0_) {
+            const Raid0Layout& r = *raid0_;
+            if (r.members.size() < 2 || r.chunk_bytes == 0 ||
+                r.member_data_bytes == 0 ||
+                r.member_data_bytes % r.chunk_bytes != 0) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "invalid RAID0 layout");
+            }
+            for (const auto& e : extents_) {
+                if (e.device_offset > r.array_bytes() ||
+                    e.length > r.array_bytes() - e.device_offset) {
+                    return Status(StatusCode::DATA_LOSS,
+                                  "extent beyond the RAID0 array");
+                }
+            }
+        }
+
         return Status::Ok();
     }
 
@@ -235,6 +292,7 @@ private:
     NamespaceIdentity ns_;
     std::vector<Extent> extents_;
     std::uint64_t file_size_ = 0;
+    std::shared_ptr<const Raid0Layout> raid0_;
 };
 
 // -------------------------------------------------------------------------

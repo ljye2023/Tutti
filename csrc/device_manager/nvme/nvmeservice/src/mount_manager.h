@@ -7,7 +7,8 @@
  *
  * Lifecycle:
  *   - mount_all(): called at daemon startup.  For every NVMe entry with
- *     auto_mount=true, mount(2) the block device at mount_path (ext4).
+ *     auto_mount=true, mount(2) the block device at mount_path (ext4 or xfs,
+ *     detected from the superblock).
  *     Failures (already mounted, fs dirty, device absent) are logged
  *     and the device continues WITHOUT a mount; it is NOT recorded as
  *     daemon-owned.  Devices already mounted before the daemon started
@@ -94,6 +95,27 @@ public:
     MountResult mount_one(const std::string& block_device,
                           const std::string& mount_path);
 
+    // Bring up the md RAID0 named `name` over exactly `members` (block device
+    // paths, e.g. /dev/snvme0n1). An array udev already assembled from these
+    // members is adopted; otherwise `mdadm --assemble` runs. Never creates an
+    // array. Returns the md block device path ("/dev/md127") and records it
+    // for stop_arrays(), or "" with `error` set.
+    std::string assemble_raid0(const std::string& name,
+                               const std::vector<std::string>& members,
+                               std::string* error);
+
+    // Take ownership of the mount at `mount_path` if it is `block_device`
+    // with an ext4/xfs filesystem. For arrays this daemon assembled: the
+    // host's fstab/systemd may mount the md device the moment it appears,
+    // racing mount_one(); whoever mounted it, the daemon must unmount it
+    // before stopping the array and releasing the members.
+    bool adopt_mount(const std::string& block_device, const std::string& mount_path);
+
+    // `mdadm --stop` every array assemble_raid0() returned. Call after
+    // unmount_all() succeeded and before the controllers are released.
+    // Returns the number of arrays that could not be stopped.
+    int stop_arrays();
+
     // Attempt to unmount every device recorded as daemon-owned.
     // Returns the number of mounts still busy (0 = all clean).
     // If force_exit_requested() becomes true mid-loop, stops retrying
@@ -124,6 +146,7 @@ private:
 
     UnmountRetryConfig          retry_cfg_;
     std::vector<OwnedMount>     owned_mounts_;
+    std::vector<std::string>    owned_arrays_;   // "/dev/mdX"
     std::atomic<int>            force_exit_{0};
 
     // Internal: try umount2 once.  Returns 0 on success, errno on failure.

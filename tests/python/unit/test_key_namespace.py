@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from tutti.storage.tutti_nvme.object_layout import DEFAULT_SEGMENT_HEADER_BYTES
 from tutti.engine.core import KVEngine
 from tutti.index.chunk_index import ChunkIndex
 from tutti.storage.memory import MemoryKVStore
@@ -134,7 +135,7 @@ class TestNamespacePlumbing:
         layout = self._layout(tmp_path / "pool", NS_A)
         layout.set_layer_span(NL)
         fingerprint = layout._config()["namespace_fingerprint"]
-        assert fingerprint == layout_fingerprint(NS_A, 8, 32 * 1024)
+        assert fingerprint == layout_fingerprint(NS_A, 8, DEFAULT_SEGMENT_HEADER_BYTES)
         assert fingerprint.startswith(NS_A + b"\0")
         layout.close_object_pool()
 

@@ -17,6 +17,7 @@ from tutti.engine.transfer import (
     select_transfer,
 )
 from tutti.index.chunk_index import derive_io_key
+from tutti.storage.tutti_nvme.object_layout import DEFAULT_SEGMENT_HEADER_BYTES
 from tutti.storage.tutti_nvme.store import (
     DirectAdmissionError,
     TuttiDirectBackend,
@@ -616,7 +617,7 @@ def test_direct_clean_root_first_write_materializes_target(tmp_path):
     target_path = Path(uri[len("file://"):])
     # 段文件在 open 时整体建好：每槽位 = 前缀 + 全部层的段（层数 × 段大小）。
     assert target_path.exists()
-    assert target_path.stat().st_size == 4 * (32768 + 3 * 8192)
+    assert target_path.stat().st_size == 4 * (DEFAULT_SEGMENT_HEADER_BYTES + 3 * 8192)
     assert len(runtime.open_batch_calls) == 1
     assert completion._watcher is None
     completion.wait()

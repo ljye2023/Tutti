@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
+from tutti.storage.tutti_nvme.object_layout import DEFAULT_SEGMENT_HEADER_BYTES
 from tutti.index.chunk_index import derive_io_key
 from tutti.index.chunk_index import decode_io_key
 from tutti.storage.memory import MemoryKVStore
@@ -119,6 +120,6 @@ def test_layer_span_predisposes_full_size(tmp_path):
     layout.prepare_put([derive_io_key(chunk, 0)], capacity_chunks=8)
     uri = layout.target_uri(chunk)
     path = Path(uri[len("file://"):])
-    assert path.stat().st_size == 2 * (32 * 1024 + 80 * SEG)  # 段文件整体定型
+    assert path.stat().st_size == 2 * (DEFAULT_SEGMENT_HEADER_BYTES + 80 * SEG)  # 段文件整体定型
     assert layout.target_size(chunk) == 80 * SEG
     layout.close_object_pool()

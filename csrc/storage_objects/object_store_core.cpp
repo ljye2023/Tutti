@@ -140,10 +140,10 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "capacity_bytes too small to hold a single object");
     }
-    if (config.segment_file_slots > UINT64_MAX / config.devices.size()) {
+    if (config.segment_file_slots > UINT64_MAX / mount_count_) {
         return Status(StatusCode::INVALID_ARGUMENT, "segment group size overflows");
     }
-    group_slots_ = config.segment_file_slots * config.devices.size();
+    group_slots_ = config.segment_file_slots * mount_count_;
 
     if (!config_.read_only) {
         const Status layout_status = ensure_layout_locked();
@@ -258,11 +258,18 @@ Status ObjectStoreCore::build_backend_locked() {
 
     // Slot numbers rotate over the mounts; every segment file is scoped to a
     // rank so ranks with the same slot numbers cannot overwrite one another.
+    // Several devices can sit behind one mount (an md RAID0 over them): that
+    // is one mount, not several -- listing it twice would put two slots at
+    // the same file offset.
     std::vector<std::string> mounts;
     mounts.reserve(config_.devices.size());
     for (const StoreDevice& device : config_.devices) {
-        mounts.push_back(device.mount_path);
+        if (std::find(mounts.begin(), mounts.end(), device.mount_path) ==
+            mounts.end()) {
+            mounts.push_back(device.mount_path);
+        }
     }
+    mount_count_ = mounts.size();
     auto segmented = std::make_unique<FixedSegmentFilePlacement>(
         std::move(mounts), "r" + std::to_string(config_.rank_id) + "/segments",
         slot_bytes_, slot_bytes_ * config_.segment_file_slots,
@@ -281,9 +288,9 @@ Status ObjectStoreCore::ensure_layout_locked() {
     const Status meta = ensure_directory(join(config_.uri, "meta"));
     if (!meta.ok()) return meta;
 
-    // One segment directory per device: slots 0..N-1 land on devices 0..N-1.
+    // One segment directory per mount: slots 0..N-1 land on mounts 0..N-1.
     const std::uint64_t devices =
-        std::min<std::uint64_t>(config_.devices.size(), allocator_.total_slots());
+        std::min<std::uint64_t>(mount_count_, allocator_.total_slots());
     for (std::uint64_t slot = 0; slot < devices; ++slot) {
         const std::string path = placement_->path_for_slot(slot);
         const std::size_t slash = path.find_last_of('/');
@@ -304,7 +311,7 @@ Status ObjectStoreCore::group_paths_locked(std::uint64_t slot,
                                           std::vector<std::string>* out) const {
     out->clear();
     const std::uint64_t group_start = (slot / group_slots_) * group_slots_;
-    for (std::size_t device = 0; device < config_.devices.size(); ++device) {
+    for (std::size_t device = 0; device < mount_count_; ++device) {
         const std::uint64_t first = group_start + device;
         if (first >= allocator_.total_slots()) break;
         out->push_back(placement_->path_for_slot(first));
@@ -433,8 +440,8 @@ StoreUsage ObjectStoreCore::usage() const {
     u.reclaiming_bytes = s.reclaiming_slots * slot_bytes_;
     u.usable_bytes = (s.free_slots + s.unmaterialised_slots) * slot_bytes_;
 
-    // Per device: slots rotate over the devices, so slot s is on s % N.
-    const std::uint64_t devices = config_.devices.size();
+    // Per mount: slots rotate over the mounts, so slot s is on s % N.
+    const std::uint64_t devices = mount_count_;
     if (devices > 0) {
         const std::uint64_t used = s.committed_slots + s.reserved_slots +
                                    s.reclaiming_slots;

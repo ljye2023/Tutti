@@ -581,6 +581,19 @@ if(BUILD_TESTING)
             )
             message(STATUS "Tutti: added tests/striped_local_nvme_contract (hardware;striped;runtime_e2e)")
 
+            # md RAID0 over the NVMe namespaces: GPU member-direct IO checked
+            # byte-for-byte against the kernel md/ext4 path.
+            add_subdirectory(
+                "${TUTTI_REPOSITORY_ROOT}/tests/raid0_local_nvme_contract"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_raid0_local_nvme_contract"
+            )
+
+            # chrdev <-> controller identity through the preset (two daemons).
+            add_subdirectory(
+                "${TUTTI_REPOSITORY_ROOT}/tests/snvme_identity_contract"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_snvme_identity_contract"
+            )
+
             # Round 19 S1: batch open performance microbenchmark.
             # Not a ctest (perf number, not pass/fail); manually invoked.
             add_subdirectory(

@@ -239,11 +239,19 @@ private:
     struct HostExtent {
         std::uint64_t logical_offset_bytes = 0;
         std::uint64_t length_bytes = 0;
+        // md array byte offset; only used by RAID0 targets.
+        std::uint64_t device_offset_bytes = 0;
     };
 
     // One target = one file on one device. The device is matched at open()
     // from the payload's namespace identity (controller PCI address), so
     // placement -- not this DataPath -- decides where a file lives.
+    //
+    // RAID0 target (payload carries a Raid0Layout): one file on an md RAID0
+    // over several of this DataPath's devices. It has no per-file device
+    // handle; submit() maps every sub-IO to (member device, member byte
+    // offset) on the host and addresses it through that device's identity
+    // handle (member_handles_), so the kernel is unchanged.
     struct StripedTarget {
         // Index into devices_ of the device this file lives on.
         std::uint32_t dev_idx = 0;
@@ -256,6 +264,11 @@ private:
         std::vector<HostExtent> extents;
         std::string domain_key;
         std::uint64_t generation = 0;
+
+        // RAID0 only (raid0_chunk_bytes != 0). Index = md slot.
+        std::uint64_t raid0_chunk_bytes = 0;
+        std::vector<std::uint32_t> raid0_dev;          // devices_ index
+        std::vector<std::uint64_t> raid0_data_offset;  // member byte offset
     };
 
     struct StripedMemory {
@@ -344,6 +357,10 @@ private:
     // Returns the matched device index through out.dev_idx.
     bool build_file_handle_(const ResolvedTarget& target,
                             StripedTarget& out);
+    // RAID0 payload: match members to devices_, ensure their identity
+    // handles cover the member data area.
+    bool build_raid0_target_(const ResolvedTarget& target,
+                             StripedTarget& out);
 
     // D2H the op's status array, aggregate into op.state/status/bytes.
     void aggregate_completion_status_(OpEntry& op);
@@ -396,6 +413,12 @@ private:
     // device-keyed key registers once and reuses.
     std::string device_domain_key_;
     std::unordered_map<std::uint64_t, StripedTarget> targets_;
+    // Per device: a handle whose single extent is the namespace itself
+    // (logical byte == namespace byte), built on the first RAID0 open and
+    // shared by every RAID0 target. nullptr until then. Their device-table
+    // rows follow the per-target rows: row n_targets + device.
+    std::vector<tutti::data_paths::local_nvme::DeviceTargetHandle*> member_handles_;
+    std::vector<std::uint64_t> member_handle_bytes_;
     std::unordered_map<std::uint64_t, StripedMemory> memory_regs_;
     std::unordered_map<std::uint64_t, OpEntry> ops_;
 

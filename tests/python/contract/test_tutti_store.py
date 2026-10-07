@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from tutti.index.chunk_index import decode_io_key
+from tutti.storage.tutti_nvme.object_layout import DEFAULT_SEGMENT_HEADER_BYTES
 from tutti.storage.tutti_nvme.store import (
     TuttiKVStore,
     _TuttiCompletion,
@@ -33,7 +34,7 @@ import json
 SEG = 4096
 # 小段文件：每文件 8 槽，避免每个用例零填充一个默认 2048 槽的大文件。
 SLOTS_PER_FILE = 8
-HEADER = 32 * 1024
+HEADER = DEFAULT_SEGMENT_HEADER_BYTES
 
 
 def io_key(chunk: bytes, layer: int) -> bytes:
@@ -1255,8 +1256,57 @@ def test_derive_device_fields_unknown_device(tmp_path):
         )
 
 
-def test_derive_striped_devices_from_daemon(tmp_path):
+def test_derive_devices_from_several_daemon_configs(tmp_path):
+    """每个盘组一个 daemon：多份配置合并成一份设备清单；device_id 不得重复。"""
+    import yaml
+
+    kv0 = tmp_path / "kv0.yaml"
+    md0 = tmp_path / "md0.yaml"
+    kv0.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": 0, "pci_addr": "ffff:00:00.0", "backing_mount_path": "/kv"}]}))
+    md0.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": 4, "pci_addr": "ffff:00:04.0", "backing_mount_path": "/md"}]}))
+    for daemon_config in ([str(kv0), str(md0)], f"{kv0},{md0}"):
+        preset = {"type": "striped", "daemon_config": daemon_config,
+                  "devices": [{"device_id": 0}, {"device_id": 4}]}
+        devices = _derive_device_fields(preset, yaml)["devices"]
+        assert [d["mount_path"] for d in devices] == ["/kv", "/md"]
+        assert [d["pci_bdf"] for d in devices] == ["ffff:00:00.0", "ffff:00:04.0"]
+
+    md0.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": 0, "pci_addr": "ffff:00:04.0", "backing_mount_path": "/md"}]}))
+    with pytest.raises(RuntimeError, match="device_id=0"):
+        _derive_device_fields(
+            {"type": "striped", "daemon_config": [str(kv0), str(md0)],
+             "devices": [{"device_id": 0}]}, yaml)
+
+
+def test_derive_backing_device_by_pci_address(tmp_path, monkeypatch):
+    """块设备按 PCI 地址从 sysfs 查：snvme 编号不一定等于 device_id。"""
+    import yaml
+
+    from tutti.storage.tutti_nvme import preset_derive
+
+    (tmp_path / "pci" / "ffff:00:04.0" / "snvme" / "snvme0" / "snvme0n1").mkdir(
+        parents=True)
+    monkeypatch.setattr(preset_derive, "_PCI_SYSFS", tmp_path / "pci")
+    daemon = tmp_path / "md0.yaml"
+    daemon.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": 4, "pci_addr": "ffff:00:04.0", "backing_mount_path": "/md"},
+        {"device_id": 5, "pci_addr": "ffff:00:05.0", "backing_mount_path": "/md"}]}))
+    devices = _derive_device_fields(
+        {"type": "striped", "daemon_config": str(daemon),
+         "devices": [{"device_id": 4}, {"device_id": 5}]}, yaml)["devices"]
+    assert devices[0]["backing_device"] == "/dev/snvme0n1"   # sysfs 实际编号
+    assert devices[1]["backing_device"] == "/dev/snvme5n1"   # 未接管：旧约定
+
+
+def test_derive_striped_devices_from_daemon(tmp_path, monkeypatch):
     """striped preset：devices 的 device_id 列表按 daemon 配置逐个推导。"""
+    from tutti.storage.tutti_nvme import preset_derive
+
+    # 不读本机 sysfs：块设备走 device_id 旧约定。
+    monkeypatch.setattr(preset_derive, "_PCI_SYSFS", tmp_path / "no-sysfs")
     import yaml
 
     daemon = {

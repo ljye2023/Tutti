@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Tutti 在线服务：Hy3-FP8 × TP8 × 4 盘段文件，与 8 卡离线基准同构。
+# Tutti 在线服务：Hy3-FP8 × TP8 × 两个 4 盘 RAID0（共 8 盘），与 8 卡离线基准同构。
 #
 # 与 vllm_smoke_server.sh 的区别：那份是 TP4 + 单盘 + 旧模块路径（adapter.connector，
 # 已随包重构失效），这份对齐 scripts/vllm/run/bench-8gpu-striped.sh 的几何与
@@ -72,6 +72,19 @@ NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 # 8TiB × 8 rank = 64TiB 需求铺满 4×5.8TB 盘，ENOSPC 后 KV 写全失败）。
 # 换算示例：8 TiB 总量 → 每 rank 1 TiB → 每盘（8 rank / 4 盘）2 TiB。
 TOTAL_CAPACITY_BYTES="${TOTAL_CAPACITY_BYTES:-$(( 8 * 1024 * 1024 * 1024 * 1024 ))}"
+
+# 盘组部署（默认：两个 md RAID0，各由独立 daemon 管理）：
+#   DAEMON_CONFIG  客户端设备清单 = 各 daemon 配置，逗号分隔（device_id 全局唯一）
+#   DEVICE_GROUPS  按 rank 分组的 device_id，分号分组：rank 0-3 → kv0（NVMe 0-3，
+#                  /mnt/tutti_md0），rank 4-7 → md0（NVMe 4-7，/mnt/nvme4），与 GPU
+#                  所在 NUMA/PCIe switch 对应
+#   KV_MOUNT       各 rank 池根（索引/检查点）所在挂载点
+# md0 需先用 scripts/tutti-md0.sh up 交给 Tutti，kv0 daemon 单独启动。
+DAEMON_CONFIG="${DAEMON_CONFIG:-$REPO_ROOT/config/local/tutti_daemon_kv0.yaml,$REPO_ROOT/config/local/tutti_daemon_md0.yaml}"
+DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
+KV_MOUNT="${KV_MOUNT:-/mnt/tutti_md0}"
+DEVICE_GROUPS_JSON="[[${DEVICE_GROUPS//;/], [}]]"
+DAEMON_CONFIG_JSON="[\"${DAEMON_CONFIG//,/\", \"}\"]"
 CAPACITY_BYTES=$(( TOTAL_CAPACITY_BYTES / TP_SIZE ))
 # 工作集（仅用于日志展示）
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
@@ -87,7 +100,8 @@ fi
 echo "[serve] chunks_per_req=$CHUNKS_PER_REQ working_set=$WORKING_SET"
 echo "[serve] IO 几何: block_size=$BLOCK_SIZE tokens/block" \
      "blocks_per_chunk=$(( CHUNK_TOKENS / BLOCK_SIZE ))" \
-     "device_groups=[[0,1,2,3]] (8 rank 共享 4 盘，槽位轮转)"
+     "device_groups=$DEVICE_GROUPS_JSON kv_mount=$KV_MOUNT"
+echo "[serve] daemon_config=$DAEMON_CONFIG"
 echo "[serve] pool: 服务级总量 $(( TOTAL_CAPACITY_BYTES / 1024 / 1024 / 1024 / 1024 )) TiB" \
      "(每 rank $(( CAPACITY_BYTES / 1024 / 1024 / 1024 )) GiB，容量仅为上限)"
 echo "[serve] pool_tag=$POOL_TAG (换 tag = 全新索引；段文件按 rank 共享，脚本不删)"
@@ -112,7 +126,7 @@ else
 fi
 echo "[serve] load_format=$LOAD_FORMAT phxloader_dir=$PHXLOADER_DIR"
 
-# 8 rank 共享 4 盘（device_groups=[[0,1,2,3]]）；每 rank 自己的池根（检查点/
+# 每组 rank 共用一个阵列（DEVICE_GROUPS）；每 rank 自己的池根（检查点/
 # 元数据）。{LOCAL_RANK} 由 connector 的 expand_placeholders 展开（大括号、无 $）。
 read -r -d '' KV_CONFIG <<JSON || true
 {
@@ -126,14 +140,14 @@ read -r -d '' KV_CONFIG <<JSON || true
     "store": {
       "type": "tutti_nvme",
       "options": {
-        "root": "/mnt/nvme0/tutti-kv-online-${POOL_TAG}-{LOCAL_RANK}",
+        "root": "$KV_MOUNT/tutti-kv-online-${POOL_TAG}-{LOCAL_RANK}",
         "capacity_bytes": $CAPACITY_BYTES,
         "io_stream": "auto",
         "preset": {
           "type": "striped",
-          "daemon_config": "$REPO_ROOT/config/local/tutti_daemon.yaml",
+          "daemon_config": $DAEMON_CONFIG_JSON,
           "gpu_id": "{LOCAL_RANK}",
-          "device_groups": [[0, 1, 2, 3]],
+          "device_groups": $DEVICE_GROUPS_JSON,
           "num_queues": 8
         }
       }

@@ -103,6 +103,7 @@ target_include_directories(nvmeservice
         $<INSTALL_INTERFACE:include/nvmeservice>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${TUTTI_REPOSITORY_ROOT}   # csrc/common/md_raid0.h
 )
 
 # =============================================================================

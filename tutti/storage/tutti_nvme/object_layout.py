@@ -37,9 +37,11 @@ from pathlib import Path
 _PRECREATE_LOG = logging.getLogger("tutti.precreate")
 
 # 段文件几何默认值（HY3 TP8：2048 槽 × ~10 MiB ≈ 20 GiB/文件）。槽位前缀
-# 32 KiB 让每个槽位的 payload 起点 16 KiB 对齐（实测 4 KiB 前缀带宽低 20%）。
+# 128 KiB：payload 起点至少 16 KiB 对齐（实测 4 KiB 前缀带宽低 20%），且每层
+# 段起点 128 KiB 对齐——md RAID0 用 128 KiB 条带时单条 IO（≤128 KiB）永不
+# 跨条带（32 KiB 前缀时每条 128 KiB IO 都被拆成 96K+32K，单卡 12.6 vs 14.2 GiB/s）。
 DEFAULT_SEGMENT_FILE_SLOTS = 2048
-DEFAULT_SEGMENT_HEADER_BYTES = 32 * 1024
+DEFAULT_SEGMENT_HEADER_BYTES = 128 * 1024
 
 # 后台预建没有工作时的轮询间隔。
 _PRECREATE_IDLE_SLEEP_S = 0.5

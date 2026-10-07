@@ -4,6 +4,7 @@
 // N NVMe devices.
 
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
+#include "csrc/common/snvme_identity.h"
 
 #include "csrc/data_paths/local_nvme/io/device_target.h"
 #include "csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh"
@@ -372,6 +373,25 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         slot.hardware_mdts = dev_info.max_data_size;
         slot.page_size = static_cast<std::uint64_t>(slot.ctrl->page_size);
 
+        // The character device must drive the controller this descriptor
+        // names: targets are matched to devices by controller_pci_addr, so a
+        // chrdev of another controller would put every IO on a foreign
+        // namespace (it happened: chrdev and controller numbers diverge once
+        // controllers are brought up by more than one daemon).
+        if (!desc.controller_pci_addr.empty()) {
+            const std::string actual =
+                tutti::detail::snvme_identity::pci_of_chrdev(desc.snvme_dev_path);
+            if (actual != desc.controller_pci_addr) {
+                nvm_ctrl_free_client(slot.ctrl);
+                slot.ctrl = nullptr;
+                rollback_devices();
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              desc.snvme_dev_path + " drives PCI " +
+                                  (actual.empty() ? "<unknown>" : actual) +
+                                  ", not " + desc.controller_pci_addr);
+            }
+        }
+
         // SQ/CQ ring depth comes from the kernel (NVM_GET_DEV_INFO,
         // mirrored into slot.ctrl->q_depth by ioctl_get_dev_info) — never
         // user-specified: the kernel builds user IOQ rings with
@@ -634,12 +654,17 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     ops_.clear();
 
     for (auto& [tok, tgt] : targets_) {
-        if (tgt.dev_handles[0]) {
+        if (!tgt.dev_handles.empty() && tgt.dev_handles[0]) {
             free_device_target(tgt.dev_handles[0], tgt.overflow_allocs[0],
                                cuda_device_);
         }
     }
     targets_.clear();
+    for (auto* h : member_handles_) {
+        if (h) free_device_target(h, nullptr, cuda_device_);
+    }
+    member_handles_.clear();
+    member_handle_bytes_.clear();
 
     for (auto& [tok, mem] : memory_regs_) {
         for (auto* dma : mem.dmas) {
@@ -700,6 +725,7 @@ bool StripedDataPath::build_file_handle_(const ResolvedTarget& target,
     auto ep = tutti::payloads::ext4_local_nvme::view_payload(target);
     if (!ep.ok()) return false;
     const Ext4LocalNvmePayload* ext = ep.value();
+    if (ext->raid0() != nullptr) return build_raid0_target_(target, out);
 
     const auto& ns = ext->namespace_identity();
     const auto& src_extents = ext->extents();
@@ -787,6 +813,88 @@ bool StripedDataPath::build_file_handle_(const ResolvedTarget& target,
     return true;
 }
 
+bool StripedDataPath::build_raid0_target_(const ResolvedTarget& target,
+                                          StripedTarget& out) {
+    auto ep = tutti::payloads::ext4_local_nvme::view_payload(target);
+    if (!ep.ok()) return false;
+    const Ext4LocalNvmePayload* ext = ep.value();
+    const auto& raid = *ext->raid0();
+    if (raid.chunk_bytes == 0 || raid.chunk_bytes % block_size_ != 0) {
+        return false;
+    }
+
+    if (member_handles_.empty()) {
+        member_handles_.assign(devices_.size(), nullptr);
+        member_handle_bytes_.assign(devices_.size(), 0);
+    }
+    out.raid0_chunk_bytes = raid.chunk_bytes;
+    out.raid0_dev.clear();
+    out.raid0_data_offset.clear();
+    for (const auto& member : raid.members) {
+        std::uint32_t dev_idx = UINT32_MAX;
+        for (std::uint32_t i = 0; i < devices_.size(); ++i) {
+            const DeviceSlot& slot = devices_[i];
+            if (member.ns.controller_pci_addr != slot.desc.controller_pci_addr ||
+                member.ns.namespace_id != slot.desc.namespace_id ||
+                member.ns.block_size != slot.desc.block_size ||
+                !slot.queue_group || slot.queue_group->d_qps() == nullptr) {
+                continue;
+            }
+            dev_idx = i;
+            break;
+        }
+        if (dev_idx == UINT32_MAX) return false;
+        if (member.data_offset_bytes % block_size_ != 0) return false;
+        for (std::uint32_t d : out.raid0_dev) {
+            if (d == dev_idx) return false;  // one device, two md slots
+        }
+
+        // The identity handle bounds every IO to the member's data area.
+        // All RAID0 targets are files of the same array, so the bound is
+        // fixed by the first one; a different array on the same devices
+        // would be a configuration error.
+        const std::uint64_t end = member.data_offset_bytes + raid.member_data_bytes;
+        if (member_handles_[dev_idx] == nullptr) {
+            DeviceTargetHandle tmpl;
+            std::memset(&tmpl, 0, sizeof(tmpl));
+            std::uint32_t bs_log = 0;
+            while ((1u << bs_log) < block_size_) ++bs_log;
+            tmpl.file_id = dev_idx;
+            tmpl.logical_size_bytes = end;
+            tmpl.header_bytes = 0;
+            tmpl.nvme_block_size = block_size_;
+            tmpl.nvme_block_size_log = bs_log;
+            tmpl.namespace_id = member.ns.namespace_id;
+            tmpl.num_extents = 1;
+            tmpl.extents[0].start_lba = 0;
+            tmpl.extents[0].length_blocks = end / block_size_;
+            tmpl.extents_overflow = nullptr;
+            tmpl.d_qps = devices_[dev_idx].queue_group->d_qps();
+            tmpl.num_d_qps = devices_[dev_idx].queue_group->n_qps();
+            DeviceTargetHandle* dev_h = nullptr;
+            void* dev_ov = nullptr;
+            if (!build_device_target(tmpl, nullptr, 0, cuda_device_,
+                                     &dev_h, &dev_ov)) {
+                return false;
+            }
+            member_handles_[dev_idx] = dev_h;
+            member_handle_bytes_[dev_idx] = end;
+        } else if (member_handle_bytes_[dev_idx] != end) {
+            return false;
+        }
+        out.raid0_dev.push_back(dev_idx);
+        out.raid0_data_offset.push_back(member.data_offset_bytes);
+    }
+
+    out.dev_idx = out.raid0_dev.front();
+    out.logical_size = target.logical_size();
+    out.extents.reserve(ext->extents().size());
+    for (const auto& e : ext->extents()) {
+        out.extents.push_back({e.logical_offset, e.length, e.device_offset});
+    }
+    return true;
+}
+
 // =========================================================================
 // close / registration_domain
 // =========================================================================
@@ -807,7 +915,7 @@ Status StripedDataPath::close_impl_(DataPathTarget target) {
         return Status(StatusCode::BUSY, "close: target has in-flight operations");
     }
 
-    if (it->second.dev_handles[0]) {
+    if (!it->second.dev_handles.empty() && it->second.dev_handles[0]) {
         free_device_target(it->second.dev_handles[0],
                            it->second.overflow_allocs[0], cuda_device_);
     }
@@ -1223,8 +1331,15 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
     const std::uint32_t n_targets = (std::uint32_t)targets_in_batch.size();
-    // One device-table row per target (the one device its file lives on).
-    const std::uint32_t total_dev_table = n_targets;
+    // One device-table row per target (the one device its file lives on),
+    // then -- when a RAID0 target is in the batch -- one identity row per
+    // device at n_targets + device.
+    bool batch_has_raid0 = false;
+    for (const auto& t : targets_in_batch) {
+        batch_has_raid0 = batch_has_raid0 || t.tgt->raid0_chunk_bytes != 0;
+    }
+    const std::uint32_t total_dev_table = n_targets +
+        (batch_has_raid0 ? static_cast<std::uint32_t>(devices_.size()) : 0u);
 
     const std::uint32_t page_size =
         static_cast<std::uint32_t>(devices_[0].page_size);
@@ -1338,26 +1453,24 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         const bool use_prebuilt = mreg->prebuilt.valid;
 
         while (remaining > 0) {
-            const std::uint32_t dev = tgt->dev_idx;
+            std::uint32_t dev = tgt->dev_idx;
             const std::uint64_t file_off = cur_off;
 
             std::uint64_t sub_io = remaining;
-            const std::uint64_t controller_mdts =
-                device_effective_mdts_(dev);
-            sub_io = std::min(sub_io, controller_mdts);
 
             // Clamp to the file's extent boundary.
-            std::uint64_t ext_end = 0;
+            const HostExtent* hit = nullptr;
             for (const auto& ext : tgt->extents) {
                 std::uint64_t ext_start = ext.logical_offset_bytes;
                 std::uint64_t ext_e = ext_start + ext.length_bytes;
                 if (file_off >= ext_start && file_off < ext_e) {
-                    ext_end = ext_e;
+                    hit = &ext;
                     break;
                 }
             }
-            if (ext_end > 0) {
-                sub_io = std::min(sub_io, ext_end - file_off);
+            if (hit) {
+                sub_io = std::min(sub_io, hit->logical_offset_bytes +
+                                              hit->length_bytes - file_off);
             }
 
             StripedDeviceSubmitEntry entry{};
@@ -1371,6 +1484,33 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
             entry.dev_idx = tgt_idx;
             entry.direction = direction;
             entry.shard_offset = file_off;
+
+            if (tgt->raid0_chunk_bytes != 0) {
+                // Second hop: md offset -> (member, member offset), split at
+                // the chunk boundary. The kernel addresses the member
+                // through its identity handle, so shard_offset is the
+                // member's own byte offset.
+                if (!hit) {
+                    reject_one(i, StatusCode::DATA_LOSS,
+                               "RAID0 target offset outside its extents");
+                    rejected[i] = true;
+                    req_ok = false;
+                    break;
+                }
+                const std::uint64_t chunk = tgt->raid0_chunk_bytes;
+                const std::uint64_t n = tgt->raid0_dev.size();
+                const std::uint64_t md_off = hit->device_offset_bytes +
+                                             (file_off - hit->logical_offset_bytes);
+                const std::uint64_t in_chunk = md_off % chunk;
+                const std::uint64_t chunk_no = md_off / chunk;
+                const std::uint64_t member = chunk_no % n;
+                sub_io = std::min(sub_io, chunk - in_chunk);
+                dev = tgt->raid0_dev[member];
+                entry.dev_idx = n_targets + dev;
+                entry.shard_offset = tgt->raid0_data_offset[member] +
+                                     (chunk_no / n) * chunk + in_chunk;
+            }
+            sub_io = std::min(sub_io, device_effective_mdts_(dev));
 
             const std::uint64_t slice_bytes =
                 mreg->prebuilt.bytes_per_slice;
@@ -1631,7 +1771,14 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         h_dev_table.reserve(total_dev_table);
         for (std::uint32_t ti = 0; ti < n_targets; ++ti) {
             const auto* t = targets_in_batch[ti].tgt;
-            h_dev_table.push_back(t->dev_handles[0]);
+            // A RAID0 target's own row is never referenced by an entry.
+            h_dev_table.push_back(t->dev_handles.empty()
+                                      ? member_handles_[t->dev_idx]
+                                      : t->dev_handles[0]);
+        }
+        if (batch_has_raid0) {
+            h_dev_table.insert(h_dev_table.end(), member_handles_.begin(),
+                               member_handles_.end());
         }
         ce = cudaMemcpyAsync(const_cast<void*>(static_cast<const void*>(lease.d_dev_table)),
                             h_dev_table.data(),

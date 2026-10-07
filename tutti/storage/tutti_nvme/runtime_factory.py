@@ -35,7 +35,9 @@ def preset_mounts(preset):
     for device in devices:
         if not isinstance(device, dict) or not device.get("mount_path"):
             return None
-        mounts.append(device["mount_path"])
+        # 多块盘可以挂在同一个挂载点后面（md RAID0）：那是一个挂载点。
+        if device["mount_path"] not in mounts:
+            mounts.append(device["mount_path"])
     return mounts or None
 
 

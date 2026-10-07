@@ -1,0 +1,46 @@
+# RAID0 contract test: the four namespaces of config/local/tutti_daemon_raid0.yaml.
+# Their daemon views all name one backing mount, so the resolver factory
+# builds the md RAID0 resolver.
+
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: raid0-test-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: striped
+        device_ids: [0, 1, 2, 3]
+        queues_per_controller: 8
+
+  resolvers:
+    - id: raid0-test-resolver
+      type: local-file
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: raid0-test-datapath
+      type: striped-local-nvme
+      config:
+        handle_cache_capacity: 16
+        prp_cache_capacity: 262144
+        handle_cache_l2_capacity: 0
+        max_in_flight_operations: 4
+        max_batch_entries: 8192
+        io_granularity: 0
+
+  backends:
+    - id: raid0-test-storage
+      contract: striped-local-nvme
+      resolver: raid0-test-resolver
+      datapath: raid0-test-datapath
+      resource: raid0-test-nvme
+      config: {}
