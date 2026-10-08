@@ -21,6 +21,17 @@ _WRITE_COLOR = 0xFFFF8C00
 _WAIT_COLOR = 0xFF8D99A6
 _DEFAULT_COLOR = 0xFF5B8FF9
 
+backend = None
+try:
+    import nvtx
+    backend = "nvtx"
+except Exception:
+    try:
+        import torch
+        backend = "torch"
+    except Exception:
+        pass
+
 
 def enabled() -> bool:
     return os.environ.get("TUTTI_NVTX", "0").lower() in {
@@ -42,25 +53,17 @@ def _color_for(name: str) -> int:
 
 @contextmanager
 def range(name: str, color: int | str | None = None):
-    backend = None
     annotation = None
     if enabled():
-        try:
-            import nvtx
+        if backend == "nvtx":
             annotation = nvtx.annotate(
                 message=str(name),
                 color=_color_for(str(name)) if color is None else color,
                 domain="tutti",
             )
             annotation.__enter__()
-            backend = "nvtx"
-        except Exception:
-            try:
-                import torch
-                torch.cuda.nvtx.range_push(str(name))
-                backend = "torch"
-            except Exception:
-                pass
+        elif backend == "torch":
+            torch.cuda.nvtx.range_push(str(name))
     try:
         yield
     finally:
@@ -71,7 +74,6 @@ def range(name: str, color: int | str | None = None):
                 pass
         elif backend == "torch":
             try:
-                import torch
                 torch.cuda.nvtx.range_pop()
             except Exception:
                 pass

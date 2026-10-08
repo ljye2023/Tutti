@@ -40,7 +40,7 @@ function(tutti_configure_cuda_like target_name)
 
     set(MACA_INCLUDE_DIR
         "${MACA_ROOT}/include"
-        "${MACA_ROOT}/mcr/include"
+        "${MACA_ROOT}/include/mcr"
         CACHE STRING "MACA SDK include dir")
 
     if(EXISTS "${MACA_ROOT}/lib64")
@@ -55,7 +55,11 @@ function(tutti_configure_cuda_like target_name)
     set(MACA_RUNTIME_LIBS "mcruntime;mxc-runtime64;runtime_cu" CACHE STRING
         "MACA runtime libraries" FORCE)
 
-    target_compile_definitions(${target_name} INTERFACE TUTTI_USE_MACA=1)
+    target_compile_definitions(${target_name} INTERFACE
+        TUTTI_USE_MACA=1
+        TUTTI_COMPILED_ACCELERATOR_PROFILE=\"MACA\"
+        TUTTI_DEFAULT_ACCEL_ID=0
+    )
 
     target_include_directories(${target_name} INTERFACE
         ${MACA_INCLUDE_DIR}

@@ -146,10 +146,20 @@ if os.path.isdir(LIBNVM_DIR):
 if os.path.isdir(os.path.join(CUDA_ROOT, "lib64")):
     RUNTIME_LIB_DIRS.append(os.path.join(CUDA_ROOT, "lib64"))
 
+CUDALIKE_DIRS = []
+if ACCELERATOR_PROFILE == "MACA":
+    MACA_HOME = os.environ.get("MACA_HOME", "/opt/maca")
+    CUDALIKE_DIRS = [
+        os.path.join(MACA_HOME, "include"),
+        os.path.join(MACA_HOME, "include", "mcr"),
+        os.path.join(MACA_HOME, "include", "mctx"),
+    ]
+    RUNTIME_LIB_DIRS.append(os.path.join(MACA_HOME, "lib"))
+
 ext = Pybind11Extension(
     "tutti_runtime._core",
     sources=["src/_core.cpp"],
-    include_dirs=[TUTTI_INCLUDE, os.path.join(CUDA_ROOT, "include")] + CCCL_DIRS,
+    include_dirs=[TUTTI_INCLUDE, os.path.join(CUDA_ROOT, "include")] + CCCL_DIRS + CUDALIKE_DIRS,
     extra_compile_args=[
         "-std=c++17",
         "-DTUTTI_USE_%s=1" % ACCELERATOR_PROFILE,

@@ -335,37 +335,50 @@ class TuttiDirectBackend:
         if not bool(getattr(pool, "is_cuda", False)):
             raise DirectAdmissionError("KV pool must be a CUDA device tensor")
         dim = getattr(pool, "dim", None)
-        if not callable(dim) or int(dim()) != 5:
-            raise DirectAdmissionError(
-                "KV pool must have rank 5: "
-                "[num_blocks, num_layers, block_size, kv_heads, kv_channels]"
-            )
+        if not callable(dim):
+            raise DirectAdmissionError("KV pool has no dim() method")
+
+        rank = int(dim())
         shape = tuple(int(value) for value in pool.shape)
         if any(value <= 0 for value in shape):
             raise DirectAdmissionError(f"KV pool has invalid shape {shape}")
-        if shape[1] != int(num_layers):
+
+        # ---- 归一化：解出 5 维语义 ----
+        if rank == 5:
+            # [num_blocks, num_layers, block_size, kv_axis, kv_channels]
+            num_blocks, layers_axis, block_size, kv_axis, kv_channels = shape
+            inner_layout_6d = False
+        elif rank == 6:
+            # [num_blocks, num_layers, 2, block_size, num_kv_heads, head_dim]
+            num_blocks, layers_axis, kv_axis, block_size, num_kv_heads, head_dim = shape
+            kv_channels = num_kv_heads * head_dim
+            inner_layout_6d = True
+        else:
             raise DirectAdmissionError(
-                f"KV pool layer axis is {shape[1]}, expected {num_layers}"
-            )
-        # shape[3] 是**每 rank 的 KV head 数**（TP 分片后），不是 K/V 轴：
+                f"KV pool must have rank 5 or 6, got shape {shape}")
+
+        # ---- 公共校验 ----
+        # 5d场景 shape[3] 是**每 rank 的 KV head 数**（TP 分片后），不是 K/V 轴：
         # 实测 TP4 [nb, 80, 64, 2, 256]、TP8 [nb, 80, 64, 1, 256]——K 与 V
         # 拼接在最后一维（2 × head_dim），head 数随 TP 变化。IO 按整页
         # （block × 层）搬运，不区分 K/V，故只校验其非零。
-        if shape[3] < 1:
+        if kv_axis < 1:
             raise DirectAdmissionError(
-                f"KV pool head axis must be >= 1, got {shape[3]}"
+                f"KV pool head axis must be >= 1, got {kv_axis}"
             )
-        if shape[2] != int(chunk_tokens) // int(blocks_per_chunk):
+        if block_size != int(chunk_tokens) // int(blocks_per_chunk):
             raise DirectAdmissionError(
-                f"KV pool block axis is {shape[2]}, inconsistent with "
-                f"chunk_tokens={chunk_tokens} and "
-                f"blocks_per_chunk={blocks_per_chunk}"
-            )
-        if int(chunk_tokens) % shape[2]:
+                f"KV pool {shape} block axis is {block_size}, inconsistent with "
+                f"chunk_tokens={chunk_tokens} and blocks_per_chunk={blocks_per_chunk}")
+        if int(chunk_tokens) % block_size:
             raise DirectAdmissionError(
                 f"chunk_tokens({chunk_tokens}) is not divisible by "
-                f"block_size({shape[2]})"
+                f"block_size({block_size})"
             )
+        if layers_axis != int(num_layers):
+            raise DirectAdmissionError(
+                f"KV pool layer axis is {layers_axis}, expected {num_layers}")
+
         contiguous = getattr(pool, "is_contiguous", None)
         if not callable(contiguous) or not bool(contiguous()):
             raise DirectAdmissionError(
@@ -373,25 +386,42 @@ class TuttiDirectBackend:
                 "layouts are unsupported)"
             )
         stride = tuple(int(value) for value in pool.stride())
-        expected_stride = (
-            shape[1] * shape[2] * shape[3] * shape[4],
-            shape[2] * shape[3] * shape[4],
-            shape[3] * shape[4],
-            shape[4],
-            1,
-        )
-        if stride != expected_stride:
-            raise DirectAdmissionError(
-                f"KV pool stride {stride} is not uniform NHD cross-layer "
-                f"stride {expected_stride}"
+
+        # ---- 按 rank 校验 stride ----
+        if not inner_layout_6d:
+            expected_stride = (
+                layers_axis * block_size * kv_axis * kv_channels,
+                block_size * kv_axis * kv_channels,
+                kv_axis * kv_channels,
+                kv_channels,
+                1,
             )
+            if stride != expected_stride:
+                raise DirectAdmissionError(
+                    f"KV pool stride {stride} is not uniform NHD cross-layer "
+                    f"stride {expected_stride}")
+        else:
+            # 物理顺序：head_dim -> kv_heads -> block_size -> kv_axis -> layers -> blocks
+            expected_stride = (
+                layers_axis * kv_axis * block_size * kv_channels,
+                kv_axis * block_size * kv_channels,
+                block_size * kv_channels,
+                kv_channels,
+                head_dim,
+                1,
+            )
+            if stride != expected_stride:
+                raise DirectAdmissionError(
+                    f"KV pool stride {stride} is not uniform 6D cross-layer "
+                    f"stride {expected_stride}")
+
         element_size = int(pool.element_size())
         pool_base = int(pool.data_ptr())
         pool_size = int(pool.numel()) * element_size
         block_stride_bytes = stride[0] * element_size
         layer_stride_bytes = stride[1] * element_size
-        page_bytes = shape[2] * shape[3] * shape[4] * element_size
-        derived_blocks = int(chunk_tokens) // shape[2]
+        page_bytes = kv_axis * block_size * kv_channels * element_size
+        derived_blocks = int(chunk_tokens) // block_size
         if derived_blocks != int(blocks_per_chunk):
             raise DirectAdmissionError(
                 f"blocks_per_chunk mismatch: {blocks_per_chunk} != "
@@ -431,9 +461,9 @@ class TuttiDirectBackend:
             block_stride_bytes=block_stride_bytes,
             layer_stride_bytes=layer_stride_bytes,
             page_bytes=page_bytes,
-            num_blocks=shape[0],
-            num_layers=shape[1],
-            block_size=shape[2],
+            num_blocks=num_blocks,
+            num_layers=layers_axis,
+            block_size=block_size,
             blocks_per_chunk=derived_blocks,
             segment_bytes=int(segment_bytes),
             accel_id=int(get_device()),
